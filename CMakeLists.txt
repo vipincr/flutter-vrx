@@ -116,6 +116,7 @@ message(STATUS "PIE .................... ${CMAKE_POSITION_INDEPENDENT_CODE}")
 add_executable(
   flutter-pi
   src/main.c
+  src/vrx_compositor.c
 )
 
 # flutterpi_module
