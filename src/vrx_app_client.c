@@ -31,6 +31,9 @@ struct vrx_app_client {
     uint32_t last_sent_sequence;
 };
 
+void *vrx_app_client_recv(struct vrx_app_client *c, struct vrx_msg_header *out_h,
+                          int *out_fd, int *out_n_fds);
+
 struct vrx_app_client *vrx_app_client_connect(const char *bundle_id) {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, VRX_UI_SOCKET, sizeof(addr.sun_path) - 1);
@@ -160,7 +163,7 @@ void *vrx_app_client_recv(struct vrx_app_client *c, struct vrx_msg_header *out_h
         .msg_iov = &iov, .msg_iovlen = 1,
         .msg_control = cbuf, .msg_controllen = sizeof(cbuf),
     };
-    ssize_t n = recvmsg(c->fd, &mh, MSG_CLOEXEC);
+    ssize_t n = recvmsg(c->fd, &mh, 0);
     if (n <= 0) return NULL;
     if ((size_t) n < sizeof(pkt.h) || pkt.h.length > sizeof(pkt.payload)) return NULL;
     if (pkt.h.length > 0 && (size_t) n < sizeof(pkt.h) + pkt.h.length) return NULL;
