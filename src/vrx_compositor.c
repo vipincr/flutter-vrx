@@ -16,6 +16,8 @@
 // the first bundle in lexical order is the launcher-class app the
 // compositor (re)spawns at boot and whenever the focused app dies.
 
+#define _GNU_SOURCE
+
 #include "vrx_compositor.h"
 
 #ifndef FLUTTER_VRX_BUILD
@@ -396,10 +398,24 @@ bad:
 
 // ─── input ────────────────────────────────────────────────────────────────
 
+static int li_open_restricted(const char *path, int flags, void *user_data) {
+    (void) user_data;
+    return open(path, flags | O_CLOEXEC);
+}
+
+static void li_close_restricted(int fd, void *user_data) {
+    (void) user_data;
+    close(fd);
+}
+
 static int li_init(struct vrx_compositor *c) {
+    static const struct libinput_interface li_if = {
+        .open_restricted = li_open_restricted,
+        .close_restricted = li_close_restricted,
+    };
     struct udev *udev = udev_new();
     if (!udev) return -1;
-    c->li = libinput_udev_create_context(&libinput_interface_default, NULL, udev);
+    c->li = libinput_udev_create_context(&li_if, NULL, udev);
     if (!c->li) { udev_unref(udev); return -1; }
     libinput_udev_assign_seat(c->li, "seat0");
     c->li_fd = libinput_get_fd(c->li);
