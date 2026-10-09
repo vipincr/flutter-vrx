@@ -117,6 +117,7 @@ add_executable(
   flutter-pi
   src/main.c
   src/vrx_compositor.c
+  src/vrx_app_client.c
 )
 
 # flutterpi_module
