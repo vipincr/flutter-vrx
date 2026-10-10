@@ -460,6 +460,10 @@ target_link_libraries(
   flutter-pi PUBLIC
   flutterpi_module
 )
+# vrx: the runtime's product name (plan 0005). The CMake target keeps
+# upstream's flutter-pi name for merge hygiene; the installed binary is
+# flutter-vrx.
+set_target_properties(flutter-pi PROPERTIES OUTPUT_NAME flutter-vrx)
 install(TARGETS flutter-pi RUNTIME DESTINATION bin)
 
 # Enable lto if supported.
