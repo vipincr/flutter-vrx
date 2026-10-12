@@ -759,6 +759,41 @@ fail_unlock:
     return ok;
 }
 
+int egl_gbm_render_surface_export_front(struct egl_gbm_render_surface *s, struct egl_gbm_export *out) {
+    struct locked_fb *fb;
+    int fd;
+
+    surface_lock(CAST_SURFACE(s));
+    fb = s->locked_front_fb;
+    if (fb == NULL) {
+        surface_unlock(CAST_SURFACE(s));
+        return EAGAIN;  // nothing rendered yet
+    }
+    fb = locked_fb_ref(fb);
+    surface_unlock(CAST_SURFACE(s));
+
+    fd = gbm_bo_get_fd(fb->bo);
+    if (fd < 0) {
+        LOG_ERROR("Couldn't export the front buffer. gbm_bo_get_fd failed.\n");
+        locked_fb_unref(fb);
+        return EIO;
+    }
+
+    out->hold = fb;
+    out->dmabuf_fd = fd;
+    out->width = gbm_bo_get_width(fb->bo);
+    out->height = gbm_bo_get_height(fb->bo);
+    out->pitch = gbm_bo_get_stride(fb->bo);
+    out->format = gbm_bo_get_format(fb->bo);
+    out->modifier = gbm_bo_get_modifier(fb->bo);
+    return 0;
+}
+
+void egl_gbm_render_surface_release_export(void *hold) {
+    ASSERT_NOT_NULL(hold);
+    locked_fb_unref((struct locked_fb *) hold);
+}
+
 /**
  * @brief Get the EGL Surface for rendering into this render surface.
  *

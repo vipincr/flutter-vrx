@@ -13,6 +13,8 @@ struct vrx_app_client;
 struct vrx_app_client_callbacks {
     void (*on_focus)(uint32_t focused, void *userdata);
     void (*on_input)(const struct vrx_msg_input *input, void *userdata);
+    // the compositor is done with the buffer presented as `sequence`
+    void (*on_release)(uint32_t sequence, void *userdata);
     void *userdata;
 };
 
@@ -25,9 +27,11 @@ bool vrx_app_client_accepts_format(const struct vrx_app_client *c,
                                    uint32_t format, uint64_t modifier);
 bool vrx_app_client_send(struct vrx_app_client *c, uint32_t type,
                          const void *payload, size_t len, int fd);
-bool vrx_app_client_present(struct vrx_app_client *c, int dmabuf_fd,
-                            uint32_t width, uint32_t height, uint32_t pitch,
-                            uint32_t format, uint64_t modifier);
+// Present a frame; returns its sequence (>0), or 0 when the send failed.
+// The buffer must not be reused until on_release reports that sequence.
+uint32_t vrx_app_client_present(struct vrx_app_client *c, int dmabuf_fd,
+                                uint32_t width, uint32_t height, uint32_t pitch,
+                                uint32_t format, uint64_t modifier);
 bool vrx_app_client_dispatch(struct vrx_app_client *c,
                              const struct vrx_app_client_callbacks *cb);
 

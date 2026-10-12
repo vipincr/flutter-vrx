@@ -35,10 +35,12 @@ int main(int argc, char **argv) {
     if (running_in_crashpad_mode(argc, argv)) {
         return crashpad_handler_main(argc, argv);
     }
+#endif
+    // Outside the crashpad #ifdef: inside it, every build without a bundled
+    // crashpad handler (ours) ran `--compositor` as an ordinary app.
     if (running_in_compositor_mode(argc, argv)) {
         return vrx_compositor_main(argc, argv);
     }
-#endif
 
     return flutterpi_app_main(argc, argv);
 }

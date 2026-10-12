@@ -12,8 +12,10 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <pthread.h>
+#include <unistd.h>
 
 #include <flutter_embedder.h>
 
@@ -28,6 +30,10 @@
 #include "util/collection.h"
 #include "util/logging.h"
 #include "util/refcounting.h"
+#include "vrx_app_client.h"
+#ifdef HAVE_EGL_GLES2
+    #include "egl_gbm_render_surface.h"
+#endif
 
 #include "config.h"
 
@@ -201,6 +207,22 @@ struct window {
      *
      */
     struct render_surface *render_surface;
+
+    /**
+     * @brief vrx app role: frames go to the compositor over IPC instead of
+     * being discarded (dummy window) or scanned out (KMS window).
+     *
+     * `vrx_out` holds the frames the compositor has not released yet; at
+     * most VRX_MAX_OUTSTANDING, because a GBM surface has 4 buffers and the
+     * render target plus the locked front take two.
+     */
+    struct vrx_app_client *vrx_client;
+#define VRX_MAX_OUTSTANDING 2
+    struct {
+        uint32_t sequence;
+        void *hold;
+    } vrx_out[VRX_MAX_OUTSTANDING];
+    uint32_t vrx_skipped;
 
 #ifdef HAVE_EGL_GLES2
     /**
@@ -411,6 +433,9 @@ static int window_init(
     window->gl_renderer = NULL;
     window->vk_renderer = NULL;
     window->render_surface = NULL;
+    window->vrx_client = NULL;
+    memset(window->vrx_out, 0, sizeof window->vrx_out);
+    window->vrx_skipped = 0;
     window->cursor_enabled = false;
     window->cursor_pos = VEC2I(0, 0);
     window->push_composition = NULL;
@@ -1694,15 +1719,75 @@ MUST_CHECK struct window *dummy_window_new(
     return window;
 }
 
+// vrx app role: export the current front buffer to the compositor. Called
+// with the window lock held, per frame and again when focus is gained (an
+// idle app has no new frame to show otherwise).
+static void vrx_present_front_locked(struct window *window) {
+#ifdef HAVE_EGL_GLES2
+    if (window->vrx_client == NULL || window->render_surface == NULL ||
+        window->renderer_type != kOpenGL_RendererType) {
+        return;
+    }
+    int slot = -1;
+    for (int i = 0; i < VRX_MAX_OUTSTANDING; i++) {
+        if (window->vrx_out[i].hold == NULL) { slot = i; break; }
+    }
+    if (slot < 0) {
+        // compositor still holds two frames: skip this one rather than let
+        // the next swap find no free GBM buffer
+        window->vrx_skipped++;
+        return;
+    }
+    struct egl_gbm_export ex;
+    if (egl_gbm_render_surface_export_front(CAST_EGL_GBM_RENDER_SURFACE(window->render_surface), &ex) != 0) {
+        return;
+    }
+    uint32_t seq = vrx_app_client_present(window->vrx_client, ex.dmabuf_fd, ex.width, ex.height,
+                                          ex.pitch, ex.format, ex.modifier);
+    close(ex.dmabuf_fd);
+    if (seq != 0) {
+        window->vrx_out[slot].sequence = seq;
+        window->vrx_out[slot].hold = ex.hold;
+    } else {
+        egl_gbm_render_surface_release_export(ex.hold);
+    }
+#else
+    (void) window;
+#endif
+}
+
 static int dummy_window_push_composition(struct window *window, struct fl_layer_composition *composition) {
     window_lock(window);
-
-    /// TODO: Maybe allow to export the layer composition as an image, for testing purposes.
     (void) composition;
-
+    vrx_present_front_locked(window);
     window_unlock(window);
-
     return 0;
+}
+
+void window_vrx_present_front(struct window *window) {
+    window_lock(window);
+    vrx_present_front_locked(window);
+    window_unlock(window);
+}
+
+void window_set_vrx_client(struct window *window, struct vrx_app_client *client) {
+    window_lock(window);
+    window->vrx_client = client;
+    window_unlock(window);
+}
+
+void window_vrx_on_release(struct window *window, uint32_t sequence) {
+    window_lock(window);
+    for (int i = 0; i < VRX_MAX_OUTSTANDING; i++) {
+        if (window->vrx_out[i].hold != NULL && window->vrx_out[i].sequence == sequence) {
+#ifdef HAVE_EGL_GLES2
+            egl_gbm_render_surface_release_export(window->vrx_out[i].hold);
+#endif
+            window->vrx_out[i].hold = NULL;
+            break;
+        }
+    }
+    window_unlock(window);
 }
 
 static struct render_surface *dummy_window_get_render_surface_internal(struct window *window, bool has_size, UNUSED struct vec2i size) {
@@ -1791,6 +1876,16 @@ static EGLSurface dummy_window_get_egl_surface(struct window *window) {
 
 static void dummy_window_deinit(struct window *window) {
     ASSERT_NOT_NULL(window);
+
+#ifdef HAVE_EGL_GLES2
+    // frames still out with the compositor hold GBM buffers of the surface
+    for (int i = 0; i < VRX_MAX_OUTSTANDING; i++) {
+        if (window->vrx_out[i].hold != NULL) {
+            egl_gbm_render_surface_release_export(window->vrx_out[i].hold);
+            window->vrx_out[i].hold = NULL;
+        }
+    }
+#endif
 
     if (window->render_surface != NULL) {
         surface_unref(CAST_SURFACE(window->render_surface));

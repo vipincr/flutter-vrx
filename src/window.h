@@ -109,6 +109,16 @@ MUST_CHECK struct window *dummy_window_new(
  */
 int window_push_composition(struct window *window, struct fl_layer_composition *composition);
 
+struct vrx_app_client;
+
+/**
+ * @brief vrx app role: present this (dummy) window's frames to the vrx
+ * compositor over IPC. Releases arrive through window_vrx_on_release.
+ */
+void window_set_vrx_client(struct window *window, struct vrx_app_client *client);
+void window_vrx_on_release(struct window *window, uint32_t sequence);
+void window_vrx_present_front(struct window *window);
+
 /**
  * @brief Get the current view geometry of this window.
  *

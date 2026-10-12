@@ -57,6 +57,7 @@
 #include "util/list.h"
 #include "util/logging.h"
 #include "window.h"
+#include "vrx_app_client.h"
 
 #include "config.h"
 
@@ -1836,6 +1837,99 @@ static int on_user_input_fd_ready(sd_event_source *s, int fd, uint32_t revents, 
     return user_input_on_fd_ready(input);
 }
 
+// ─── vrx app role ────────────────────────────────────────────────────────
+//
+// In --app mode the compositor owns the display and the input devices; this
+// process renders offscreen, presents each frame over IPC (window.c) and
+// receives routed input here. Touch events are emitted exactly the way
+// user_input.c emits libinput touch: one kAdd per slot the first time it is
+// seen, then kDown/kMove/kUp, the up at the slot's last position.
+
+#define VRX_TOUCH_SLOTS 10
+#define VRX_TOUCH_DEVICE_BASE 1000  // clear of any pointer device ids
+
+static struct {
+    struct vrx_app_client *client;
+    struct window *window;
+    struct flutterpi *fpi;
+    bool slot_added[VRX_TOUCH_SLOTS];
+    struct vec2f slot_pos[VRX_TOUCH_SLOTS];
+} vrx_app;
+
+static FlutterPointerEvent vrx_touch_event(FlutterPointerPhase phase, uint64_t time_ns, struct vec2f pos, int32_t device) {
+    FlutterPointerEvent e;
+    memset(&e, 0, sizeof e);
+    e.struct_size = sizeof e;
+    e.phase = phase;
+    e.timestamp = (size_t) (time_ns / 1000);  // the embedder wants microseconds
+    e.x = pos.x;
+    e.y = pos.y;
+    e.device = device;
+    e.signal_kind = kFlutterPointerSignalKindNone;
+    e.device_kind = kFlutterPointerDeviceKindTouch;
+    return e;
+}
+
+static void vrx_on_input(const struct vrx_msg_input *in, void *userdata) {
+    (void) userdata;
+    if (in->kind != VRX_INPUT_TOUCH) {
+        // v1: the bench carriers are touch panels; pointer and key routing
+        // land with the keyboard-capable carriers
+        return;
+    }
+    const struct vrx_input_touch *t = &in->u.touch;
+    if (t->slot >= VRX_TOUCH_SLOTS) return;
+    int32_t device = VRX_TOUCH_DEVICE_BASE + (int32_t) t->slot;
+    FlutterPointerEvent events[2];
+    size_t n = 0;
+
+    if (t->kind != 2) {
+        vrx_app.slot_pos[t->slot] = VEC2F((double) t->x, (double) t->y);
+    }
+    struct vec2f pos = vrx_app.slot_pos[t->slot];
+
+    if (!vrx_app.slot_added[t->slot]) {
+        events[n++] = vrx_touch_event(kAdd, t->time_ns, pos, device);
+        vrx_app.slot_added[t->slot] = true;
+    }
+    FlutterPointerPhase phase = t->kind == 0 ? kDown : t->kind == 1 ? kMove : kUp;
+    events[n++] = vrx_touch_event(phase, t->time_ns, pos, device);
+    on_flutter_pointer_event(vrx_app.fpi, events, n);
+}
+
+static void vrx_on_focus(uint32_t focused, void *userdata) {
+    (void) userdata;
+    // An idle app draws nothing new, so a focused app re-presents what it
+    // last rendered; otherwise the screen keeps showing the previous app.
+    // B4 turns unfocused into "stop pumping frames"; v1 keeps rendering.
+    if (focused && vrx_app.window != NULL) {
+        window_vrx_present_front(vrx_app.window);
+    }
+}
+
+static void vrx_on_release(uint32_t sequence, void *userdata) {
+    (void) userdata;
+    window_vrx_on_release(vrx_app.window, sequence);
+}
+
+static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+    (void) s;
+    (void) fd;
+    (void) userdata;
+    static const struct vrx_app_client_callbacks cbs = {
+        .on_focus = vrx_on_focus,
+        .on_input = vrx_on_input,
+        .on_release = vrx_on_release,
+    };
+    if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
+        // the compositor went away or told us to stop: an app has nothing to
+        // show without it, so exit and let the supervisor decide
+        LOG_ERROR("vrx: compositor connection closed; exiting.\n");
+        flutterpi_schedule_exit(vrx_app.fpi);
+    }
+    return 0;
+}
+
 static struct flutter_paths *setup_paths(enum flutter_runtime_mode runtime_mode, const char *app_bundle_path) {
 #if defined(FILESYSTEM_LAYOUT_DEFAULT)
     return fs_layout_flutterpi_resolve(app_bundle_path, runtime_mode);
@@ -1863,6 +1957,7 @@ bool flutterpi_parse_cmdline_args(int argc, char **argv, struct flutterpi_cmdlin
     int runtime_mode_int = FLUTTER_RUNTIME_MODE_DEBUG;
     int vulkan_int = false;
     int dummy_display_int = 0;
+    int vrx_app_int = 0;
     int longopt_index = 0;
     int opt, ok;
 
@@ -1883,6 +1978,7 @@ bool flutterpi_parse_cmdline_args(int argc, char **argv, struct flutterpi_cmdlin
         { "dummy-display", no_argument, &dummy_display_int, 1 },
         { "dummy-display-size", required_argument, NULL, 's' },
         { "drm-fd", required_argument, NULL, 'f' },
+        { "app", no_argument, &vrx_app_int, 1 },
         { 0, 0, 0, 0 },
     };
     memset(result_out, 0, sizeof *result_out);
@@ -2060,6 +2156,10 @@ valid_format:
     result_out->use_vulkan = vulkan_int;
 
     result_out->dummy_display = !!dummy_display_int;
+    result_out->vrx_app = !!vrx_app_int;
+    if (result_out->vrx_app) {
+        result_out->dummy_display = true;
+    }
 
     return true;
 }
@@ -2199,6 +2299,54 @@ found_connected_connector:
 fail_free_devices:
     drmFreeDevices(devices, n_devices);
     return NULL;
+}
+
+// vrx app role: the GBM device for buffers the compositor will scan out.
+// It must be the KMS (primary) node, not the render node: on split
+// display/render hardware (the CM4: vc4 scans out, v3d renders) only the
+// display driver can scan out a buffer, and vc4 refuses to import v3d's
+// scattered shmem pages (drmPrimeFDToHandle EINVAL, bench 2026-10-13). On
+// the KMS node Mesa's kmsro allocates from the display driver and renders
+// through the GPU. Allocation needs no DRM master, so the compositor stays
+// the only master.
+static struct gbm_device *open_kms_node_as_gbm_device(void) {
+    drmDevicePtr devices[64];
+    int n = drmGetDevices2(0, devices, sizeof(devices) / sizeof(*devices));
+    if (n < 0) {
+        LOG_ERROR("Could not query DRM device list: %s\n", strerror(-n));
+        return NULL;
+    }
+    struct gbm_device *gbm = NULL;
+    for (int i = 0; i < n && gbm == NULL; i++) {
+        if (!(devices[i]->available_nodes & (1 << DRM_NODE_PRIMARY))) {
+            continue;
+        }
+        int fd = open(devices[i]->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        drmModeRes *res = drmModeGetResources(fd);
+        bool is_kms = res != NULL && res->count_connectors > 0 && res->count_crtcs > 0;
+        if (res != NULL) {
+            drmModeFreeResources(res);
+        }
+        if (!is_kms) {
+            close(fd);
+            continue;
+        }
+        gbm = gbm_create_device(fd);
+        if (gbm == NULL) {
+            LOG_ERROR("Could not create GBM device on \"%s\". Continuing.\n", devices[i]->nodes[DRM_NODE_PRIMARY]);
+            close(fd);
+        } else {
+            LOG_DEBUG("vrx: allocating scanout buffers through %s\n", devices[i]->nodes[DRM_NODE_PRIMARY]);
+        }
+    }
+    drmFreeDevices(devices, n);
+    if (gbm == NULL) {
+        LOG_ERROR("vrx: no KMS device to allocate scanout buffers from.\n");
+    }
+    return gbm;
 }
 
 static struct gbm_device *open_rendernode_as_gbm_device() {
@@ -2401,6 +2549,26 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         goto fail_free_cmd_args;
     }
 
+    if (cmd_args.vrx_app) {
+        // The compositor decides the geometry, so connect before any window
+        // exists. No compositor means nothing to show: refuse to start.
+        if (renderer_type != kOpenGL_RendererType) {
+            LOG_ERROR("vrx: --app presents EGL/GBM buffers and needs the OpenGL renderer.\n");
+            goto fail_free_cmd_args;
+        }
+        char app_id[64];
+        vrx_bundle_id(bundle_path, app_id, sizeof app_id);
+        vrx_app.client = vrx_app_client_connect(app_id);
+        if (vrx_app.client == NULL) {
+            goto fail_free_cmd_args;
+        }
+        cmd_args.dummy_display_size = VEC2I(
+            (int) vrx_app_client_width(vrx_app.client),
+            (int) vrx_app_client_height(vrx_app.client)
+        );
+        vrx_app.fpi = fpi;
+    }
+
     paths = setup_paths(runtime_mode, bundle_path);
     if (paths == NULL) {
         goto fail_free_cmd_args;
@@ -2478,7 +2646,9 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         // render node as a GBM device.
         // There's other ways to get an offscreen EGL display, but we need the gbm_device for other things
         // (e.g. buffer allocating for the video player, so we just do this.)
-        gbm_device = open_rendernode_as_gbm_device();
+        // app mode renders into buffers the compositor scans out; plain
+        // offscreen rendering is happy with the unprivileged render node
+        gbm_device = cmd_args.vrx_app ? open_kms_node_as_gbm_device() : open_rendernode_as_gbm_device();
         if (gbm_device == NULL) {
             goto fail_destroy_locales;
         }
@@ -2599,6 +2769,15 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         }
     }
 
+    if (cmd_args.vrx_app) {
+        if (window == NULL) {
+            LOG_ERROR("Couldn't create the vrx app window.\n");
+            goto fail_unref_renderer;
+        }
+        window_set_vrx_client(window, vrx_app.client);
+        vrx_app.window = window;
+    }
+
     compositor = compositor_new(tracer, window);
     if (compositor == NULL) {
         LOG_ERROR("Couldn't create compositor.\n");
@@ -2632,7 +2811,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     fpi->libseat = libseat;
     list_inithead(&fpi->fd_for_device_id);
 
-    input = user_input_new(
+    // the vrx compositor owns the input devices; events arrive over IPC
+    input = cmd_args.vrx_app ? NULL : user_input_new(
         &user_input_interface,
         fpi,
         &geometry.display_to_view_transform,
@@ -2640,7 +2820,13 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         geometry.display_size.x,
         geometry.display_size.y
     );
-    if (input == NULL) {
+    if (cmd_args.vrx_app) {
+        ok = sd_event_add_io(event_loop, NULL, vrx_app_client_fd(vrx_app.client), EPOLLIN | EPOLLHUP | EPOLLERR, on_vrx_ipc_ready, NULL);
+        if (ok < 0) {
+            LOG_ERROR("vrx: couldn't listen on the compositor socket. sd_event_add_io: %s\n", strerror(-ok));
+            goto fail_unref_compositor;
+        }
+    } else if (input == NULL) {
         LOG_ERROR("Couldn't initialize user input. flutter-pi will run without user input.\n");
     } else {
         sd_event_source *user_input_event_source;

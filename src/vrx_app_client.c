@@ -37,7 +37,7 @@ void *vrx_app_client_recv(struct vrx_app_client *c, struct vrx_msg_header *out_h
 struct vrx_app_client *vrx_app_client_connect(const char *bundle_id) {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, VRX_UI_SOCKET, sizeof(addr.sun_path) - 1);
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         fprintf(stderr, "[vrx-app] socket: %s\n", strerror(errno));
         return NULL;
@@ -127,10 +127,10 @@ bool vrx_app_client_send(struct vrx_app_client *c, uint32_t type,
     return sendmsg(c->fd, &mh, MSG_NOSIGNAL) >= 0;
 }
 
-bool vrx_app_client_present(struct vrx_app_client *c, int dmabuf_fd,
-                            uint32_t width, uint32_t height, uint32_t pitch,
-                            uint32_t format, uint64_t modifier) {
-    if (!c || !c->registered) return false;
+uint32_t vrx_app_client_present(struct vrx_app_client *c, int dmabuf_fd,
+                                uint32_t width, uint32_t height, uint32_t pitch,
+                                uint32_t format, uint64_t modifier) {
+    if (!c || !c->registered) return 0;
     struct vrx_msg_buffer b = {
         .width = width,
         .height = height,
@@ -139,9 +139,8 @@ bool vrx_app_client_present(struct vrx_app_client *c, int dmabuf_fd,
         .modifier = modifier,
         .sequence = ++c->last_sent_sequence,
     };
-    // The fd is dup'd by sendmsg into the message; the caller keeps ownership
-    // of the original and closes it after the bo is released.
-    return vrx_app_client_send(c, VRX_MSG_BUFFER, &b, sizeof(b), dmabuf_fd);
+    // sendmsg dups the fd into the message; the caller keeps the original.
+    return vrx_app_client_send(c, VRX_MSG_BUFFER, &b, sizeof(b), dmabuf_fd) ? b.sequence : 0;
 }
 
 // Read one message. Returns a malloc'd payload the caller frees, or NULL on
@@ -163,8 +162,10 @@ void *vrx_app_client_recv(struct vrx_app_client *c, struct vrx_msg_header *out_h
         .msg_iov = &iov, .msg_iovlen = 1,
         .msg_control = cbuf, .msg_controllen = sizeof(cbuf),
     };
-    ssize_t n = recvmsg(c->fd, &mh, 0);
+    // seqpacket: one recvmsg is exactly one message
+    ssize_t n = recvmsg(c->fd, &mh, MSG_CMSG_CLOEXEC);
     if (n <= 0) return NULL;
+    if (mh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) return NULL;
     if ((size_t) n < sizeof(pkt.h) || pkt.h.length > sizeof(pkt.payload)) return NULL;
     if (pkt.h.length > 0 && (size_t) n < sizeof(pkt.h) + pkt.h.length) return NULL;
 
@@ -207,6 +208,11 @@ bool vrx_app_client_dispatch(struct vrx_app_client *c,
         case VRX_MSG_INPUT:
             if (h.length >= sizeof(struct vrx_msg_input) && cb && cb->on_input) {
                 cb->on_input((const struct vrx_msg_input *) p, cb->userdata);
+            }
+            break;
+        case VRX_MSG_RELEASE:
+            if (h.length >= sizeof(struct vrx_msg_release) && cb && cb->on_release) {
+                cb->on_release(((struct vrx_msg_release *) p)->sequence, cb->userdata);
             }
             break;
         case VRX_MSG_SHUTDOWN:

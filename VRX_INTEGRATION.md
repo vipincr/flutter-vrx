@@ -1,10 +1,31 @@
-# flutter-vrx: integrating the app role (B2 completion design)
+# flutter-vrx: integrating the app role (B2)
 
-Status: compositor role (`--compositor`) and the IPC client
-(`vrx_app_client.c`) compile cross-clean. What remains is wiring the client
-into `flutterpi_app_main` so `--app <bundle>` runs the stock engine path but
-presents over IPC instead of KMS. This file records the surveyed design so it
-is executed, not re-derived.
+Status (2026-10-13): **B2 done and bench-verified on the CM4 +
+CM4-DISP-BASE-2.8A.** `flutter-vrx --compositor` owns KMS and input; each
+`flutter-vrx --release --app <bundle>` renders in its own process and
+presents over IPC. Proven on the panel: the app's frame is scanned out
+through the compositor; with two apps running, `kill -9` of the focused one
+moves focus to the other, which re-presents, and the screen flips to it
+while the compositor survives.
+
+What the bench changed relative to the design below:
+
+- **Allocation runs on the KMS node, not the render node.** vc4 scans out
+  only contiguous (CMA) memory and refuses to import v3d's shmem
+  (drmPrimeFDToHandle EINVAL). App mode opens the primary node as its GBM
+  device, so Mesa's kmsro allocates from vc4 and renders through v3d; no DRM
+  master needed. The compositor imports with drmPrimeFDToHandle into the KMS
+  device (a GBM device on the KMS node returns render-side handles, which
+  drmModeAddFB2 rejects with ENOENT).
+- **SOCK_SEQPACKET**, so every recvmsg is one message with its fds.
+- **VRX_MSG_RELEASE**: the compositor returns each buffer once it is off
+  screen or superseded; the app holds at most two (GBM surfaces have four
+  buffers) and skips a frame rather than starve the surface.
+- **Modeset once, then page flips**, with a one-deep queue (newest wins).
+- **Focus gain re-presents** the app's current front buffer: an idle app has
+  no new frame to show otherwise.
+
+The surveyed design follows as it was recorded.
 
 ## The seams (verified against this tree)
 

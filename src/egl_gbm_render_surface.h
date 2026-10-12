@@ -49,4 +49,19 @@ ATTR_PURE EGLSurface egl_gbm_render_surface_get_egl_surface(struct egl_gbm_rende
 
 ATTR_PURE EGLConfig egl_gbm_render_surface_get_egl_config(struct egl_gbm_render_surface *s);
 
+// vrx app role: the newest frame (the front buffer locked by the last
+// queue_present), exported for the compositor. `hold` keeps the GBM buffer
+// locked so the surface never renders into it; pass it to
+// egl_gbm_render_surface_release_export once the compositor sends
+// VRX_MSG_RELEASE. `dmabuf_fd` is the caller's to close (after sending).
+struct egl_gbm_export {
+    void *hold;
+    int dmabuf_fd;
+    uint32_t width, height, pitch, format;
+    uint64_t modifier;
+};
+
+int egl_gbm_render_surface_export_front(struct egl_gbm_render_surface *s, struct egl_gbm_export *out);
+void egl_gbm_render_surface_release_export(void *hold);
+
 #endif  // _FLUTTERPI_SRC_EGL_GBM_RENDER_SURFACE_H

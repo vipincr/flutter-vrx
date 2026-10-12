@@ -5,8 +5,11 @@
 // The wire between `flutter-vrx --compositor` (DRM master, input owner,
 // supervisor) and each `flutter-vrx --app` process (own UI thread, own
 // engine, renders into a dmabuf it hands over). One unix socket at
-// VRX_UI_SOCKET; length-prefixed little-endian messages; file descriptors
-// travel as SCM_RIGHTS on the message that names them.
+// VRX_UI_SOCKET of type SOCK_SEQPACKET: every send is one message and every
+// recvmsg returns exactly one, so neither side frames or buffers (a stream
+// socket merges and splits messages, which lost the FOCUS that follows
+// REGISTERED). File descriptors travel as SCM_RIGHTS on the message that
+// names them.
 //
 // v1 is deliberately small: register, present, focus, input, close. The
 // compositor shows exactly one fullscreen app (the focused one) by flipping
@@ -42,6 +45,11 @@ enum vrx_msg_type {
     VRX_MSG_CLOSED = 6,
     // comp -> app: fatal protocol error; exit.
     VRX_MSG_SHUTDOWN = 7,
+    // comp -> app: I no longer scan out (or will never scan out) the buffer
+    // you presented with this sequence; you may render into it again. Until
+    // this arrives the app must not reuse the buffer, or it draws into the
+    // frame on screen.
+    VRX_MSG_RELEASE = 8,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -73,6 +81,10 @@ struct vrx_msg_buffer {
 
 struct vrx_msg_focus {
     uint32_t focused;  // 0/1
+};
+
+struct vrx_msg_release {
+    uint32_t sequence;  // the vrx_msg_buffer.sequence being returned
 };
 
 // Input event kinds. Coordinates are output pixels, origin top-left.
@@ -111,5 +123,29 @@ struct vrx_msg_input {
 };
 
 struct vrx_msg_closed {};
+
+// The app id for a bundle path. meta-flutter installs apps as
+// /usr/share/flutter/<app>/<engine-version>/release, so the id is the
+// component two above "release"; any other path uses its last component.
+#include <stdio.h>
+#include <string.h>
+static inline void vrx_bundle_id(const char *path, char *out, size_t out_len) {
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    size_t n = strlen(tmp);
+    while (n > 1 && tmp[n - 1] == '/') tmp[--n] = 0;
+    char *last = strrchr(tmp, '/');
+    if (last && strcmp(last + 1, "release") == 0) {
+        *last = 0;                          // .../<app>/<ver>
+        char *ver = strrchr(tmp, '/');
+        if (ver) {
+            *ver = 0;                       // .../<app>
+            char *app = strrchr(tmp, '/');
+            snprintf(out, out_len, "%s", app ? app + 1 : tmp);
+            return;
+        }
+    }
+    snprintf(out, out_len, "%s", last ? last + 1 : tmp);
+}
 
 #endif  // VRX_IPC_H

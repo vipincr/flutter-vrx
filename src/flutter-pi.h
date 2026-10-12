@@ -145,6 +145,11 @@ struct flutterpi_cmdline_args {
     bool dummy_display;
     struct vec2i dummy_display_size;
 
+    // vrx app role (--app): render offscreen and present to the vrx
+    // compositor over IPC; implies the dummy display with the compositor's
+    // output size.
+    bool vrx_app;
+
     bool has_drm_fd;
     int drm_fd;
 };
