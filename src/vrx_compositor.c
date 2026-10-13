@@ -32,6 +32,7 @@
 #include <drm_fourcc.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <grp.h>
 #include <inttypes.h>
 #include <libinput.h>
@@ -41,6 +42,7 @@
 #include <string.h>
 #include <linux/input-event-codes.h>
 #include <sys/epoll.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
 #include <sys/socket.h>
@@ -115,6 +117,19 @@ struct vrx_compositor {
     // key repeat: libinput sends none, so the held key repeats from here
     int repeat_fd;
     uint32_t repeat_key;       // 0 = none held
+
+    // idle (plan 0008 Part C step 3): no input for light_off seconds turns
+    // the backlight off; the input that wakes it only wakes it
+    int idle_fd;               // timerfd
+    int conf_fd;               // inotify on the settings directory
+    uint32_t light_off;        // seconds, 0 = never
+    char backlight[96];        // /sys/class/backlight/<name>, "" = none
+    int light_level;           // what to restore on waking
+    bool dark;                 // the timer turned the light off
+    int touches;               // contacts down now
+    bool swallow_touch;        // the waking touch, until every contact is up
+    bool swallow_pointer;      // the waking click, until its buttons are up
+    uint32_t swallow_key;      // the waking key, until it is released
 
     struct app_client apps[MAX_APPS];
     int focused;               // slot, -1 = none
@@ -1068,7 +1083,140 @@ static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m)
     }
 }
 
+// ── idle ────────────────────────────────────────────────────────────────
+// The system's own settings are the reserved id's file (vrx is the OS,
+// never an applet): light_off=<seconds>, 0 or absent = never. vrx-policy
+// seeds it; Settings > Display writes it.
+#define VRX_SETTINGS_DIR "/etc/vrx/settings"
+#define VRX_SETTINGS_FILE VRX_SETTINGS_DIR "/vrx.conf"
+
+static int backlight_get(const struct vrx_compositor *c, const char *what) {
+    char path[128];
+    snprintf(path, sizeof path, "%s/%s", c->backlight, what);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+static void backlight_set(const struct vrx_compositor *c, int level) {
+    char path[128];
+    snprintf(path, sizeof path, "%s/brightness", c->backlight);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "[vrx-compositor] %s: %s\n", path, strerror(errno));
+        return;
+    }
+    fprintf(f, "%d\n", level);
+    fclose(f);
+}
+
+static void idle_arm(struct vrx_compositor *c) {
+    if (c->idle_fd < 0) return;
+    struct itimerspec t = { .it_value = { .tv_sec = c->backlight[0] ? c->light_off : 0 } };
+    timerfd_settime(c->idle_fd, 0, &t, NULL);
+}
+
+static void idle_read_conf(struct vrx_compositor *c) {
+    uint32_t light_off = 0;
+    FILE *f = fopen(VRX_SETTINGS_FILE, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof line, f)) {
+            unsigned v;
+            if (sscanf(line, " light_off = %u", &v) == 1) light_off = v;
+        }
+        fclose(f);
+    }
+    if (light_off != c->light_off) {
+        fprintf(stderr, "[vrx-compositor] light off after %us idle%s\n", light_off, light_off ? "" : " (never)");
+    }
+    c->light_off = light_off;
+    idle_arm(c);
+}
+
+static void idle_init(struct vrx_compositor *c) {
+    c->idle_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    DIR *d = opendir("/sys/class/backlight");
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            snprintf(c->backlight, sizeof c->backlight, "/sys/class/backlight/%s", e->d_name);
+            break;
+        }
+        closedir(d);
+    }
+    if (!c->backlight[0]) fprintf(stderr, "[vrx-compositor] no backlight: the light never goes off\n");
+    // the directory, not the file: Settings writes a new file renamed over it
+    c->conf_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    if (c->conf_fd >= 0 && inotify_add_watch(c->conf_fd, VRX_SETTINGS_DIR, IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
+        fprintf(stderr, "[vrx-compositor] watch %s: %s\n", VRX_SETTINGS_DIR, strerror(errno));
+    }
+    idle_read_conf(c);
+}
+
+static void idle_conf_changed(struct vrx_compositor *c) {
+    char buf[4096];
+    while (read(c->conf_fd, buf, sizeof buf) > 0) {}
+    idle_read_conf(c);
+}
+
+static void idle_fire(struct vrx_compositor *c) {
+    uint64_t expirations;
+    if (read(c->idle_fd, &expirations, sizeof expirations) != sizeof expirations) return;
+    if (c->dark || !c->backlight[0] || !c->light_off) return;
+    int level = backlight_get(c, "brightness");
+    // already off (Settings' Light): the next touch lights it at full
+    c->light_level = level > 0 ? level : backlight_get(c, "max_brightness");
+    if (level > 0) backlight_set(c, 0);
+    c->dark = true;
+    fprintf(stderr, "[vrx-compositor] idle %us: light off\n", c->light_off);
+}
+
+// Every input re-arms the timer. On a dark panel the first touch, click
+// or key lights it and is not delivered, nor is the rest of it (a touch
+// until every contact is up, a click until its buttons are, a key until
+// its release). A panel something else lit meanwhile (an alarm) is not
+// dark any more: that input goes through.
+static bool idle_swallows(struct vrx_compositor *c, const struct vrx_msg_input *m) {
+    idle_arm(c);
+    if (m->kind == VRX_INPUT_TOUCH) {
+        if (m->u.touch.kind == 0) c->touches++;
+        if (m->u.touch.kind == 2 && c->touches > 0) c->touches--;
+    }
+    if (c->dark) {
+        c->dark = false;
+        if (backlight_get(c, "brightness") <= 0) {
+            backlight_set(c, c->light_level);
+            fprintf(stderr, "[vrx-compositor] input: light on\n");
+            if (m->kind == VRX_INPUT_TOUCH) c->swallow_touch = true;
+            if (m->kind == VRX_INPUT_POINTER && m->u.pointer.buttons) c->swallow_pointer = true;
+            if (m->kind == VRX_INPUT_KEY && m->u.key.state == 1) c->swallow_key = m->u.key.keycode;
+        }
+    }
+    switch (m->kind) {
+    case VRX_INPUT_TOUCH:
+        if (!c->swallow_touch) return false;
+        if (c->touches == 0) c->swallow_touch = false;
+        return true;
+    case VRX_INPUT_POINTER:
+        if (!c->swallow_pointer) return false;
+        if (m->u.pointer.buttons == 0) c->swallow_pointer = false;
+        return true;
+    case VRX_INPUT_KEY:
+        if (!c->swallow_key || m->u.key.keycode != c->swallow_key) return false;
+        if (m->u.key.state == 0) c->swallow_key = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void send_input(struct vrx_compositor *c, const struct vrx_msg_input *m) {
+    if (idle_swallows(c, m)) return;
     int target = input_target(c, m);
     if (target < 0 || !c->apps[target].in_use) return;
     client_send(c, c->apps[target].fd, VRX_MSG_INPUT, m, sizeof *m, -1);
@@ -1236,6 +1384,8 @@ static void li_dispatch(struct vrx_compositor *c) {
 #define TAG_LIBINPUT  0xFFFFFFFFFFFFFFFDull
 #define TAG_DRM       0xFFFFFFFFFFFFFFFCull
 #define TAG_REPEAT    0xFFFFFFFFFFFFFFFBull
+#define TAG_IDLE      0xFFFFFFFFFFFFFFFAull
+#define TAG_CONF      0xFFFFFFFFFFFFFFF9ull
 #define CLIENT_TAG(slot, fd) (((uint64_t) (uint32_t) (fd) << 32) | (uint32_t) (slot))
 
 static void accept_client(struct vrx_compositor *c) {
@@ -1308,6 +1458,15 @@ int vrx_compositor_main(int argc, char **argv) {
         ev.data.u64 = TAG_REPEAT;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.repeat_fd, &ev);
     }
+    idle_init(&c);
+    if (c.idle_fd >= 0) {
+        ev.data.u64 = TAG_IDLE;
+        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.idle_fd, &ev);
+    }
+    if (c.conf_fd >= 0) {
+        ev.data.u64 = TAG_CONF;
+        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.conf_fd, &ev);
+    }
     c.px = c.width / 2.0;
     c.py = c.height / 2.0;
     cursor_init(&c);
@@ -1332,6 +1491,10 @@ int vrx_compositor_main(int argc, char **argv) {
                 drm_readable(&c);
             } else if (tag == TAG_REPEAT) {
                 repeat_fire(&c);
+            } else if (tag == TAG_IDLE) {
+                idle_fire(&c);
+            } else if (tag == TAG_CONF) {
+                idle_conf_changed(&c);
             } else {
                 int slot = (int) (uint32_t) tag;
                 int fd = (int) (tag >> 32);
