@@ -42,7 +42,9 @@
 #include <string.h>
 #include <linux/input-event-codes.h>
 #include <sys/epoll.h>
+#include <signal.h>
 #include <sys/inotify.h>
+#include <sys/signalfd.h>
 #include <sys/mman.h>
 #include <sys/timerfd.h>
 #include <sys/socket.h>
@@ -52,6 +54,7 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <systemd/sd-bus.h>
 
 #include "vrx_ipc.h"
 #include "vrx_kms.h"
@@ -75,7 +78,6 @@ struct app_client {
     uint32_t region_top;  // its last SHELL_REGION: kept, since the shell
     bool region_full;     // reports on its first frame and vrxhost may
                           // name it after that
-    bool hold;            // asked to keep the screen on (plan 0010 D3)
     char id[sizeof(struct vrx_msg_register)];
 };
 
@@ -139,6 +141,14 @@ struct vrx_compositor {
     bool dark;                 // the screen is off
     bool light_after_flip;     // waking: light once the newest frame is up
     bool was_held;             // an app held the screen on, last we looked
+    // holds are logind's idle inhibitors (plan 0010 D3): the pids holding
+    // one, honoured for the focused app and the shell only
+    sd_bus *bus;
+    pid_t inhibitors[32];
+    int n_inhibitors;
+    struct udev_monitor *bl_mon;  // the backlight's change events
+    int bl_level;              // the backlight's level while lit, as set
+    int sig_fd;                // SIGTERM / SIGINT
     int wake_devices;          // touch screens, pointers, keyboards present
     int touches;               // contacts down now
     bool swallow_touch;        // the waking touch, until every contact is up
@@ -766,7 +776,8 @@ static void drop_client(struct vrx_compositor *c, int slot) {
         if (c->touch_owner[i] == slot) c->touch_owner[i] = -1;
     }
     if (c->pointer_owner == slot) c->pointer_owner = -1;
-    // a closed socket releases its hold: a crash cannot pin the screen on
+    // its inhibitor dies with the process (logind's fd); until logind says
+    // so, a gone app's pid matches nothing focused
     hold_changed(c, "app gone");
 }
 
@@ -776,8 +787,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
                           const struct vrx_msg_header *h, void *payload, int fd) {
     struct app_client *a = &c->apps[slot];
     // a connection is an app (REGISTER) or the controller (CONTROL), once
-    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME ||
-                   h->type == VRX_MSG_HOLD;
+    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL) && !a->controller) ||
         (h->type == VRX_MSG_SHELL_REGION && !a->registered) ||
@@ -901,18 +911,6 @@ static void client_handle(struct vrx_compositor *c, int slot,
         case VRX_MSG_CLOSED:
             fprintf(stderr, "[vrx-compositor] app '%s' said closed\n", a->id);
             break;
-        case VRX_MSG_HOLD: {
-            struct vrx_msg_hold *m = payload;
-            if (h->length < sizeof *m) goto bad;
-            if (a->hold == (m->on != 0)) break;
-            a->hold = m->on != 0;
-            int n = 0;
-            for (int i = 0; i < MAX_APPS; i++) n += c->apps[i].in_use && c->apps[i].hold;
-            fprintf(stderr, "[vrx-compositor] '%s' %s the screen on (%d holding)\n", a->id,
-                    a->hold ? "holds" : "lets go of", n);
-            hold_changed(c, a->id);
-            break;
-        }
         default:
             goto bad;
     }
@@ -1129,8 +1127,11 @@ static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m)
 // the next touch, click or key brings both back and is not delivered. No
 // setting means "off": brightness is a position 0-100 that maps into a
 // floor-to-full range, so a stored 0 is still a screen a person can read
-// (the owner, 2026-10-14). The settings are one file, written by applets
-// holding the display grant; nothing else touches the light.
+// (the owner, 2026-10-14). Linux first (the owner, same day): a hold is a
+// logind idle inhibitor, a dimmable backlight's level is its own sysfs
+// value (persisted by systemd-backlight, written by applets holding the
+// display grant), and this file holds only what Linux has no home for:
+// the timeout, and the brightness of a screen dimmed by plane alpha.
 #define SCREEN_DIR "/etc/vrx/display"
 #define SCREEN_FILE SCREEN_DIR "/screen.conf"
 #define SCREEN_FACTS VRX_UI_SOCKET_DIR "/screen"
@@ -1164,12 +1165,17 @@ static void backlight_set(const struct vrx_compositor *c, int level) {
     fclose(f);
 }
 
-// The light's level for the brightness setting: full on a two-level
-// light, the setting mapped above the floor on a dimmable one.
+// The lowest level a dimmable backlight may sit at while lit.
+static int backlight_floor(const struct vrx_compositor *c) {
+    int f = (int) (c->bl_max * BACKLIGHT_FLOOR + 0.5);
+    return f < 1 ? 1 : f;
+}
+
+// The light's level while lit: full on a two-level light; on a dimmable
+// one, its own level as last set, never below the floor.
 static int light_level(const struct vrx_compositor *c) {
     if (c->dim != DIM_BACKLIGHT) return c->bl_max;
-    int l = (int) (c->bl_max * (BACKLIGHT_FLOOR + (1 - BACKLIGHT_FLOOR) * c->brightness / 100.0) + 0.5);
-    return l < 1 ? 1 : l;
+    return c->bl_level < backlight_floor(c) ? backlight_floor(c) : c->bl_level;
 }
 
 static uint64_t plane_alpha(const struct vrx_compositor *c) {
@@ -1189,13 +1195,112 @@ static void screen_light(struct vrx_compositor *c) {
     backlight_set(c, light_level(c));
 }
 
-// Some app holds the screen on, and it counts: it is focused or the shell.
+// An idle inhibitor is held by the focused app or the shell. One held by
+// an app in the background counts for nothing, the open-book lesson
+// (evrx-rt docs/20): the screen is held for what is being watched.
 static bool held(const struct vrx_compositor *c) {
-    for (int i = 0; i < MAX_APPS; i++) {
-        const struct app_client *a = &c->apps[i];
-        if (a->in_use && a->registered && a->hold && (i == c->focused || i == c->shell)) return true;
+    for (int k = 0; k < c->n_inhibitors; k++) {
+        if (c->focused >= 0 && c->apps[c->focused].pid == c->inhibitors[k]) return true;
+        if (c->shell >= 0 && c->apps[c->shell].pid == c->inhibitors[k]) return true;
     }
     return false;
+}
+
+// logind's idle inhibitors, as pids. Read at start and whenever logind
+// says BlockInhibited changed (it does, on every take and release).
+static void inhibitors_read(struct vrx_compositor *c) {
+    sd_bus_message *reply = NULL;
+    sd_bus_error err = SD_BUS_ERROR_NULL;
+    c->n_inhibitors = 0;
+    int r = sd_bus_call_method(c->bus, "org.freedesktop.login1", "/org/freedesktop/login1",
+                               "org.freedesktop.login1.Manager", "ListInhibitors", &err, &reply, "");
+    if (r < 0) {
+        fprintf(stderr, "[vrx-compositor] ListInhibitors: %s\n", err.message ? err.message : strerror(-r));
+        sd_bus_error_free(&err);
+        return;
+    }
+    if (sd_bus_message_enter_container(reply, 'a', "(ssssuu)") >= 0) {
+        const char *what, *who, *why, *mode;
+        uint32_t uid, pid;
+        while (sd_bus_message_read(reply, "(ssssuu)", &what, &who, &why, &mode, &uid, &pid) > 0) {
+            if (strstr(what, "idle") && strcmp(mode, "block") == 0 && c->n_inhibitors < 32) {
+                c->inhibitors[c->n_inhibitors++] = (pid_t) pid;
+                fprintf(stderr, "[vrx-compositor] idle inhibitor: %s (pid %u): %s\n", who, pid, why);
+            }
+        }
+    }
+    sd_bus_message_unref(reply);
+}
+
+static int on_logind_changed(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
+    (void) ret_error;
+    struct vrx_compositor *c = userdata;
+    const char *iface;
+    if (sd_bus_message_read(m, "s", &iface) < 0) return 0;
+    if (sd_bus_message_enter_container(m, 'a', "{sv}") < 0) return 0;
+    bool changed = false;
+    while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
+        const char *name;
+        if (sd_bus_message_read(m, "s", &name) < 0) break;
+        if (strcmp(name, "BlockInhibited") == 0) changed = true;
+        sd_bus_message_skip(m, "v");
+        sd_bus_message_exit_container(m);
+    }
+    if (changed) {
+        inhibitors_read(c);
+        hold_changed(c, "logind inhibitors changed");
+    }
+    return 0;
+}
+
+static void logind_init(struct vrx_compositor *c) {
+    if (sd_bus_open_system(&c->bus) < 0) {
+        fprintf(stderr, "[vrx-compositor] no system bus: nothing can hold the screen on\n");
+        c->bus = NULL;
+        return;
+    }
+    sd_bus_match_signal(c->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                        "org.freedesktop.DBus.Properties", "PropertiesChanged", on_logind_changed, c);
+    inhibitors_read(c);
+}
+
+static void bus_readable(struct vrx_compositor *c) {
+    while (sd_bus_process(c->bus, NULL) > 0) {}
+}
+
+// The backlight changed (an applet with the display grant set a level,
+// through the kit): that is the brightness now. Below the floor it is put
+// back up; while the screen is off it is remembered for the wake.
+static void backlight_changed(struct vrx_compositor *c) {
+    struct udev_device *d;
+    while ((d = udev_monitor_receive_device(c->bl_mon))) udev_device_unref(d);
+    if (c->dim != DIM_BACKLIGHT) return;
+    int level = sysfs_int(c->backlight, "brightness");
+    if (level < 0) return;
+    if (c->dark) {
+        if (level > 0) {
+            c->bl_level = level;
+            backlight_set(c, 0);
+        }
+        return;
+    }
+    if (level == c->bl_level && level >= backlight_floor(c)) return;
+    c->bl_level = level;
+    if (level < backlight_floor(c)) {
+        fprintf(stderr, "[vrx-compositor] backlight %d is below the floor; %d\n", level, backlight_floor(c));
+        backlight_set(c, backlight_floor(c));
+        c->bl_level = backlight_floor(c);
+    }
+}
+
+// Stopping (shutdown, a restart): the light goes back to its level first,
+// so systemd-backlight saves the person's brightness, not the idle 0.
+static void on_stop(struct vrx_compositor *c) {
+    struct signalfd_siginfo si;
+    if (read(c->sig_fd, &si, sizeof si) != sizeof si) return;
+    if (c->dark) backlight_set(c, light_level(c));
+    fprintf(stderr, "[vrx-compositor] stopping (signal %u)\n", si.ssi_signo);
+    c->running = false;
 }
 
 // The timer runs only while the screen is on, nothing holds it, the
@@ -1314,14 +1419,18 @@ static int conf_int(const char *key, int fallback) {
 
 static void screen_read_conf(struct vrx_compositor *c) {
     int light_off = conf_int("light_off", LIGHT_OFF_DEFAULT);
-    int brightness = conf_int("brightness", 100);
+    // a dimmable backlight keeps its own level (sysfs, systemd-backlight);
+    // the file's brightness is only for a screen dimmed by plane alpha
+    int brightness = c->dim == DIM_BACKLIGHT ? 100 : conf_int("brightness", 100);
     if (brightness > 100) brightness = 100;
     if ((uint32_t) light_off != c->light_off) {
         fprintf(stderr, "[vrx-compositor] screen off after %ds idle%s\n", light_off, light_off ? "" : " (never)");
         c->light_off = (uint32_t) light_off;
     }
     if (brightness != c->brightness) {
-        fprintf(stderr, "[vrx-compositor] brightness %d%s\n", brightness, c->dim == DIM_NONE ? " (this screen cannot dim)" : "");
+        if (c->dim != DIM_BACKLIGHT) {
+            fprintf(stderr, "[vrx-compositor] brightness %d%s\n", brightness, c->dim == DIM_NONE ? " (this screen cannot dim)" : "");
+        }
         c->brightness = brightness;
         screen_light(c);
     }
@@ -1374,6 +1483,16 @@ static void screen_init(struct vrx_compositor *c) {
     c->primary_alpha = c->primary_plane ? prop_id(c->drm_fd, c->primary_plane, DRM_MODE_OBJECT_PLANE, "alpha") : 0;
     c->shell_alpha = c->shell_plane ? prop_id(c->drm_fd, c->shell_plane, DRM_MODE_OBJECT_PLANE, "alpha") : 0;
     c->dim = c->bl_max > 1 ? DIM_BACKLIGHT : c->primary_alpha ? DIM_ALPHA : DIM_NONE;
+    // the level systemd-backlight restored at boot is the brightness
+    c->bl_level = c->backlight[0] ? sysfs_int(c->backlight, "brightness") : 0;
+    if (c->dim == DIM_BACKLIGHT) {
+        struct udev *udev = udev_new();
+        c->bl_mon = udev ? udev_monitor_new_from_netlink(udev, "udev") : NULL;
+        if (c->bl_mon) {
+            udev_monitor_filter_add_match_subsystem_devtype(c->bl_mon, "backlight", NULL);
+            udev_monitor_enable_receiving(c->bl_mon);
+        }
+    }
     fprintf(stderr, "[vrx-compositor] screen: light %s (max %d), DPMS %s, dims by %s\n",
             c->backlight[0] ? c->backlight : "none", c->bl_max, c->dpms_prop ? "yes" : "no",
             c->dim == DIM_BACKLIGHT ? "the backlight" : c->dim == DIM_ALPHA ? "plane alpha" : "nothing");
@@ -1617,6 +1736,9 @@ static void li_dispatch(struct vrx_compositor *c) {
 #define TAG_REPEAT    0xFFFFFFFFFFFFFFFBull
 #define TAG_IDLE      0xFFFFFFFFFFFFFFFAull
 #define TAG_CONF      0xFFFFFFFFFFFFFFF9ull
+#define TAG_BUS       0xFFFFFFFFFFFFFFF8ull
+#define TAG_BACKLIGHT 0xFFFFFFFFFFFFFFF7ull
+#define TAG_SIGNAL    0xFFFFFFFFFFFFFFF6ull
 #define CLIENT_TAG(slot, fd) (((uint64_t) (uint32_t) (fd) << 32) | (uint32_t) (slot))
 
 static void accept_client(struct vrx_compositor *c) {
@@ -1698,6 +1820,25 @@ int vrx_compositor_main(int argc, char **argv) {
         ev.data.u64 = TAG_CONF;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.conf_fd, &ev);
     }
+    logind_init(&c);
+    if (c.bus) {
+        ev.data.u64 = TAG_BUS;
+        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, sd_bus_get_fd(c.bus), &ev);
+    }
+    if (c.bl_mon) {
+        ev.data.u64 = TAG_BACKLIGHT;
+        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, udev_monitor_get_fd(c.bl_mon), &ev);
+    }
+    sigset_t stop;
+    sigemptyset(&stop);
+    sigaddset(&stop, SIGTERM);
+    sigaddset(&stop, SIGINT);
+    sigprocmask(SIG_BLOCK, &stop, NULL);
+    c.sig_fd = signalfd(-1, &stop, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (c.sig_fd >= 0) {
+        ev.data.u64 = TAG_SIGNAL;
+        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.sig_fd, &ev);
+    }
     c.px = c.width / 2.0;
     c.py = c.height / 2.0;
     cursor_init(&c);
@@ -1726,6 +1867,12 @@ int vrx_compositor_main(int argc, char **argv) {
                 idle_fire(&c);
             } else if (tag == TAG_CONF) {
                 screen_conf_changed(&c);
+            } else if (tag == TAG_BUS) {
+                bus_readable(&c);
+            } else if (tag == TAG_BACKLIGHT) {
+                backlight_changed(&c);
+            } else if (tag == TAG_SIGNAL) {
+                on_stop(&c);
             } else {
                 int slot = (int) (uint32_t) tag;
                 int fd = (int) (tag >> 32);
