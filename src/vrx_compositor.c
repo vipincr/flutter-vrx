@@ -202,6 +202,8 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
 
 static void client_send(struct vrx_compositor *c, int fd, uint32_t type,
                         const void *payload, size_t len, int pass_fd);
+struct app_client;
+static void report_app(struct vrx_compositor *c, const struct app_client *a, uint32_t state);
 
 // Give a frame back: tell its app the buffer is free (if the app is still
 // the one that presented it), then drop our framebuffer, import and fd.
@@ -272,6 +274,7 @@ static void flip_queued(struct vrx_compositor *c) {
         c->queued.app = -1;
         fprintf(stderr, "[vrx-compositor] modeset: first frame from app %d on screen\n",
                 c->on_screen.app);
+        if (c->on_screen.app >= 0) report_app(c, &c->apps[c->on_screen.app], VRX_APP_SHOWN);
         return;
     }
     if (drmModePageFlip(c->drm_fd, c->crtc_id, c->queued.fb_id,
@@ -301,6 +304,7 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
     if (c->on_screen.app_fd != c->pending.app_fd) {
         fprintf(stderr, "[vrx-compositor] screen switched to slot %d ('%s')\n", c->pending.app,
                 c->pending.app >= 0 ? c->apps[c->pending.app].id : "?");
+        if (c->pending.app >= 0) report_app(c, &c->apps[c->pending.app], VRX_APP_SHOWN);
     }
     frame_release(c, &c->on_screen);
     c->on_screen = c->pending;
@@ -391,9 +395,9 @@ static void send_registered(struct vrx_compositor *c, struct app_client *a) {
 
 // Tell vrxhost an app arrived (registered) or left. Silent without a
 // controller: vrxhost learns the current set when it connects.
-static void report_app(struct vrx_compositor *c, const struct app_client *a, bool alive) {
+static void report_app(struct vrx_compositor *c, const struct app_client *a, uint32_t state) {
     if (c->controller < 0) return;
-    struct vrx_msg_app_state m = { .pid = a->pid, .alive = alive ? 1 : 0 };
+    struct vrx_msg_app_state m = { .pid = a->pid, .state = state };
     snprintf(m.id, sizeof m.id, "%s", a->id);
     client_send(c, c->apps[c->controller].fd, VRX_MSG_APP_STATE, &m, sizeof m, -1);
 }
@@ -446,7 +450,7 @@ static void drop_client(struct vrx_compositor *c, int slot) {
         return;
     }
     fprintf(stderr, "[vrx-compositor] app '%s' (pid %d) gone\n", a->id, (int) a->pid);
-    if (a->registered) report_app(c, a, false);
+    if (a->registered) report_app(c, a, VRX_APP_GONE);
     // Frames it presented stay valid (we hold our own fd and import): the
     // screen keeps its last frame until the next focused app's frame
     // replaces it. Only the RELEASE goes nowhere, which frame_release checks.
@@ -483,7 +487,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
             fprintf(stderr, "[vrx-compositor] app '%s' registered (slot %d, pid %d)\n", a->id,
                     slot, (int) a->pid);
             send_registered(c, a);
-            report_app(c, a, true);
+            report_app(c, a, VRX_APP_REGISTERED);
             if (c->want_focus > 0 && a->pid == c->want_focus) focus_slot(c, slot);
             break;
         }
@@ -499,7 +503,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
             c->controller = slot;
             fprintf(stderr, "[vrx-compositor] controller connected (pid %d)\n", (int) a->pid);
             for (int i = 0; i < MAX_APPS; i++) {
-                if (c->apps[i].in_use && c->apps[i].registered) report_app(c, &c->apps[i], true);
+                if (c->apps[i].in_use && c->apps[i].registered) report_app(c, &c->apps[i], VRX_APP_REGISTERED);
             }
             break;
         }

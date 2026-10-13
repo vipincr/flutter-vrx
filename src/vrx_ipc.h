@@ -62,7 +62,8 @@ enum vrx_msg_type {
     // vrxhost -> comp: focus the app with this pid (0 = none). An app that
     // has not registered yet takes the focus when it does.
     VRX_MSG_SET_FOCUS = 10,
-    // comp -> vrxhost: an app registered (alive = 1) or disconnected (0).
+    // comp -> vrxhost: an app disconnected (state 0), registered (1), or
+    // had its first frame put on screen (2: what "the UI is up" means).
     // On CONTROL the compositor reports every app already registered.
     VRX_MSG_APP_STATE = 11,
 };
@@ -117,9 +118,15 @@ struct vrx_msg_set_focus {
     int32_t pid;
 };
 
+enum vrx_app_state {
+    VRX_APP_GONE = 0,
+    VRX_APP_REGISTERED = 1,
+    VRX_APP_SHOWN = 2,
+};
+
 struct vrx_msg_app_state {
     int32_t pid;
-    uint32_t alive;  // 0/1
+    uint32_t state;  // VRX_APP_GONE / VRX_APP_REGISTERED / VRX_APP_SHOWN
     char id[64];     // the app's REGISTER id
 };
 
