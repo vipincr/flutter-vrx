@@ -12,6 +12,8 @@
 
 #include "vrx_app_client.h"
 
+#include <systemd/sd-daemon.h>
+
 #include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -148,7 +150,15 @@ uint32_t vrx_app_client_present(struct vrx_app_client *c, int dmabuf_fd,
         .sequence = ++c->last_sent_sequence,
     };
     // sendmsg dups the fd into the message; the caller keeps the original.
-    return vrx_app_client_send(c, VRX_MSG_BUFFER, &b, sizeof(b), dmabuf_fd) ? b.sequence : 0;
+    if (!vrx_app_client_send(c, VRX_MSG_BUFFER, &b, sizeof(b), dmabuf_fd)) return 0;
+    if (b.sequence == 1) {
+        // the first frame is with the compositor: the applet is usable.
+        // Its unit is Type=notify with a start budget (plan 0008 D18); a
+        // runtime that never gets here fails the start instead of sitting
+        // half-up. A no-op outside systemd.
+        sd_notify(0, "READY=1");
+    }
+    return b.sequence;
 }
 
 // Read one message. Returns a malloc'd payload the caller frees, or NULL on

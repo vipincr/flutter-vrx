@@ -2584,6 +2584,14 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         goto fail_close_wakeup_fd;
     }
 
+    // Plan 0008 D18: under a unit with WatchdogSec= the main loop pings
+    // WATCHDOG=1 for as long as it turns; a loop that stops (a deadlock, a
+    // driver hang) is killed and restarted by systemd. A no-op otherwise.
+    ok = sd_event_set_watchdog(event_loop, true);
+    if (ok < 0) {
+        LOG_ERROR("sd_event_set_watchdog: %s\n", strerror(-ok));
+    }
+
     ok = sd_event_add_io(event_loop, NULL, wakeup_fd, EPOLLIN, on_wakeup_main_loop, NULL);
     if (ok < 0) {
         LOG_ERROR("Error adding wakeup callback to main loop. sd_event_add_io: %s\n", strerror(-ok));
