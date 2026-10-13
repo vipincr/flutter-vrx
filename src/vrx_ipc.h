@@ -81,6 +81,9 @@ enum vrx_msg_type {
     // (0). While that app is focused the shell's plane is off, its input
     // goes to the app, and its insets are 0 (a keyboard on a 58mm panel).
     VRX_MSG_CHROME = 15,
+    // shell -> comp -> the focused app: the strip's Back was pressed. The
+    // app goes back a screen, or leaves (Nav.pop) at its first. No payload.
+    VRX_MSG_BACK = 16,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.

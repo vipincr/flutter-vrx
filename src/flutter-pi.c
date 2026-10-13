@@ -1984,9 +1984,9 @@ static void vrx_on_release(uint32_t sequence, void *userdata) {
 }
 
 // The shell's strip (plan 0008 D10): the compositor says how much of the
-// top to keep clear; vrx_kit adds it to MediaQuery's padding (the embedder
-// API has no safe-area padding of its own). Kept, so an app whose Dart side
-// starts after the message can ask (getInsets); later changes are pushed.
+// top to keep clear; vrx_kit lays the app out below it. Kept, so an app
+// whose Dart side starts after the message can ask (getInsets); later
+// changes are pushed on vrx/chrome, as is the strip's Back.
 static uint32_t vrx_insets_top;
 
 static void vrx_on_insets(uint32_t top, void *userdata) {
@@ -1995,11 +1995,17 @@ static void vrx_on_insets(uint32_t top, void *userdata) {
     vrx_insets_top = top;
     // before the engine runs there is no one to tell: Dart asks on start
     if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
-    platch_call_json("vrx/insets", "insets", &JSONOBJECT1("top", JSONNUM(top)), NULL, NULL);
+    platch_call_json("vrx/chrome", "insets", &JSONOBJECT1("top", JSONNUM(top)), NULL, NULL);
+}
+
+static void vrx_on_back(void *userdata) {
+    (void) userdata;
+    if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
+    platch_call_json("vrx/chrome", "back", &(struct json_value){ .type = kJsonNull }, NULL, NULL);
 }
 
 // vrx/shell: getInsets and setChrome {hidden} for every app; setRegion
-// {top, full} from the shell.
+// {top, full} and back from the shell.
 static int on_vrx_shell_channel(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *handle) {
     (void) channel;
     if (strcmp(object->method, "getInsets") == 0) {
@@ -2014,6 +2020,10 @@ static int on_vrx_shell_channel(char *channel, struct platch_obj *object, Flutte
             .full = full && JSONVALUE_IS_BOOL(*full) && JSONVALUE_AS_BOOL(*full),
         };
         vrx_app_client_send(vrx_app.client, VRX_MSG_SHELL_REGION, &m, sizeof m, -1);
+        return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
+    }
+    if (strcmp(object->method, "back") == 0) {
+        vrx_app_client_send(vrx_app.client, VRX_MSG_BACK, NULL, 0, -1);
         return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
     }
     if (strcmp(object->method, "setChrome") == 0) {
@@ -2034,6 +2044,7 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
         .on_input = vrx_on_input,
         .on_release = vrx_on_release,
         .on_insets = vrx_on_insets,
+        .on_back = vrx_on_back,
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to

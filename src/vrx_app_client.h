@@ -17,6 +17,7 @@ struct vrx_app_client_callbacks {
     void (*on_release)(uint32_t sequence, void *userdata);
     // keep clear of the top `top` output pixels (the shell's strip)
     void (*on_insets)(uint32_t top, void *userdata);
+    void (*on_back)(void *userdata);
     void *userdata;
 };
 

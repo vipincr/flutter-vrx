@@ -742,7 +742,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
     bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL) && !a->controller) ||
-        (h->type == VRX_MSG_SHELL_REGION && slot != c->shell) ||
+        ((h->type == VRX_MSG_SHELL_REGION || h->type == VRX_MSG_BACK) && slot != c->shell) ||
         ((h->type == VRX_MSG_REGISTER || h->type == VRX_MSG_CONTROL) &&
          (a->registered || a->controller))) {
         goto bad;
@@ -806,6 +806,11 @@ static void client_handle(struct vrx_compositor *c, int slot,
             if (changed) send_insets(c, -1);
             break;
         }
+        case VRX_MSG_BACK:
+            if (c->focused >= 0 && c->focused != c->shell) {
+                client_send(c, c->apps[c->focused].fd, VRX_MSG_BACK, NULL, 0, -1);
+            }
+            break;
         case VRX_MSG_CHROME: {
             struct vrx_msg_chrome *m = payload;
             if (h->length < sizeof *m || slot == c->shell) goto bad;
