@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: MIT
 //
-// flutter-vrx IPC protocol (plan 0005, milestone B2).
+// flutter-vrx IPC protocol (plan 0005, milestones B2 and B3).
 //
-// The wire between `flutter-vrx --compositor` (DRM master, input owner,
-// supervisor) and each `flutter-vrx --app` process (own UI thread, own
-// engine, renders into a dmabuf it hands over). One unix socket at
+// The wire between `flutter-vrx --compositor` (DRM master, input owner)
+// and each `flutter-vrx --app` process (own UI thread, own engine, renders
+// into a dmabuf it hands over), plus vrxhost as the one controller that
+// names the focused app (plan 0007 amendment C). One unix socket at
 // VRX_UI_SOCKET of type SOCK_SEQPACKET: every send is one message and every
 // recvmsg returns exactly one, so neither side frames or buffers (a stream
 // socket merges and splits messages, which lost the FOCUS that follows
 // REGISTERED). File descriptors travel as SCM_RIGHTS on the message that
 // names them.
+//
+// The socket is root:VRX_UI_SOCKET_GROUP 0660, the group apps run under.
+// A connection's first message makes it an app (REGISTER) or the controller
+// (CONTROL, accepted from root only); the compositor identifies both by
+// SO_PEERCRED, so the pid vrxhost spawned is the pid it focuses.
 //
 // v1 is deliberately small: register, present, focus, input, close. The
 // compositor shows exactly one fullscreen app (the focused one) by flipping
@@ -25,6 +31,7 @@
 
 #define VRX_UI_SOCKET_DIR "/run/vrx-ui"
 #define VRX_UI_SOCKET VRX_UI_SOCKET_DIR "/vrx.sock"
+#define VRX_UI_SOCKET_GROUP "vrx"
 #define VRX_MAX_FORMATS 8
 
 // Message types. APP->COMP or COMP->APP as noted.
@@ -50,6 +57,14 @@ enum vrx_msg_type {
     // this arrives the app must not reuse the buffer, or it draws into the
     // frame on screen.
     VRX_MSG_RELEASE = 8,
+    // vrxhost -> comp, first message: I am the controller. No payload.
+    VRX_MSG_CONTROL = 9,
+    // vrxhost -> comp: focus the app with this pid (0 = none). An app that
+    // has not registered yet takes the focus when it does.
+    VRX_MSG_SET_FOCUS = 10,
+    // comp -> vrxhost: an app registered (alive = 1) or disconnected (0).
+    // On CONTROL the compositor reports every app already registered.
+    VRX_MSG_APP_STATE = 11,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -85,6 +100,16 @@ struct vrx_msg_focus {
 
 struct vrx_msg_release {
     uint32_t sequence;  // the vrx_msg_buffer.sequence being returned
+};
+
+struct vrx_msg_set_focus {
+    int32_t pid;
+};
+
+struct vrx_msg_app_state {
+    int32_t pid;
+    uint32_t alive;  // 0/1
+    char id[64];     // the app's REGISTER id
 };
 
 // Input event kinds. Coordinates are output pixels, origin top-left.
@@ -124,8 +149,9 @@ struct vrx_msg_input {
 
 struct vrx_msg_closed {};
 
-// The app id for a bundle path. meta-flutter installs apps as
-// /usr/share/flutter/<app>/<engine-version>/release, so the id is the
+// The app id for a bundle path. Bundles sit at
+// <root>/<app>/<engine-version>/release (meta-flutter's layout; vrx applets
+// use /system/defaults/<id>/<engine-version>/release), so the id is the
 // component two above "release"; any other path uses its last component.
 #include <stdio.h>
 #include <string.h>

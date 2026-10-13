@@ -1852,6 +1852,7 @@ static struct {
     struct vrx_app_client *client;
     struct window *window;
     struct flutterpi *fpi;
+    bool lost;  // the compositor went away: exit non-zero so vrxhost restarts us
     bool slot_added[VRX_TOUCH_SLOTS];
     struct vec2f slot_pos[VRX_TOUCH_SLOTS];
 } vrx_app;
@@ -1923,8 +1924,10 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to
-        // show without it, so exit and let the supervisor decide
+        // show without it, so exit and let vrxhost decide. Non-zero, because
+        // a clean exit means the app finished and vrxhost does not restart it.
         LOG_ERROR("vrx: compositor connection closed; exiting.\n");
+        vrx_app.lost = true;
         flutterpi_schedule_exit(vrx_app.fpi);
     }
     return 0;
@@ -3085,5 +3088,5 @@ int flutterpi_app_main(int argc, char **argv) {
 
     flutterpi_destroy(flutterpi);
 
-    return EXIT_SUCCESS;
+    return vrx_app.lost ? EXIT_FAILURE : EXIT_SUCCESS;
 }

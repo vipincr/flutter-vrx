@@ -1,22 +1,25 @@
 // SPDX-License-Identifier: MIT
 //
-// flutter-vrx compositor role (plan 0005, milestone B2).
+// flutter-vrx compositor role (plan 0005, milestones B2 and B3).
 //
 // `flutter-vrx --compositor` is the display server of a vrx board in the
-// only sense vrx needs one: DRM master owning scanout and input, supervising
-// per-app `flutter-vrx --app` processes, and flipping KMS scanout to the
-// focused app's latest presented dmabuf. There is no Wayland, no X11, no
-// protocol negotiation — the wire is vrx_ipc.h, and only our own --app
-// processes ever speak it.
+// only sense vrx needs one: DRM master owning scanout and input, and
+// flipping KMS scanout to the focused app's latest presented dmabuf. There
+// is no Wayland, no X11, no protocol negotiation: the wire is vrx_ipc.h,
+// and only our own --app processes and vrxhost ever speak it.
 //
-// v1 policy, deliberately blunt: exactly one app is focused and the
-// compositor scans out its newest buffer. Scanout is one modeset, then page
-// flips: a frame waits for the flip slot (newer frames replace a waiting
-// one), and every buffer goes back to its app with VRX_MSG_RELEASE once it
-// is off screen or superseded, so an app never renders into the frame being
-// displayed. Unfocused apps' buffers are released on arrival. The boot spawn
-// below (first bundle under /usr/share/flutter) is bench scaffolding until
-// vrxhost owns launching (plan 0007 amendment C, B3).
+// The compositor launches nothing and decides no focus. vrxhost (plan 0007
+// amendment C) spawns the apps, connects here as the one controller
+// (VRX_MSG_CONTROL, root only), and names the focused app by pid; the
+// compositor reports each app's arrival and exit back to it. Until the
+// controller names one, no app is focused and the screen stays dark.
+//
+// Exactly one app is focused and the compositor scans out its newest
+// buffer. Scanout is one modeset, then page flips: a frame waits for the
+// flip slot (newer frames replace a waiting one), and every buffer goes
+// back to its app with VRX_MSG_RELEASE once it is off screen or
+// superseded, so an app never renders into the frame being displayed.
+// Unfocused apps' buffers are released on arrival.
 
 #define _GNU_SOURCE
 
@@ -29,11 +32,10 @@
 #include <drm_fourcc.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <glob.h>
+#include <grp.h>
 #include <inttypes.h>
 #include <libinput.h>
 #include <libudev.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,8 +43,6 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
-#include <sys/wait.h>
-#include <limits.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -51,12 +51,16 @@
 
 // ─── app client ───────────────────────────────────────────────────────────
 
+// connections: the apps plus the controller
 #define MAX_APPS 8
 
 struct app_client {
     bool in_use;        // slot occupied; slots never move (epoll holds them)
     int fd;
+    pid_t pid;          // SO_PEERCRED at accept: who vrxhost spawned
+    uid_t uid;
     bool registered;
+    bool controller;    // this connection is vrxhost, not an app
     char id[sizeof(struct vrx_msg_register)];
 };
 
@@ -87,6 +91,9 @@ struct vrx_compositor {
 
     struct app_client apps[MAX_APPS];
     int focused;               // slot, -1 = none
+    int controller;            // slot of vrxhost's connection, -1 = none
+    pid_t want_focus;          // the controller's choice, 0 = none; may name
+                               // an app that has not registered yet
 
     // scanout pipeline: what is on screen, what a requested flip will show,
     // and the newest frame waiting for the flip slot
@@ -281,15 +288,28 @@ static void drm_readable(struct vrx_compositor *c) {
 
 // ─── socket + clients ─────────────────────────────────────────────────────
 
+// The socket is root:vrx 0660: apps run as the unprivileged vrx user
+// (plan 0007 amendment B) and must be able to connect; nobody else can.
+// No vrx group means vrxhost is not installed, and then nothing would ever
+// launch an app or pick a focus, so that is a startup failure, said once.
 static int sock_init(struct vrx_compositor *c) {
+    struct group *gr = getgrnam(VRX_UI_SOCKET_GROUP);
+    if (!gr) {
+        fprintf(stderr, "[vrx-compositor] no '%s' group: vrxhost (vrx-linux) is not installed, "
+                        "and it is what launches apps and picks the focus\n", VRX_UI_SOCKET_GROUP);
+        return -1;
+    }
     mkdir(VRX_UI_SOCKET_DIR, 0755);
     unlink(VRX_UI_SOCKET);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, VRX_UI_SOCKET, sizeof(addr.sun_path) - 1);
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
-    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0 ||
-        listen(fd, 8) != 0) {
+    mode_t old = umask(0177);  // born 0600: no window where others connect
+    int r = bind(fd, (struct sockaddr *) &addr, sizeof(addr));
+    umask(old);
+    if (r != 0 || chown(VRX_UI_SOCKET, 0, gr->gr_gid) != 0 ||
+        chmod(VRX_UI_SOCKET, 0660) != 0 || listen(fd, 8) != 0) {
         fprintf(stderr, "[vrx-compositor] socket %s: %s\n", VRX_UI_SOCKET, strerror(errno));
         close(fd);
         return -1;
@@ -335,12 +355,46 @@ static void send_registered(struct vrx_compositor *c, struct app_client *a) {
     client_send(c, a->fd, VRX_MSG_REGISTERED, &r, sizeof r, -1);
 }
 
+// Tell vrxhost an app arrived (registered) or left. Silent without a
+// controller: vrxhost learns the current set when it connects.
+static void report_app(struct vrx_compositor *c, const struct app_client *a, bool alive) {
+    if (c->controller < 0) return;
+    struct vrx_msg_app_state m = { .pid = a->pid, .alive = alive ? 1 : 0 };
+    snprintf(m.id, sizeof m.id, "%s", a->id);
+    client_send(c, c->apps[c->controller].fd, VRX_MSG_APP_STATE, &m, sizeof m, -1);
+}
+
 static void focus_slot(struct vrx_compositor *c, int slot) {
+    if (slot == c->focused) return;
+    int old = c->focused;
     c->focused = slot;
-    if (slot < 0) return;
-    fprintf(stderr, "[vrx-compositor] focus -> slot %d ('%s')\n", slot, c->apps[slot].id);
+    if (old >= 0 && c->apps[old].in_use) {
+        client_send(c, c->apps[old].fd, VRX_MSG_FOCUS,
+                    &(struct vrx_msg_focus){ .focused = 0 }, sizeof(struct vrx_msg_focus), -1);
+    }
+    // a frame from the old focus still waiting for the flip slot never shows
+    frame_release(c, &c->queued);
+    if (slot < 0) {
+        fprintf(stderr, "[vrx-compositor] focus -> none\n");
+        return;
+    }
+    fprintf(stderr, "[vrx-compositor] focus -> slot %d ('%s', pid %d)\n", slot,
+            c->apps[slot].id, (int) c->apps[slot].pid);
+    // focus gain makes the app re-present its current frame (an idle app
+    // has nothing new to draw), which is what flips the screen to it
     client_send(c, c->apps[slot].fd, VRX_MSG_FOCUS,
                 &(struct vrx_msg_focus){ .focused = 1 }, sizeof(struct vrx_msg_focus), -1);
+}
+
+// Apply the controller's choice if that app is here; if it has not
+// registered yet, its REGISTER applies it.
+static void apply_want_focus(struct vrx_compositor *c) {
+    int slot = -1;
+    for (int i = 0; c->want_focus > 0 && i < MAX_APPS; i++) {
+        struct app_client *a = &c->apps[i];
+        if (a->in_use && a->registered && a->pid == c->want_focus) { slot = i; break; }
+    }
+    focus_slot(c, slot);
 }
 
 static void drop_client(struct vrx_compositor *c, int slot) {
@@ -348,25 +402,29 @@ static void drop_client(struct vrx_compositor *c, int slot) {
     if (!a->in_use) return;
     epoll_ctl(c->epoll_fd, EPOLL_CTL_DEL, a->fd, NULL);
     close(a->fd);
-    fprintf(stderr, "[vrx-compositor] app '%s' gone\n", a->id);
+    if (a->controller) {
+        // the focus stays where vrxhost left it; a restarted vrxhost
+        // reconnects and re-sends it
+        fprintf(stderr, "[vrx-compositor] controller (pid %d) gone\n", (int) a->pid);
+        c->controller = -1;
+        memset(a, 0, sizeof *a);
+        a->fd = -1;
+        return;
+    }
+    fprintf(stderr, "[vrx-compositor] app '%s' (pid %d) gone\n", a->id, (int) a->pid);
+    if (a->registered) report_app(c, a, false);
     // Frames it presented stay valid (we hold our own fd and import): the
-    // screen keeps its last frame until another app's frame replaces it.
-    // Only the RELEASE goes nowhere, which frame_release checks.
+    // screen keeps its last frame until the next focused app's frame
+    // replaces it. Only the RELEASE goes nowhere, which frame_release checks.
     struct frame *frames[] = { &c->on_screen, &c->pending, &c->queued };
     for (size_t i = 0; i < sizeof frames / sizeof frames[0]; i++) {
         if (frames[i]->valid && frames[i]->app == slot) frames[i]->app = -1;
     }
     memset(a, 0, sizeof *a);
     a->fd = -1;
-    if (c->focused == slot) {
-        // fall back to the lowest live registered slot (the launcher-class
-        // app registers first); B3 hands this decision to vrxhost
-        int next = -1;
-        for (int i = 0; i < MAX_APPS; i++) {
-            if (c->apps[i].in_use && c->apps[i].registered) { next = i; break; }
-        }
-        focus_slot(c, next);
-    }
+    // what comes next on screen is vrxhost's decision (it sees the exit
+    // both here and as its child's status)
+    if (c->focused == slot) c->focused = -1;
 }
 
 // Handle one message. `fd` is the descriptor that rode it, or -1; this
@@ -374,6 +432,13 @@ static void drop_client(struct vrx_compositor *c, int slot) {
 static void client_handle(struct vrx_compositor *c, int slot,
                           const struct vrx_msg_header *h, void *payload, int fd) {
     struct app_client *a = &c->apps[slot];
+    // a connection is an app (REGISTER) or the controller (CONTROL), once
+    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED;
+    if ((app_msg && !a->registered) || (h->type == VRX_MSG_SET_FOCUS && !a->controller) ||
+        ((h->type == VRX_MSG_REGISTER || h->type == VRX_MSG_CONTROL) &&
+         (a->registered || a->controller))) {
+        goto bad;
+    }
     switch (h->type) {
         case VRX_MSG_REGISTER: {
             struct vrx_msg_register *r = payload;
@@ -381,10 +446,34 @@ static void client_handle(struct vrx_compositor *c, int slot,
             r->id[sizeof r->id - 1] = 0;
             snprintf(a->id, sizeof a->id, "%s", r->id);
             a->registered = true;
-            fprintf(stderr, "[vrx-compositor] app '%s' registered (slot %d)\n", a->id, slot);
+            fprintf(stderr, "[vrx-compositor] app '%s' registered (slot %d, pid %d)\n", a->id,
+                    slot, (int) a->pid);
             send_registered(c, a);
-            // boot policy: the first app to register takes focus (B3: vrxhost)
-            if (c->focused < 0) focus_slot(c, slot);
+            report_app(c, a, true);
+            if (c->want_focus > 0 && a->pid == c->want_focus) focus_slot(c, slot);
+            break;
+        }
+        case VRX_MSG_CONTROL: {
+            // root only: an app (the vrx user) must never steer focus
+            if (a->uid != 0 || c->controller >= 0) {
+                fprintf(stderr, "[vrx-compositor] refusing controller (pid %d uid %d): %s\n",
+                        (int) a->pid, (int) a->uid,
+                        a->uid != 0 ? "not root" : "one is connected");
+                goto bad;
+            }
+            a->controller = true;
+            c->controller = slot;
+            fprintf(stderr, "[vrx-compositor] controller connected (pid %d)\n", (int) a->pid);
+            for (int i = 0; i < MAX_APPS; i++) {
+                if (c->apps[i].in_use && c->apps[i].registered) report_app(c, &c->apps[i], true);
+            }
+            break;
+        }
+        case VRX_MSG_SET_FOCUS: {
+            struct vrx_msg_set_focus *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            c->want_focus = m->pid;
+            apply_want_focus(c);
             break;
         }
         case VRX_MSG_BUFFER: {
@@ -540,39 +629,6 @@ static void li_dispatch(struct vrx_compositor *c) {
     }
 }
 
-// ─── registry + supervision ───────────────────────────────────────────────
-
-#define BUNDLE_ROOT "/usr/share/flutter"
-
-static int spawn_first_bundle(struct vrx_compositor *c) {
-    // the lexically-first app bundle: BUNDLE_ROOT/<app>/<engine-ver>/release
-    // (the engine itself installs BUNDLE_ROOT/<ver>/release, which a
-    // one-star glob matched by mistake; vrx-ui learned this 2026-10-10)
-    char pattern[PATH_MAX];
-    snprintf(pattern, sizeof pattern, "%s/*/*/release", BUNDLE_ROOT);
-    glob_t g;
-    if (glob(pattern, 0, NULL, &g) != 0 || g.gl_pathc == 0) {
-        fprintf(stderr, "[vrx-compositor] no app bundles under %s\n", BUNDLE_ROOT);
-        if (g.gl_pathc == 0 && g.gl_offs == 0) globfree(&g);
-        return -1;
-    }
-    char *first = g.gl_pathv[0];
-    char id[64] = {0};
-    vrx_bundle_id(first, id, sizeof id);
-    fprintf(stderr, "[vrx-compositor] launching '%s' (%s)\n", id, first);
-    pid_t pid = fork();
-    if (pid == 0) {
-        // child: connect to nothing, just exec the app role
-        // --release: the engine we ship is AOT-only
-        char *const argv[] = { (char *) "flutter-vrx", (char *) "--release", (char *) "--app", first, NULL };
-        execv("/usr/bin/flutter-vrx", argv);  // inherit the environment (LANG etc.)
-        _exit(127);
-    }
-    (void) c;
-    globfree(&g);
-    return pid >= 0 ? 0 : -1;
-}
-
 // ─── main loop ────────────────────────────────────────────────────────────
 
 // epoll tags: the high bits mark the kind, a client tag also carries its
@@ -595,9 +651,18 @@ static void accept_client(struct vrx_compositor *c) {
         close(fd);
         return;
     }
+    struct ucred cred;
+    socklen_t len = sizeof cred;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) {
+        fprintf(stderr, "[vrx-compositor] SO_PEERCRED: %s; refusing\n", strerror(errno));
+        close(fd);
+        return;
+    }
     memset(&c->apps[slot], 0, sizeof c->apps[slot]);
     c->apps[slot].in_use = true;
     c->apps[slot].fd = fd;
+    c->apps[slot].pid = cred.pid;
+    c->apps[slot].uid = cred.uid;
     struct epoll_event ev = { .events = EPOLLIN, .data.u64 = CLIENT_TAG(slot, fd) };
     epoll_ctl(c->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
 }
@@ -608,9 +673,9 @@ int vrx_compositor_main(int argc, char **argv) {
         if (!strcmp(argv[i], "--compositor")) continue;
         if (i + 1 < argc && !strcmp(argv[i], "--device")) device = argv[++i];
     }
-    signal(SIGCHLD, SIG_IGN);  // auto-reap the boot spawn (B3 moves it to vrxhost)
     struct vrx_compositor c = {0};
     c.focused = -1;
+    c.controller = -1;
     struct frame *frames[] = { &c.on_screen, &c.pending, &c.queued };
     for (size_t i = 0; i < sizeof frames / sizeof frames[0]; i++) {
         frames[i]->dmabuf_fd = -1;
@@ -633,7 +698,6 @@ int vrx_compositor_main(int argc, char **argv) {
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.li_fd, &ev);
     }
 
-    spawn_first_bundle(&c);
     c.running = true;
 
     fprintf(stderr, "[vrx-compositor] running (socket %s)\n", VRX_UI_SOCKET);
