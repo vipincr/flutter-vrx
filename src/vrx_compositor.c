@@ -58,8 +58,10 @@
 
 // ─── app client ───────────────────────────────────────────────────────────
 
-// connections: the apps plus the controller
-#define MAX_APPS 8
+// connections: the apps plus the controller. vrx runs every built-in
+// applet at once (the shell, residents, Home's tiles warmed up: eleven on
+// 0.1.0077), and 8 refused the shell's restart on the bench
+#define MAX_APPS 32
 
 struct app_client {
     bool in_use;        // slot occupied; slots never move (epoll holds them)
@@ -70,6 +72,9 @@ struct app_client {
     bool controller;    // this connection is vrxhost, not an app
     bool no_chrome;     // asked for the whole screen: the shell steps aside
                         // while it is focused
+    uint32_t region_top;  // its last SHELL_REGION: kept, since the shell
+    bool region_full;     // reports on its first frame and vrxhost may
+                          // name it after that
     char id[sizeof(struct vrx_msg_register)];
 };
 
@@ -655,7 +660,8 @@ static void apply_want_shell(struct vrx_compositor *c) {
     }
     if (slot == c->shell) return;
     c->shell = slot;
-    c->shell_full = false;
+    c->shell_top = slot >= 0 ? c->apps[slot].region_top : 0;
+    c->shell_full = slot >= 0 && c->apps[slot].region_full;
     if (slot < 0) {
         frame_release(c, &c->shell_frame);
         shell_show(c);
@@ -757,7 +763,8 @@ static void client_handle(struct vrx_compositor *c, int slot,
     bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL) && !a->controller) ||
-        ((h->type == VRX_MSG_SHELL_REGION || h->type == VRX_MSG_BACK) && slot != c->shell) ||
+        (h->type == VRX_MSG_SHELL_REGION && !a->registered) ||
+        (h->type == VRX_MSG_BACK && slot != c->shell) ||
         ((h->type == VRX_MSG_REGISTER || h->type == VRX_MSG_CONTROL) &&
          (a->registered || a->controller))) {
         goto bad;
@@ -814,10 +821,13 @@ static void client_handle(struct vrx_compositor *c, int slot,
         case VRX_MSG_SHELL_REGION: {
             struct vrx_msg_shell_region *m = payload;
             if (h->length < sizeof *m) goto bad;
-            uint32_t top = m->top > c->height ? c->height : m->top;
-            bool changed = top != c->shell_top;
-            c->shell_top = top;
-            c->shell_full = m->full != 0;
+            a->region_top = m->top > c->height ? c->height : m->top;
+            a->region_full = m->full != 0;
+            // the shell-to-be's region waits for vrxhost to name it
+            if (slot != c->shell) break;
+            bool changed = a->region_top != c->shell_top;
+            c->shell_top = a->region_top;
+            c->shell_full = a->region_full;
             if (changed) send_insets(c, -1);
             break;
         }
