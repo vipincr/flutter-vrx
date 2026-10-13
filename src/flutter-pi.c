@@ -1844,10 +1844,14 @@ static int on_user_input_fd_ready(sd_event_source *s, int fd, uint32_t revents, 
 // process renders offscreen, presents each frame over IPC (window.c) and
 // receives routed input here. Touch events are emitted exactly the way
 // user_input.c emits libinput touch: one kAdd per slot the first time it is
-// seen, then kDown/kMove/kUp, the up at the slot's last position.
+// seen, then kDown/kMove/kUp, the up at the slot's last position. The mouse
+// is one more device: kAdd once, then kHover while no button is down and
+// kDown/kMove/kUp across button changes; a wheel is a scroll signal. Keys go
+// through user_input.c's own xkb translation (user_input_emit_key).
 
 #define VRX_TOUCH_SLOTS 10
 #define VRX_TOUCH_DEVICE_BASE 1000  // clear of any pointer device ids
+#define VRX_MOUSE_DEVICE 999
 
 static struct {
     struct vrx_app_client *client;
@@ -1856,7 +1860,68 @@ static struct {
     bool lost;  // the compositor went away: exit non-zero so vrxhost restarts us
     bool slot_added[VRX_TOUCH_SLOTS];
     struct vec2f slot_pos[VRX_TOUCH_SLOTS];
+    bool mouse_added;
+    uint32_t mouse_buttons;
+    struct keyboard_config *kbdcfg;
+    struct keyboard_state *kbd;
 } vrx_app;
+
+// The keyboard half of user_input_interface for routed keys: the same
+// sinks the libinput path feeds, minus VT switching (an app owns no VT).
+static const struct user_input_interface vrx_key_interface = {
+    .on_utf8_character = on_utf8_character,
+    .on_xkb_keysym = on_xkb_keysym,
+    .on_gtk_keyevent = on_gtk_keyevent,
+};
+
+static void vrx_on_key(const struct vrx_input_key *k) {
+    if (vrx_app.kbdcfg == NULL) {
+        // the board's layout (/etc/default/keyboard), else xkb's default
+        vrx_app.kbdcfg = keyboard_config_new();
+        if (vrx_app.kbdcfg != NULL) vrx_app.kbd = keyboard_state_new(vrx_app.kbdcfg, NULL, NULL);
+        if (vrx_app.kbd == NULL) LOG_ERROR("vrx: no keyboard layout; keys are dropped.\n");
+    }
+    user_input_emit_key(&vrx_key_interface, vrx_app.fpi, vrx_app.kbd, k->time_ns / 1000, (uint16_t) k->keycode, (int32_t) k->state);
+}
+
+static void vrx_on_pointer(const struct vrx_input_pointer *p) {
+    FlutterPointerEvent events[2];
+    size_t n = 0;
+    FlutterPointerEvent e;
+    memset(&e, 0, sizeof e);
+    e.struct_size = sizeof e;
+    e.timestamp = (size_t) (p->time_ns / 1000);
+    e.x = p->x;
+    e.y = p->y;
+    e.device = VRX_MOUSE_DEVICE;
+    e.device_kind = kFlutterPointerDeviceKindMouse;
+    e.signal_kind = kFlutterPointerSignalKindNone;
+    if (!vrx_app.mouse_added) {
+        events[n] = e;
+        events[n].phase = kAdd;
+        n++;
+        vrx_app.mouse_added = true;
+    }
+    uint32_t was = vrx_app.mouse_buttons, now = p->buttons;
+    e.buttons = now;
+    if (p->scroll_x != 0 || p->scroll_y != 0) {
+        e.phase = now ? kMove : kHover;
+        e.signal_kind = kFlutterPointerSignalKindScroll;
+        e.scroll_delta_x = p->scroll_x;
+        e.scroll_delta_y = p->scroll_y;
+    } else if (!was && !now) {
+        e.phase = kHover;
+    } else if (!was) {
+        e.phase = kDown;
+    } else if (!now) {
+        e.phase = kUp;
+    } else {
+        e.phase = kMove;
+    }
+    vrx_app.mouse_buttons = now;
+    events[n++] = e;
+    on_flutter_pointer_event(vrx_app.fpi, events, n);
+}
 
 static FlutterPointerEvent vrx_touch_event(FlutterPointerPhase phase, uint64_t time_ns, struct vec2f pos, int32_t device) {
     FlutterPointerEvent e;
@@ -1874,11 +1939,15 @@ static FlutterPointerEvent vrx_touch_event(FlutterPointerPhase phase, uint64_t t
 
 static void vrx_on_input(const struct vrx_msg_input *in, void *userdata) {
     (void) userdata;
-    if (in->kind != VRX_INPUT_TOUCH) {
-        // v1: the bench carriers are touch panels; pointer and key routing
-        // land with the keyboard-capable carriers
+    if (in->kind == VRX_INPUT_KEY) {
+        vrx_on_key(&in->u.key);
         return;
     }
+    if (in->kind == VRX_INPUT_POINTER) {
+        vrx_on_pointer(&in->u.pointer);
+        return;
+    }
+    if (in->kind != VRX_INPUT_TOUCH) return;
     const struct vrx_input_touch *t = &in->u.touch;
     if (t->slot >= VRX_TOUCH_SLOTS) return;
     int32_t device = VRX_TOUCH_DEVICE_BASE + (int32_t) t->slot;

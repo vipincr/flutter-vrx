@@ -71,6 +71,23 @@ struct user_input_interface {
 
 struct user_input;
 
+struct keyboard_state;
+
+/**
+ * @brief Run one evdev key through @p keyboard_state (xkb) and hand the result to
+ * @p interface the way a libinput key event is handed over. The vrx app role calls
+ * this for keys the compositor routes to it, so both paths share one translation.
+ * @p key_state is 0 release, 1 press, 2 repeat.
+ */
+int user_input_emit_key(
+    const struct user_input_interface *interface,
+    void *userdata,
+    struct keyboard_state *keyboard_state,
+    uint64_t time_usec,
+    uint16_t evdev_keycode,
+    int32_t key_state
+);
+
 /**
  * @brief Create a new user input instance. Will try to load the default keyboard config from /etc/default/keyboard
  * and create a udev-backed libinput instance.

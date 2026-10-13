@@ -140,7 +140,12 @@ enum vrx_input_kind {
 struct vrx_input_pointer {
     uint64_t time_ns;
     int32_t x, y;
-    uint32_t buttons;  // bit per button, 1 = down (button 1 = left)
+    // bit per button, 1 = down, Flutter's numbering: 1 left, 2 right,
+    // 4 middle, 8 back, 16 forward
+    uint32_t buttons;
+    // a wheel or touchpad scroll in output pixels (positive: right, down);
+    // 0 on a move or a button change
+    int32_t scroll_x, scroll_y;
 };
 
 struct vrx_input_touch {

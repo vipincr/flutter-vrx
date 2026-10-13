@@ -39,7 +39,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/input-event-codes.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
+#include <sys/timerfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -87,6 +90,7 @@ struct vrx_compositor {
     uint64_t trace_buffer_ns;  // when the answering buffer arrived
     bool logged_format;        // first frame's format/modifier logged
     uint32_t connector_id, crtc_id;
+    char output[32];           // the connector's name, HDMI-A-1
     drmModeModeInfo mode;
     uint32_t width, height;
     uint32_t width_mm, height_mm;  // the connector's physical size, 0 = unknown
@@ -97,6 +101,18 @@ struct vrx_compositor {
 
     struct libinput *li;
     int li_fd;
+
+    // the mouse: where the pointer is, which buttons are down, and the
+    // cursor drawn there on the KMS cursor plane (shown on the first
+    // mouse move, hidden on a touch)
+    double px, py;
+    uint32_t buttons;
+    uint32_t cursor_handle;    // 64x64 ARGB dumb buffer, 0 = none
+    bool cursor_wanted, cursor_shown;
+
+    // key repeat: libinput sends none, so the held key repeats from here
+    int repeat_fd;
+    uint32_t repeat_key;       // 0 = none held
 
     struct app_client apps[MAX_APPS];
     int focused;               // slot, -1 = none
@@ -111,6 +127,9 @@ struct vrx_compositor {
     bool running;
 };
 
+static void cursor_update(struct vrx_compositor *c);
+static void repeat_arm(struct vrx_compositor *c, uint32_t key);
+
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -118,6 +137,44 @@ static uint64_t now_ns(void) {
 }
 
 // ─── KMS ──────────────────────────────────────────────────────────────────
+
+// "HDMI-A-1", "DPI-1": the kernel's connector name, as /sys/class/drm
+// and modetest print it
+static void connector_name(const drmModeConnector *conn, char *out, size_t cap) {
+    if (!conn) {
+        snprintf(out, cap, "?");
+        return;
+    }
+    const char *type = drmModeGetConnectorTypeName(conn->connector_type);
+    snprintf(out, cap, "%s-%u", type ? type : "Unknown", conn->connector_type_id);
+}
+
+// The output asked for: VRX_OUTPUT, else `output=` in /etc/vrx/display.conf
+// (the display settings file plan 0008 Part C shares), else none.
+static void output_wanted(char *out, size_t cap) {
+    out[0] = 0;
+    const char *env = getenv("VRX_OUTPUT");
+    if (env && env[0]) {
+        snprintf(out, cap, "%s", env);
+        return;
+    }
+    FILE *f = fopen("/etc/vrx/display.conf", "re");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char *v = line;
+        while (*v == ' ' || *v == '\t') v++;
+        if (strncmp(v, "output", 6) != 0) continue;
+        v += 6;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v != '=') continue;
+        v++;
+        while (*v == ' ' || *v == '\t') v++;
+        v[strcspn(v, " \t\r\n#")] = 0;
+        snprintf(out, cap, "%s", v);
+    }
+    fclose(f);
+}
 
 static int kms_init(struct vrx_compositor *c, const char *device) {
     char found[64];
@@ -146,18 +203,34 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
         fprintf(stderr, "[vrx-compositor] drmModeGetResources: %s\n", strerror(errno));
         return -1;
     }
+    // The output: the one named (VRX_OUTPUT, else display.conf's
+    // output=, e.g. HDMI-A-1) when it is connected, else the first
+    // connected. A board with only an HDMI monitor needs no naming; one
+    // with a panel and a monitor names the monitor to use it.
+    char want[32] = "";
+    output_wanted(want, sizeof want);
     drmModeConnector *conn = NULL;
-    for (int i = 0; i < res->count_connectors && !conn; i++) {
-        conn = drmModeGetConnector(c->drm_fd, res->connectors[i]);
-        if (conn && conn->connection != DRM_MODE_CONNECTED) {
-            drmModeFreeConnector(conn);
-            conn = NULL;
+    for (int pass = want[0] ? 0 : 1; pass < 2 && !conn; pass++) {
+        for (int i = 0; i < res->count_connectors && !conn; i++) {
+            conn = drmModeGetConnector(c->drm_fd, res->connectors[i]);
+            char name[32];
+            connector_name(conn, name, sizeof name);
+            bool ok = conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0 &&
+                      (pass == 1 || strcmp(name, want) == 0);
+            if (!ok && conn) {
+                drmModeFreeConnector(conn);
+                conn = NULL;
+            }
+        }
+        if (pass == 0 && !conn) {
+            fprintf(stderr, "[vrx-compositor] output %s is not connected; using the first connected\n", want);
         }
     }
-    if (!conn || conn->count_modes == 0) {
+    if (!conn) {
         fprintf(stderr, "[vrx-compositor] no connected display\n");
         return -1;
     }
+    connector_name(conn, c->output, sizeof c->output);
     // prefer the preferred mode, else the first
     int mi = 0;
     for (int i = 0; i < conn->count_modes; i++) {
@@ -170,33 +243,33 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
     c->width_mm = conn->mmWidth;
     c->height_mm = conn->mmHeight;
 
-    drmModeEncoder *enc = NULL;
-    if (conn->encoder_id) enc = drmModeGetEncoder(c->drm_fd, conn->encoder_id);
-    if (!enc) {
-        for (int i = 0; i < res->count_encoders && !enc; i++) {
-            enc = drmModeGetEncoder(c->drm_fd, res->encoders[i]);
-            if (enc && !(enc->possible_crtcs & (1u << 0))) { /* keep it simple: first */ }
+    // The CRTC: the one the firmware already drives this output with,
+    // else the first the output's encoders can reach (an HDMI port and
+    // the DPI panel hang off different CRTCs on vc4)
+    c->crtc_id = 0;
+    if (conn->encoder_id) {
+        drmModeEncoder *enc = drmModeGetEncoder(c->drm_fd, conn->encoder_id);
+        if (enc) {
+            c->crtc_id = enc->crtc_id;
+            drmModeFreeEncoder(enc);
         }
     }
-    if (!enc) {
-        fprintf(stderr, "[vrx-compositor] no encoder for connector\n");
-        return -1;
+    for (int e = 0; e < conn->count_encoders && !c->crtc_id; e++) {
+        drmModeEncoder *enc = drmModeGetEncoder(c->drm_fd, conn->encoders[e]);
+        if (!enc) continue;
+        for (int k = 0; k < res->count_crtcs && !c->crtc_id; k++) {
+            if (enc->possible_crtcs & (1u << k)) c->crtc_id = res->crtcs[k];
+        }
+        drmModeFreeEncoder(enc);
     }
-    c->crtc_id = enc->crtc_id;
-    if (!c->crtc_id) {
-        drmModeCrtc * crtc = drmModeGetCrtc(c->drm_fd, res->crtcs[0]);
-        c->crtc_id = crtc ? crtc->crtc_id : 0;
-        if (crtc) drmModeFreeCrtc(crtc);
-    }
-    drmModeFreeEncoder(enc);
     drmModeFreeConnector(conn);
     drmModeFreeResources(res);
     if (!c->crtc_id) {
         fprintf(stderr, "[vrx-compositor] no crtc\n");
         return -1;
     }
-    fprintf(stderr, "[vrx-compositor] %s: %ux%u@%u on crtc %u, %ux%umm\n",
-            path, c->width, c->height, c->mode.vrefresh, c->crtc_id, c->width_mm, c->height_mm);
+    fprintf(stderr, "[vrx-compositor] %s %s: %ux%u@%u on crtc %u, %ux%umm\n",
+            path, c->output, c->width, c->height, c->mode.vrefresh, c->crtc_id, c->width_mm, c->height_mm);
     return 0;
 }
 
@@ -268,6 +341,7 @@ static void flip_queued(struct vrx_compositor *c) {
             return;
         }
         c->mode_set = true;
+        cursor_update(c);
         c->on_screen = c->queued;
         memset(&c->queued, 0, sizeof c->queued);
         c->queued.dmabuf_fd = -1;
@@ -406,6 +480,8 @@ static void focus_slot(struct vrx_compositor *c, int slot) {
     if (slot == c->focused) return;
     int old = c->focused;
     c->focused = slot;
+    // a key held into a focus change stops repeating into the new app
+    repeat_arm(c, 0);
     if (old >= 0 && c->apps[old].in_use) {
         client_send(c, c->apps[old].fd, VRX_MSG_FOCUS,
                     &(struct vrx_msg_focus){ .focused = 0 }, sizeof(struct vrx_msg_focus), -1);
@@ -616,59 +692,261 @@ static int li_init(struct vrx_compositor *c) {
     return 0;
 }
 
+// ─── the mouse cursor ─────────────────────────────────────────────────────
+
+#define CURSOR_SIZE 64
+
+// The classic arrow, on a 12x21 grid, tip at the origin (the hotspot).
+static bool in_arrow(double x, double y) {
+    static const double P[][2] = { {0, 0}, {0, 17}, {4, 13}, {7, 20}, {10, 19}, {7, 12}, {12, 12} };
+    const int n = sizeof P / sizeof P[0];
+    bool in = false;
+    for (int i = 0, j = n - 1; i < n; j = i++) {
+        if ((P[i][1] > y) != (P[j][1] > y) &&
+            x < (P[j][0] - P[i][0]) * (y - P[i][1]) / (P[j][1] - P[i][1]) + P[i][0]) {
+            in = !in;
+        }
+    }
+    return in;
+}
+
+// A white arrow with a black edge, sized to the output: about 1/40 of
+// its height, so it reads on the 640-line panel and on a 4K monitor.
+static void cursor_init(struct vrx_compositor *c) {
+    struct drm_mode_create_dumb cd = { .width = CURSOR_SIZE, .height = CURSOR_SIZE, .bpp = 32 };
+    if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) != 0) {
+        fprintf(stderr, "[vrx-compositor] no cursor buffer: %s\n", strerror(errno));
+        return;
+    }
+    struct drm_mode_map_dumb md = { .handle = cd.handle };
+    uint32_t *px = MAP_FAILED;
+    if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &md) == 0) {
+        px = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, c->drm_fd, md.offset);
+    }
+    if (px == MAP_FAILED) {
+        fprintf(stderr, "[vrx-compositor] cannot map the cursor: %s\n", strerror(errno));
+        struct drm_mode_destroy_dumb dd = { .handle = cd.handle };
+        drmIoctl(c->drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+        return;
+    }
+    double size = c->height / 40.0;
+    if (size < 16) size = 16;
+    if (size > CURSOR_SIZE - 2) size = CURSOR_SIZE - 2;
+    const double k = 21.0 / size;  // grid units per pixel
+    const uint32_t stride = cd.pitch / 4;
+    for (int y = 0; y < CURSOR_SIZE; y++) {
+        for (int x = 0; x < CURSOR_SIZE; x++) {
+            double gx = (x + 0.5) * k, gy = (y + 0.5) * k;
+            uint32_t v = 0;
+            if (in_arrow(gx, gy)) {
+                // the edge: a pixel inside whose neighbour is outside
+                bool edge = !in_arrow(gx - k, gy) || !in_arrow(gx + k, gy) ||
+                            !in_arrow(gx, gy - k) || !in_arrow(gx, gy + k);
+                v = edge ? 0xFF000000u : 0xFFFFFFFFu;
+            }
+            px[y * stride + x] = v;
+        }
+    }
+    munmap(px, cd.size);
+    c->cursor_handle = cd.handle;
+}
+
+// Put the cursor where the pointer is, once the CRTC is lit; hide it.
+static void cursor_update(struct vrx_compositor *c) {
+    if (!c->cursor_handle || !c->mode_set) return;
+    if (c->cursor_wanted && !c->cursor_shown) {
+        if (drmModeSetCursor2(c->drm_fd, c->crtc_id, c->cursor_handle, CURSOR_SIZE, CURSOR_SIZE, 0, 0) != 0) {
+            fprintf(stderr, "[vrx-compositor] cursor plane refused: %s\n", strerror(errno));
+            c->cursor_handle = 0;
+            return;
+        }
+        c->cursor_shown = true;
+    } else if (!c->cursor_wanted && c->cursor_shown) {
+        drmModeSetCursor(c->drm_fd, c->crtc_id, 0, 0, 0);
+        c->cursor_shown = false;
+    }
+    if (c->cursor_shown) drmModeMoveCursor(c->drm_fd, c->crtc_id, (int) c->px, (int) c->py);
+}
+
+// ─── input ────────────────────────────────────────────────────────────────
+
+// A held key repeats after 400 ms, 30 times a second: the rates a desktop
+// ships with.
+static void repeat_arm(struct vrx_compositor *c, uint32_t key) {
+    if (c->repeat_fd < 0) return;
+    c->repeat_key = key;
+    struct itimerspec t = {0};
+    if (key) {
+        t.it_value.tv_nsec = 400 * 1000000L;
+        t.it_interval.tv_nsec = 33 * 1000000L;
+    }
+    timerfd_settime(c->repeat_fd, 0, &t, NULL);
+}
+
+static bool is_modifier(uint32_t key) {
+    switch (key) {
+    case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: case KEY_LEFTCTRL: case KEY_RIGHTCTRL:
+    case KEY_LEFTALT: case KEY_RIGHTALT: case KEY_LEFTMETA: case KEY_RIGHTMETA:
+    case KEY_CAPSLOCK: case KEY_NUMLOCK: case KEY_SCROLLLOCK:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void send_input(struct vrx_compositor *c, const struct vrx_msg_input *m) {
+    if (c->focused < 0) return;
+    client_send(c, c->apps[c->focused].fd, VRX_MSG_INPUT, m, sizeof *m, -1);
+    bool press = (m->kind == VRX_INPUT_TOUCH && m->u.touch.kind == 0) ||
+                 (m->kind == VRX_INPUT_KEY && m->u.key.state == 1);
+    if (c->trace && press) {
+        c->trace_input_ns = now_ns();
+        c->trace_buffer_ns = 0;
+    }
+}
+
+static void send_pointer(struct vrx_compositor *c, uint64_t time_ns, int32_t sx, int32_t sy) {
+    struct vrx_msg_input m = { .kind = VRX_INPUT_POINTER };
+    m.u.pointer = (struct vrx_input_pointer){
+        .time_ns = time_ns,
+        .x = (int32_t) c->px, .y = (int32_t) c->py,
+        .buttons = c->buttons,
+        .scroll_x = sx, .scroll_y = sy,
+    };
+    c->cursor_wanted = true;
+    cursor_update(c);
+    send_input(c, &m);
+}
+
+static void repeat_fire(struct vrx_compositor *c) {
+    uint64_t expirations;
+    if (read(c->repeat_fd, &expirations, sizeof expirations) != sizeof expirations) return;
+    if (!c->repeat_key) return;
+    struct vrx_msg_input m = { .kind = VRX_INPUT_KEY };
+    m.u.key = (struct vrx_input_key){ .time_ns = now_ns(), .keycode = c->repeat_key, .state = 2 };
+    send_input(c, &m);
+}
+
+// Flutter's button bits for a Linux button code
+static uint32_t button_bit(uint32_t code) {
+    switch (code) {
+    case BTN_LEFT: return 1;
+    case BTN_RIGHT: return 2;
+    case BTN_MIDDLE: return 4;
+    case BTN_SIDE: case BTN_BACK: return 8;
+    case BTN_EXTRA: case BTN_FORWARD: return 16;
+    default: return 0;
+    }
+}
+
+// a wheel click scrolls about three lines of body text
+#define WHEEL_PX_PER_CLICK 50
+
 static void li_dispatch(struct vrx_compositor *c) {
     libinput_dispatch(c->li);
     while (libinput_next_event_type(c->li) != LIBINPUT_EVENT_NONE) {
         struct libinput_event *ev = libinput_get_event(c->li);
         enum libinput_event_type t = libinput_event_get_type(ev);
-        int idx = c->focused;
-        if (idx >= 0) {
-            struct vrx_msg_input m = {0};
-            bool send = false;
-            if (t == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
-                struct libinput_event_pointer *p = libinput_event_get_pointer_event(ev);
-                double x = libinput_event_pointer_get_absolute_x_transformed(p, c->width);
-                double y = libinput_event_pointer_get_absolute_y_transformed(p, c->height);
-                m.kind = VRX_INPUT_POINTER;
-                m.u.pointer = (struct vrx_input_pointer){
-                    .time_ns = (uint64_t) libinput_event_pointer_get_time_usec(p) * 1000,
-                    .x = (int32_t) x, .y = (int32_t) y,
-                    .buttons = 0,
-                };
-                send = true;
-            } else if (t == LIBINPUT_EVENT_KEYBOARD_KEY) {
-                struct libinput_event_keyboard *k = libinput_event_get_keyboard_event(ev);
-                m.kind = VRX_INPUT_KEY;
-                m.u.key = (struct vrx_input_key){
-                    .time_ns = (uint64_t) libinput_event_keyboard_get_time_usec(k) * 1000,
-                    .keycode = libinput_event_keyboard_get_key(k),
-                    .state = libinput_event_keyboard_get_key_state(k) ? 1 : 0,
-                };
-                send = true;
-            } else if (t == LIBINPUT_EVENT_TOUCH_DOWN || t == LIBINPUT_EVENT_TOUCH_MOTION ||
-                       t == LIBINPUT_EVENT_TOUCH_UP) {
-                struct libinput_event_touch *th = libinput_event_get_touch_event(ev);
-                m.kind = VRX_INPUT_TOUCH;
-                uint32_t kind = t == LIBINPUT_EVENT_TOUCH_DOWN ? 0 :
-                                t == LIBINPUT_EVENT_TOUCH_MOTION ? 1 : 2;
-                m.u.touch = (struct vrx_input_touch){
-                    .time_ns = (uint64_t) libinput_event_touch_get_time_usec(th) * 1000,
-                    .slot = (uint32_t) libinput_event_touch_get_slot(th),
-                    .kind = kind,
-                    .x = kind == 2 ? 0 : (int32_t) libinput_event_touch_get_x_transformed(th, c->width),
-                    .y = kind == 2 ? 0 : (int32_t) libinput_event_touch_get_y_transformed(th, c->height),
-                };
-                send = true;
+        struct libinput_event_pointer *p = NULL;
+        switch (t) {
+        case LIBINPUT_EVENT_DEVICE_ADDED: {
+            // a touchpad clicks on a tap, as people expect
+            struct libinput_device *d = libinput_event_get_device(ev);
+            if (libinput_device_config_tap_get_finger_count(d) > 0) {
+                libinput_device_config_tap_set_enabled(d, LIBINPUT_CONFIG_TAP_ENABLED);
             }
-            if (send) {
-                client_send(c, c->apps[idx].fd, VRX_MSG_INPUT, &m, sizeof m, -1);
-                bool press = (m.kind == VRX_INPUT_TOUCH && m.u.touch.kind == 0) ||
-                             (m.kind == VRX_INPUT_KEY && m.u.key.state == 1);
-                if (c->trace && press) {
-                    c->trace_input_ns = now_ns();
-                    c->trace_buffer_ns = 0;
-                }
+            break;
+        }
+        case LIBINPUT_EVENT_POINTER_MOTION:
+            p = libinput_event_get_pointer_event(ev);
+            c->px += libinput_event_pointer_get_dx(p);
+            c->py += libinput_event_pointer_get_dy(p);
+            if (c->px < 0) c->px = 0;
+            if (c->py < 0) c->py = 0;
+            if (c->px > c->width - 1) c->px = c->width - 1;
+            if (c->py > c->height - 1) c->py = c->height - 1;
+            send_pointer(c, libinput_event_pointer_get_time_usec(p) * 1000, 0, 0);
+            break;
+        case LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE:
+            p = libinput_event_get_pointer_event(ev);
+            c->px = libinput_event_pointer_get_absolute_x_transformed(p, c->width);
+            c->py = libinput_event_pointer_get_absolute_y_transformed(p, c->height);
+            send_pointer(c, libinput_event_pointer_get_time_usec(p) * 1000, 0, 0);
+            break;
+        case LIBINPUT_EVENT_POINTER_BUTTON: {
+            p = libinput_event_get_pointer_event(ev);
+            uint32_t bit = button_bit(libinput_event_pointer_get_button(p));
+            if (!bit) break;
+            if (libinput_event_pointer_get_button_state(p) == LIBINPUT_BUTTON_STATE_PRESSED) {
+                c->buttons |= bit;
+            } else {
+                c->buttons &= ~bit;
             }
+            send_pointer(c, libinput_event_pointer_get_time_usec(p) * 1000, 0, 0);
+            break;
+        }
+        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS: {
+            // (LIBINPUT_EVENT_POINTER_AXIS repeats these for old clients)
+            p = libinput_event_get_pointer_event(ev);
+            double v[2] = {0, 0};
+            const enum libinput_pointer_axis axes[2] = {
+                LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL,
+            };
+            for (int a = 0; a < 2; a++) {
+                if (!libinput_event_pointer_has_axis(p, axes[a])) continue;
+                v[a] = t == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL
+                           ? libinput_event_pointer_get_scroll_value_v120(p, axes[a]) / 120.0 * WHEEL_PX_PER_CLICK
+                           : libinput_event_pointer_get_scroll_value(p, axes[a]);
+            }
+            if (v[0] != 0 || v[1] != 0) {
+                send_pointer(c, libinput_event_pointer_get_time_usec(p) * 1000, (int32_t) v[0], (int32_t) v[1]);
+            }
+            break;
+        }
+        case LIBINPUT_EVENT_KEYBOARD_KEY: {
+            struct libinput_event_keyboard *k = libinput_event_get_keyboard_event(ev);
+            uint32_t key = libinput_event_keyboard_get_key(k);
+            bool down = libinput_event_keyboard_get_key_state(k) == LIBINPUT_KEY_STATE_PRESSED;
+            struct vrx_msg_input m = { .kind = VRX_INPUT_KEY };
+            m.u.key = (struct vrx_input_key){
+                .time_ns = libinput_event_keyboard_get_time_usec(k) * 1000,
+                .keycode = key,
+                .state = down ? 1 : 0,
+            };
+            if (down && !is_modifier(key)) {
+                repeat_arm(c, key);
+            } else if (!down && key == c->repeat_key) {
+                repeat_arm(c, 0);
+            }
+            send_input(c, &m);
+            break;
+        }
+        case LIBINPUT_EVENT_TOUCH_DOWN:
+        case LIBINPUT_EVENT_TOUCH_MOTION:
+        case LIBINPUT_EVENT_TOUCH_UP: {
+            struct libinput_event_touch *th = libinput_event_get_touch_event(ev);
+            uint32_t kind = t == LIBINPUT_EVENT_TOUCH_DOWN ? 0 :
+                            t == LIBINPUT_EVENT_TOUCH_MOTION ? 1 : 2;
+            struct vrx_msg_input m = { .kind = VRX_INPUT_TOUCH };
+            m.u.touch = (struct vrx_input_touch){
+                .time_ns = (uint64_t) libinput_event_touch_get_time_usec(th) * 1000,
+                .slot = (uint32_t) libinput_event_touch_get_slot(th),
+                .kind = kind,
+                .x = kind == 2 ? 0 : (int32_t) libinput_event_touch_get_x_transformed(th, c->width),
+                .y = kind == 2 ? 0 : (int32_t) libinput_event_touch_get_y_transformed(th, c->height),
+            };
+            // a finger on the glass: the arrow would only be in the way
+            if (c->cursor_wanted) {
+                c->cursor_wanted = false;
+                cursor_update(c);
+            }
+            send_input(c, &m);
+            break;
+        }
+        default:
+            break;
         }
         libinput_event_destroy(ev);
     }
@@ -682,6 +960,7 @@ static void li_dispatch(struct vrx_compositor *c) {
 #define TAG_LISTENER  0xFFFFFFFFFFFFFFFEull
 #define TAG_LIBINPUT  0xFFFFFFFFFFFFFFFDull
 #define TAG_DRM       0xFFFFFFFFFFFFFFFCull
+#define TAG_REPEAT    0xFFFFFFFFFFFFFFFBull
 #define CLIENT_TAG(slot, fd) (((uint64_t) (uint32_t) (fd) << 32) | (uint32_t) (slot))
 
 static void accept_client(struct vrx_compositor *c) {
@@ -743,6 +1022,14 @@ int vrx_compositor_main(int argc, char **argv) {
         ev.data.u64 = TAG_LIBINPUT;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.li_fd, &ev);
     }
+    c.repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (c.repeat_fd >= 0) {
+        ev.data.u64 = TAG_REPEAT;
+        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.repeat_fd, &ev);
+    }
+    c.px = c.width / 2.0;
+    c.py = c.height / 2.0;
+    cursor_init(&c);
 
     c.running = true;
 
@@ -762,6 +1049,8 @@ int vrx_compositor_main(int argc, char **argv) {
                 li_dispatch(&c);
             } else if (tag == TAG_DRM) {
                 drm_readable(&c);
+            } else if (tag == TAG_REPEAT) {
+                repeat_fire(&c);
             } else {
                 int slot = (int) (uint32_t) tag;
                 int fd = (int) (tag >> 32);
