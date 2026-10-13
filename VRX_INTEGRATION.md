@@ -1,6 +1,20 @@
-# flutter-vrx: integrating the app role (B2)
+# flutter-vrx: integrating the app role (B2, B3)
 
-Status (2026-10-13): **B2 done and bench-verified on the CM4 +
+Status (2026-10-13): **B3: vrxhost launches, the compositor composites.**
+The compositor role launches nothing and decides no focus. vrxhost
+(vrx-linux, plan 0007 amendment C) starts each applet as the
+unprivileged vrx user, connects to the compositor's socket as the one
+controller (CONTROL, root only, checked by SO_PEERCRED) and names the
+focused app by pid (SET_FOCUS); the compositor reports each app's arrival
+and exit (APP_STATE). The socket is root:vrx 0660. REGISTERED carries the
+panel's physical size, and the app's pixel ratio is (px per mm) /
+VRX_DP_PER_MM, the 160 dp/inch density vrx_kit's mm metrics are written
+in (1.77 on the 2.8" panel). Bench-proven on the CM4 + disp28a: a tap on
+the launcher's Clock tile reached vrxhost as vrx.nav.push, vrxhost started
+clock and focused it, and the screen switched; pop, home, a killed app's
+restart and refocus all followed.
+
+**B2 done and bench-verified on the CM4 +
 CM4-DISP-BASE-2.8A.** `flutter-vrx --compositor` owns KMS and input; each
 `flutter-vrx --release --app <bundle>` renders in its own process and
 presents over IPC. Proven on the panel: the app's frame is scanned out
@@ -62,6 +76,8 @@ The surveyed design follows as it was recorded.
 - BUFFER fds must be read with recvmsg (SCM_RIGHTS) in client_readable —
   the current recv() path parses the header/payload but cannot receive
   descriptors; flagged in vrx_compositor.c.
-- B3: registry-driven launch/switch (a `vrx/apps/*` platform channel on the
-  launcher + per-app restart policy); B4: crash containment exercise,
-  background buffer release, boot-to-first-frame measurement.
+- B3 landed as above: launch, restart policy and focus live in vrxhost;
+  the launcher talks to vrxhost over its intent socket (vrx_kit's
+  VrxHost), not a platform channel.
+- B4: suspend unfocused apps (FOCUS(0) is already sent), background
+  buffer release, boot-to-first-frame measurement.
