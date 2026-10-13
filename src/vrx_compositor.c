@@ -43,11 +43,13 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
 #include "vrx_ipc.h"
+#include "vrx_kms.h"
 
 // ─── app client ───────────────────────────────────────────────────────────
 
@@ -77,6 +79,12 @@ struct frame {
 
 struct vrx_compositor {
     int drm_fd;
+    // VRX_TRACE_LATENCY=1: log input-to-screen latency per touch/key, the
+    // number a person feels as responsiveness (input sent → the app's next
+    // buffer arrives → that buffer is flipped onto the panel)
+    bool trace;
+    uint64_t trace_input_ns;   // the untraced input being answered, 0 = none
+    uint64_t trace_buffer_ns;  // when the answering buffer arrived
     bool logged_format;        // first frame's format/modifier logged
     uint32_t connector_id, crtc_id;
     drmModeModeInfo mode;
@@ -103,13 +111,27 @@ struct vrx_compositor {
     bool running;
 };
 
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
 // ─── KMS ──────────────────────────────────────────────────────────────────
 
 static int kms_init(struct vrx_compositor *c, const char *device) {
-    const char *path = device ? device : "/dev/dri/card0";
-    c->drm_fd = open(path, O_RDWR | O_CLOEXEC);
+    char found[64];
+    const char *path = device;
+    if (path) {
+        c->drm_fd = open(path, O_RDWR | O_CLOEXEC);
+    } else {
+        // the node with connectors and CRTCs, whatever its number this boot
+        c->drm_fd = vrx_open_kms_node(found, sizeof found);
+        path = found;
+    }
     if (c->drm_fd < 0) {
-        fprintf(stderr, "[vrx-compositor] cannot open %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "[vrx-compositor] cannot open %s: %s\n",
+                device ? device : "a display (no DRM node has a connector)", strerror(errno));
         return -1;
     }
     if (drmSetMaster(c->drm_fd) != 0) {
@@ -269,6 +291,13 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
                          unsigned int usec, void *data) {
     (void) fd; (void) seq; (void) sec; (void) usec;
     struct vrx_compositor *c = data;
+    if (c->trace && c->trace_input_ns && c->trace_buffer_ns) {
+        uint64_t now = now_ns();
+        fprintf(stderr, "[vrx-compositor] latency: input→buffer %.1f ms, input→screen %.1f ms\n",
+                (double) (c->trace_buffer_ns - c->trace_input_ns) / 1e6,
+                (double) (now - c->trace_input_ns) / 1e6);
+        c->trace_input_ns = 0;
+    }
     if (c->on_screen.app_fd != c->pending.app_fd) {
         fprintf(stderr, "[vrx-compositor] screen switched to slot %d ('%s')\n", c->pending.app,
                 c->pending.app >= 0 ? c->apps[c->pending.app].id : "?");
@@ -494,6 +523,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
                 frame_release(c, &f);
                 break;
             }
+            if (c->trace && c->trace_input_ns && !c->trace_buffer_ns) c->trace_buffer_ns = now_ns();
             // newest wins: a frame still waiting for the flip slot is
             // superseded and returned
             frame_release(c, &c->queued);
@@ -628,6 +658,12 @@ static void li_dispatch(struct vrx_compositor *c) {
             }
             if (send) {
                 client_send(c, c->apps[idx].fd, VRX_MSG_INPUT, &m, sizeof m, -1);
+                bool press = (m.kind == VRX_INPUT_TOUCH && m.u.touch.kind == 0) ||
+                             (m.kind == VRX_INPUT_KEY && m.u.key.state == 1);
+                if (c->trace && press) {
+                    c->trace_input_ns = now_ns();
+                    c->trace_buffer_ns = 0;
+                }
             }
         }
         libinput_event_destroy(ev);
@@ -679,6 +715,7 @@ int vrx_compositor_main(int argc, char **argv) {
         if (i + 1 < argc && !strcmp(argv[i], "--device")) device = argv[++i];
     }
     struct vrx_compositor c = {0};
+    c.trace = getenv("VRX_TRACE_LATENCY") != NULL;
     c.focused = -1;
     c.controller = -1;
     struct frame *frames[] = { &c.on_screen, &c.pending, &c.queued };

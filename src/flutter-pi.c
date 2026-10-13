@@ -58,6 +58,7 @@
 #include "util/logging.h"
 #include "window.h"
 #include "vrx_app_client.h"
+#include "vrx_kms.h"
 
 #include "config.h"
 
@@ -2313,42 +2314,19 @@ fail_free_devices:
 // through the GPU. Allocation needs no DRM master, so the compositor stays
 // the only master.
 static struct gbm_device *open_kms_node_as_gbm_device(void) {
-    drmDevicePtr devices[64];
-    int n = drmGetDevices2(0, devices, sizeof(devices) / sizeof(*devices));
-    if (n < 0) {
-        LOG_ERROR("Could not query DRM device list: %s\n", strerror(-n));
+    char path[64];
+    int fd = vrx_open_kms_node(path, sizeof path);
+    if (fd < 0) {
+        LOG_ERROR("vrx: no KMS device to allocate scanout buffers from.\n");
         return NULL;
     }
-    struct gbm_device *gbm = NULL;
-    for (int i = 0; i < n && gbm == NULL; i++) {
-        if (!(devices[i]->available_nodes & (1 << DRM_NODE_PRIMARY))) {
-            continue;
-        }
-        int fd = open(devices[i]->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
-        if (fd < 0) {
-            continue;
-        }
-        drmModeRes *res = drmModeGetResources(fd);
-        bool is_kms = res != NULL && res->count_connectors > 0 && res->count_crtcs > 0;
-        if (res != NULL) {
-            drmModeFreeResources(res);
-        }
-        if (!is_kms) {
-            close(fd);
-            continue;
-        }
-        gbm = gbm_create_device(fd);
-        if (gbm == NULL) {
-            LOG_ERROR("Could not create GBM device on \"%s\". Continuing.\n", devices[i]->nodes[DRM_NODE_PRIMARY]);
-            close(fd);
-        } else {
-            LOG_DEBUG("vrx: allocating scanout buffers through %s\n", devices[i]->nodes[DRM_NODE_PRIMARY]);
-        }
-    }
-    drmFreeDevices(devices, n);
+    struct gbm_device *gbm = gbm_create_device(fd);
     if (gbm == NULL) {
-        LOG_ERROR("vrx: no KMS device to allocate scanout buffers from.\n");
+        LOG_ERROR("Could not create GBM device on \"%s\".\n", path);
+        close(fd);
+        return NULL;
     }
+    LOG_DEBUG("vrx: allocating scanout buffers through %s\n", path);
     return gbm;
 }
 
