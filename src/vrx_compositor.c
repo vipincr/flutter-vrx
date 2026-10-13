@@ -1369,8 +1369,23 @@ static void hold_changed(struct vrx_compositor *c, const char *why) {
     idle_arm(c);
 }
 
-// A touch screen, a pointer, or a keyboard with letters (the HDMI CEC
-// remotes register as keyboards with no letter keys) can wake the screen.
+// A device a person wakes the screen with, as udev classifies it: a
+// touchscreen, keyboard, mouse, touchpad or tablet. vc4's HDMI CEC inputs
+// are present with or without a TV and udev tags them only as keys and a
+// pointing stick, so they do not count (bench, CM4, 2026-10-14).
+static bool can_wake(struct libinput_device *d) {
+    static const char *kinds[] = { "ID_INPUT_TOUCHSCREEN", "ID_INPUT_KEYBOARD", "ID_INPUT_MOUSE",
+                                   "ID_INPUT_TOUCHPAD", "ID_INPUT_TABLET" };
+    struct udev_device *u = libinput_device_get_udev_device(d);
+    bool yes = false;
+    for (size_t i = 0; u && i < sizeof kinds / sizeof kinds[0] && !yes; i++) {
+        const char *v = udev_device_get_property_value(u, kinds[i]);
+        yes = v && strcmp(v, "1") == 0;
+    }
+    if (u) udev_device_unref(u);
+    return yes;
+}
+
 static void wake_devices_changed(struct vrx_compositor *c, int delta, const char *name) {
     c->wake_devices += delta;
     fprintf(stderr, "[vrx-compositor] %s %s: %d device%s can wake the screen%s\n", name,
@@ -1616,10 +1631,7 @@ static void li_dispatch(struct vrx_compositor *c) {
             if (libinput_device_config_tap_get_finger_count(d) > 0) {
                 libinput_device_config_tap_set_enabled(d, LIBINPUT_CONFIG_TAP_ENABLED);
             }
-            if (libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_TOUCH) ||
-                libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_POINTER) ||
-                (libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_KEYBOARD) &&
-                 libinput_device_keyboard_has_key(d, KEY_A) == 1)) {
+            if (can_wake(d)) {
                 libinput_device_set_user_data(d, c);
                 wake_devices_changed(c, +1, libinput_device_get_name(d));
             }
