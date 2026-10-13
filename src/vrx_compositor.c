@@ -625,13 +625,15 @@ static bool chrome_shown(const struct vrx_compositor *c) {
     return c->shell >= 0 && !(c->focused >= 0 && c->apps[c->focused].no_chrome);
 }
 
-// Tell every app but the shell how much of the top to keep clear (none
-// for an app that asked for the whole screen).
+// Tell every app but the shell how tall the strip is. An app that took
+// the whole screen knows it did and lays itself out without the strip;
+// telling it 0 meant its first frame after giving the screen back was
+// laid out under the strip (bench 2026-10-13).
 static void send_insets(struct vrx_compositor *c, int only) {
+    struct vrx_msg_insets m = { .top = c->shell >= 0 ? c->shell_top : 0 };
     for (int i = 0; i < MAX_APPS; i++) {
         struct app_client *a = &c->apps[i];
         if (!a->in_use || !a->registered || i == c->shell || (only >= 0 && i != only)) continue;
-        struct vrx_msg_insets m = { .top = c->shell >= 0 && !a->no_chrome ? c->shell_top : 0 };
         client_send(c, a->fd, VRX_MSG_INSETS, &m, sizeof m, -1);
     }
 }
@@ -841,7 +843,6 @@ static void client_handle(struct vrx_compositor *c, int slot,
             if (h->length < sizeof *m || slot == c->shell) goto bad;
             if (a->no_chrome == (m->hidden != 0)) break;
             a->no_chrome = m->hidden != 0;
-            send_insets(c, slot);
             if (slot == c->focused) shell_show(c);
             break;
         }

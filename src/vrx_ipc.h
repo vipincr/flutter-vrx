@@ -74,12 +74,13 @@ enum vrx_msg_type {
     // (input there goes to the shell, apps are told to keep clear), or the
     // whole screen while its drawer is open (all input is the shell's).
     VRX_MSG_SHELL_REGION = 13,
-    // comp -> app: keep clear of the top `top` pixels (the shell's strip);
-    // sent on REGISTER and whenever it changes.
+    // comp -> app: the shell's strip covers the top `top` pixels; sent on
+    // REGISTER and whenever it changes.
     VRX_MSG_INSETS = 14,
     // app -> comp: give me the whole screen (hidden = 1) or the strip back
-    // (0). While that app is focused the shell's plane is off, its input
-    // goes to the app, and its insets are 0 (a keyboard on a 58mm panel).
+    // (0). While that app is focused the shell's plane is off and its input
+    // goes to the app; the app lays itself out without the strip (a
+    // keyboard on a 58mm panel). Its INSETS stay the strip's height.
     VRX_MSG_CHROME = 15,
     // shell -> comp -> the focused app: the strip's Back was pressed. The
     // app goes back a screen, or leaves (Nav.pop) at its first. No payload.

@@ -223,6 +223,10 @@ struct window {
         void *hold;
     } vrx_out[VRX_MAX_OUTSTANDING];
     uint32_t vrx_skipped;
+    // a frame was skipped (both slots held) and nothing newer went out: the
+    // next release presents the front, or an idle app's last frame never
+    // shows (bench 2026-10-13: an app stayed laid out under the strip)
+    bool vrx_stale;
 
 #ifdef HAVE_EGL_GLES2
     /**
@@ -1734,8 +1738,9 @@ static void vrx_present_front_locked(struct window *window) {
     }
     if (slot < 0) {
         // compositor still holds two frames: skip this one rather than let
-        // the next swap find no free GBM buffer
+        // the next swap find no free GBM buffer; a release sends it
         window->vrx_skipped++;
+        window->vrx_stale = true;
         return;
     }
     struct egl_gbm_export ex;
@@ -1748,6 +1753,7 @@ static void vrx_present_front_locked(struct window *window) {
     if (seq != 0) {
         window->vrx_out[slot].sequence = seq;
         window->vrx_out[slot].hold = ex.hold;
+        window->vrx_stale = false;
     } else {
         egl_gbm_render_surface_release_export(ex.hold);
     }
@@ -1787,6 +1793,7 @@ void window_vrx_on_release(struct window *window, uint32_t sequence) {
             break;
         }
     }
+    if (window->vrx_stale) vrx_present_front_locked(window);
     window_unlock(window);
 }
 
