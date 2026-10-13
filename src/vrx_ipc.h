@@ -85,6 +85,16 @@ enum vrx_msg_type {
     // shell -> comp -> the focused app: the strip's Back was pressed. The
     // app goes back a screen, or leaves (Nav.pop) at its first. No payload.
     VRX_MSG_BACK = 16,
+    // app -> comp: keep the screen on (on = 1) or let it go (0). Honoured
+    // only while that app is focused or is the shell, like Wayland's
+    // idle-inhibit; a hold taking effect while the screen is off turns it
+    // on, a release restarts the idle timeout, a closed socket releases
+    // it (plan 0010 D3).
+    VRX_MSG_HOLD = 17,
+    // comp -> app: the screen went off (on = 0) or came back (1); sent on
+    // REGISTER too while it is off. The app stops drawing while it is off
+    // (Flutter: AppLifecycleState.hidden, plan 0010 D4).
+    VRX_MSG_DISPLAY = 18,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -158,6 +168,14 @@ struct vrx_msg_insets {
 
 struct vrx_msg_chrome {
     uint32_t hidden;  // 1: the app has the whole screen while focused
+};
+
+struct vrx_msg_hold {
+    uint32_t on;  // 0/1
+};
+
+struct vrx_msg_display {
+    uint32_t on;  // 0/1
 };
 
 struct vrx_msg_app_state {

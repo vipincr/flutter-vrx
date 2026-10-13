@@ -18,6 +18,8 @@ struct vrx_app_client_callbacks {
     // keep clear of the top `top` output pixels (the shell's strip)
     void (*on_insets)(uint32_t top, void *userdata);
     void (*on_back)(void *userdata);
+    // the screen went off (0) or came back (1)
+    void (*on_display)(uint32_t on, void *userdata);
     void *userdata;
 };
 

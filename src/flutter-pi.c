@@ -2003,6 +2003,31 @@ static void vrx_on_back(void *userdata) {
     platch_call_json("vrx/chrome", "back", &(struct json_value){ .type = kJsonNull }, NULL, NULL);
 }
 
+// The screen went off or came back (plan 0010 D4): Flutter stops
+// scheduling frames while hidden, so tickers and animations rest; Dart
+// timers keep running (an alarm still fires). The framework fills in the
+// states between. Before the engine runs there is nobody to tell, and an
+// app started while the screen is off draws until the next wake.
+static void vrx_on_display(uint32_t on, void *userdata) {
+    (void) userdata;
+    if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
+    const char *state = on ? "AppLifecycleState.resumed" : "AppLifecycleState.hidden";
+    flutterpi_send_platform_message(flutterpi, "flutter/lifecycle", (const uint8_t *) state, strlen(state), NULL);
+}
+
+// vrx/display: hold {on}, the kit's VrxKeepScreenOn (plan 0010 D3).
+static int on_vrx_display_channel(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *handle) {
+    (void) channel;
+    if (strcmp(object->method, "hold") == 0) {
+        struct json_value *on = jsobject_get(&object->json_arg, "on");
+        if (!on || !JSONVALUE_IS_BOOL(*on)) return platch_respond_illegal_arg_json(handle, "hold: on must be a bool");
+        struct vrx_msg_hold m = { .on = JSONVALUE_AS_BOOL(*on) };
+        vrx_app_client_send(vrx_app.client, VRX_MSG_HOLD, &m, sizeof m, -1);
+        return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
+    }
+    return platch_respond_not_implemented(handle);
+}
+
 // vrx/shell: getInsets and setChrome {hidden} for every app; setRegion
 // {top, full} and back from the shell.
 static int on_vrx_shell_channel(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *handle) {
@@ -2044,6 +2069,7 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
         .on_release = vrx_on_release,
         .on_insets = vrx_on_insets,
         .on_back = vrx_on_back,
+        .on_display = vrx_on_display,
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to
@@ -3080,6 +3106,8 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
         // the shell's region and every app's insets (plan 0008 D10)
         ok = plugin_registry_set_receiver_locked("vrx/shell", kJSONMethodCall, on_vrx_shell_channel);
         if (ok != 0) LOG_ERROR("vrx: cannot listen on vrx/shell: %s\n", strerror(ok));
+        ok = plugin_registry_set_receiver_locked("vrx/display", kJSONMethodCall, on_vrx_display_channel);
+        if (ok != 0) LOG_ERROR("vrx: cannot listen on vrx/display: %s\n", strerror(ok));
     }
     fpi->texture_registry = texture_registry;
     fpi->libseat = libseat;

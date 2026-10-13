@@ -75,6 +75,7 @@ struct app_client {
     uint32_t region_top;  // its last SHELL_REGION: kept, since the shell
     bool region_full;     // reports on its first frame and vrxhost may
                           // name it after that
+    bool hold;            // asked to keep the screen on (plan 0010 D3)
     char id[sizeof(struct vrx_msg_register)];
 };
 
@@ -123,14 +124,22 @@ struct vrx_compositor {
     int repeat_fd;
     uint32_t repeat_key;       // 0 = none held
 
-    // idle (plan 0008 Part C step 3): no input for light_off seconds turns
-    // the backlight off; the input that wakes it only wakes it
+    // screen power (plan 0010): no input for light_off seconds turns the
+    // light and the panel off; the input that wakes them only wakes them
     int idle_fd;               // timerfd
-    int conf_fd;               // inotify on the settings directory
+    int conf_fd;               // inotify on the screen settings directory
     uint32_t light_off;        // seconds, 0 = never
+    int brightness;            // the setting, 0-100, mapped above a floor
     char backlight[96];        // /sys/class/backlight/<name>, "" = none
-    int light_level;           // what to restore on waking
-    bool dark;                 // the timer turned the light off
+    int bl_max;                // its max_brightness, 0 = no backlight
+    enum { DIM_NONE, DIM_BACKLIGHT, DIM_ALPHA } dim;  // how brightness is shown
+    uint32_t dpms_prop;        // the connector's DPMS property, 0 = none
+    uint32_t primary_plane;    // the CRTC's primary plane
+    uint32_t primary_alpha, shell_alpha;  // their alpha properties, 0 = none
+    bool dark;                 // the screen is off
+    bool light_after_flip;     // waking: light once the newest frame is up
+    bool was_held;             // an app held the screen on, last we looked
+    int wake_devices;          // touch screens, pointers, keyboards present
     int touches;               // contacts down now
     bool swallow_touch;        // the waking touch, until every contact is up
     bool swallow_pointer;      // the waking click, until its buttons are up
@@ -183,8 +192,11 @@ static void connector_name(const drmModeConnector *conn, char *out, size_t cap) 
     snprintf(out, cap, "%s-%u", type ? type : "Unknown", conn->connector_type_id);
 }
 
-// The output asked for: VRX_OUTPUT, else `output=` in /etc/vrx/display.conf
-// (the display settings file plan 0008 Part C shares), else none.
+static bool conf_value(const char *path, const char *key, char *out, size_t cap);
+
+// The output asked for: VRX_OUTPUT, else `output=` in the screen settings
+// file (/etc/vrx/display/screen.conf, the one display settings file), else
+// none.
 static void output_wanted(char *out, size_t cap) {
     out[0] = 0;
     const char *env = getenv("VRX_OUTPUT");
@@ -192,22 +204,7 @@ static void output_wanted(char *out, size_t cap) {
         snprintf(out, cap, "%s", env);
         return;
     }
-    FILE *f = fopen("/etc/vrx/display.conf", "re");
-    if (!f) return;
-    char line[128];
-    while (fgets(line, sizeof line, f)) {
-        char *v = line;
-        while (*v == ' ' || *v == '\t') v++;
-        if (strncmp(v, "output", 6) != 0) continue;
-        v += 6;
-        while (*v == ' ' || *v == '\t') v++;
-        if (*v != '=') continue;
-        v++;
-        while (*v == ' ' || *v == '\t') v++;
-        v[strcspn(v, " \t\r\n#")] = 0;
-        snprintf(out, cap, "%s", v);
-    }
-    fclose(f);
+    conf_value("/etc/vrx/display/screen.conf", "output", out, cap);
 }
 
 // ─── overlay planes (plan 0008 Part C, step 1) ────────────────────────────
@@ -270,6 +267,7 @@ static uint32_t plane_probe(struct vrx_compositor *c, bool log) {
                 (void) alpha;
             }
             if (!overlay && has_type && type == DRM_PLANE_TYPE_OVERLAY && argb) overlay = p->plane_id;
+            if (!c->primary_plane && has_type && type == DRM_PLANE_TYPE_PRIMARY) c->primary_plane = p->plane_id;
         }
         drmModeFreePlane(p);
     }
@@ -341,7 +339,7 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
         fprintf(stderr, "[vrx-compositor] drmModeGetResources: %s\n", strerror(errno));
         return -1;
     }
-    // The output: the one named (VRX_OUTPUT, else display.conf's
+    // The output: the one named (VRX_OUTPUT, else screen.conf's
     // output=, e.g. HDMI-A-1) when it is connected, else the first
     // connected. A board with only an HDMI monitor needs no naming; one
     // with a panel and a monitor names the monitor to use it.
@@ -469,10 +467,15 @@ static bool frame_import(struct vrx_compositor *c, struct frame *f,
 }
 
 static void shell_show(struct vrx_compositor *c);
+static void screen_light(struct vrx_compositor *c);
+static void display_tell(struct vrx_compositor *c, int only);
+static void hold_changed(struct vrx_compositor *c, const char *why);
 
-// Ask for the queued frame to be flipped in, if the flip slot is free.
+// Ask for the queued frame to be flipped in, if the flip slot is free and
+// the screen is on (a flip on a CRTC that is off is refused; the newest
+// frame waits in `queued` for the wake, plan 0010 D5).
 static void flip_queued(struct vrx_compositor *c) {
-    if (!c->queued.valid || c->pending.valid) return;
+    if (!c->queued.valid || c->pending.valid || c->dark) return;
     if (!c->mode_set) {
         // the very first frame: one modeset, after which everything flips
         if (drmModeSetCrtc(c->drm_fd, c->crtc_id, c->queued.fb_id, 0, 0,
@@ -482,6 +485,7 @@ static void flip_queued(struct vrx_compositor *c) {
             return;
         }
         c->mode_set = true;
+        screen_light(c);
         cursor_update(c);
         if (getenv("VRX_PROBE_OVERLAY")) plane_probe_bar(c);
         shell_show(c);
@@ -528,6 +532,11 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
     memset(&c->pending, 0, sizeof c->pending);
     c->pending.dmabuf_fd = -1;
     c->pending.app = -1;
+    if (c->light_after_flip) {
+        // waking: the current screen is up, now it can be seen
+        c->light_after_flip = false;
+        screen_light(c);
+    }
     flip_queued(c);
 }
 
@@ -672,6 +681,7 @@ static void apply_want_shell(struct vrx_compositor *c) {
                 (int) c->apps[slot].pid, c->shell_plane);
     }
     send_insets(c, -1);
+    hold_changed(c, "shell changed");
 }
 
 static void focus_slot(struct vrx_compositor *c, int slot) {
@@ -688,6 +698,8 @@ static void focus_slot(struct vrx_compositor *c, int slot) {
     }
     // a frame from the old focus still waiting for the flip slot never shows
     frame_release(c, &c->queued);
+    // a hold counts only while its app is in front
+    hold_changed(c, "focus changed");
     if (slot < 0) {
         fprintf(stderr, "[vrx-compositor] focus -> none\n");
         return;
@@ -754,6 +766,8 @@ static void drop_client(struct vrx_compositor *c, int slot) {
         if (c->touch_owner[i] == slot) c->touch_owner[i] = -1;
     }
     if (c->pointer_owner == slot) c->pointer_owner = -1;
+    // a closed socket releases its hold: a crash cannot pin the screen on
+    hold_changed(c, "app gone");
 }
 
 // Handle one message. `fd` is the descriptor that rode it, or -1; this
@@ -762,7 +776,8 @@ static void client_handle(struct vrx_compositor *c, int slot,
                           const struct vrx_msg_header *h, void *payload, int fd) {
     struct app_client *a = &c->apps[slot];
     // a connection is an app (REGISTER) or the controller (CONTROL), once
-    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME;
+    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME ||
+                   h->type == VRX_MSG_HOLD;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL) && !a->controller) ||
         (h->type == VRX_MSG_SHELL_REGION && !a->registered) ||
@@ -782,6 +797,8 @@ static void client_handle(struct vrx_compositor *c, int slot,
                     slot, (int) a->pid);
             send_registered(c, a);
             report_app(c, a, VRX_APP_REGISTERED);
+            // an app starting while the screen is off starts hidden
+            if (c->dark) display_tell(c, slot);
             if (c->want_shell > 0 && a->pid == c->want_shell) {
                 apply_want_shell(c);
             } else {
@@ -884,6 +901,18 @@ static void client_handle(struct vrx_compositor *c, int slot,
         case VRX_MSG_CLOSED:
             fprintf(stderr, "[vrx-compositor] app '%s' said closed\n", a->id);
             break;
+        case VRX_MSG_HOLD: {
+            struct vrx_msg_hold *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            if (a->hold == (m->on != 0)) break;
+            a->hold = m->on != 0;
+            int n = 0;
+            for (int i = 0; i < MAX_APPS; i++) n += c->apps[i].in_use && c->apps[i].hold;
+            fprintf(stderr, "[vrx-compositor] '%s' %s the screen on (%d holding)\n", a->id,
+                    a->hold ? "holds" : "lets go of", n);
+            hold_changed(c, a->id);
+            break;
+        }
         default:
             goto bad;
     }
@@ -1094,17 +1123,27 @@ static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m)
     }
 }
 
-// ── idle ────────────────────────────────────────────────────────────────
-// The system's own settings are the reserved id's file (vrx is the OS,
-// never an applet): light_off=<seconds>, 0 or absent = never. vrx-policy
-// seeds it; Settings > Display writes it.
-#define VRX_SETTINGS_DIR "/etc/vrx/settings"
-#define VRX_SETTINGS_FILE VRX_SETTINGS_DIR "/vrx.conf"
+// ── screen power (plan 0010) ────────────────────────────────────────────
+// The compositor alone turns the screen off and on (D1): after light_off
+// seconds without input the light goes to 0 and the connector to DPMS off;
+// the next touch, click or key brings both back and is not delivered. No
+// setting means "off": brightness is a position 0-100 that maps into a
+// floor-to-full range, so a stored 0 is still a screen a person can read
+// (the owner, 2026-10-14). The settings are one file, written by applets
+// holding the display grant; nothing else touches the light.
+#define SCREEN_DIR "/etc/vrx/display"
+#define SCREEN_FILE SCREEN_DIR "/screen.conf"
+#define SCREEN_FACTS VRX_UI_SOCKET_DIR "/screen"
+#define LIGHT_OFF_DEFAULT 120
+// the floors (D8): a tenth of a dimmable backlight; plane alpha 0.4, about
+// 13 % of full luminance, since alpha scales encoded values
+#define BACKLIGHT_FLOOR 0.1
+#define ALPHA_FLOOR 0.4
 
-static int backlight_get(const struct vrx_compositor *c, const char *what) {
-    char path[128];
-    snprintf(path, sizeof path, "%s/%s", c->backlight, what);
-    FILE *f = fopen(path, "r");
+static int sysfs_int(const char *dir, const char *what) {
+    char path[160];
+    snprintf(path, sizeof path, "%s/%s", dir, what);
+    FILE *f = fopen(path, "re");
     if (!f) return -1;
     int v = -1;
     if (fscanf(f, "%d", &v) != 1) v = -1;
@@ -1113,9 +1152,10 @@ static int backlight_get(const struct vrx_compositor *c, const char *what) {
 }
 
 static void backlight_set(const struct vrx_compositor *c, int level) {
+    if (!c->backlight[0]) return;
     char path[128];
     snprintf(path, sizeof path, "%s/brightness", c->backlight);
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "we");
     if (!f) {
         fprintf(stderr, "[vrx-compositor] %s: %s\n", path, strerror(errno));
         return;
@@ -1124,31 +1164,199 @@ static void backlight_set(const struct vrx_compositor *c, int level) {
     fclose(f);
 }
 
+// The light's level for the brightness setting: full on a two-level
+// light, the setting mapped above the floor on a dimmable one.
+static int light_level(const struct vrx_compositor *c) {
+    if (c->dim != DIM_BACKLIGHT) return c->bl_max;
+    int l = (int) (c->bl_max * (BACKLIGHT_FLOOR + (1 - BACKLIGHT_FLOOR) * c->brightness / 100.0) + 0.5);
+    return l < 1 ? 1 : l;
+}
+
+static uint64_t plane_alpha(const struct vrx_compositor *c) {
+    if (c->dim != DIM_ALPHA) return 0xffff;
+    return (uint64_t) (0xffff * (ALPHA_FLOOR + (1 - ALPHA_FLOOR) * c->brightness / 100.0) + 0.5);
+}
+
+// Light the screen at the set brightness: the backlight, and on a light
+// that cannot dim, every plane's alpha over the CRTC's black background.
+static void screen_light(struct vrx_compositor *c) {
+    if (c->dark) return;
+    if (c->dim == DIM_ALPHA && c->mode_set) {
+        uint64_t a = plane_alpha(c);
+        if (c->primary_alpha) drmModeObjectSetProperty(c->drm_fd, c->primary_plane, DRM_MODE_OBJECT_PLANE, c->primary_alpha, a);
+        if (c->shell_alpha) drmModeObjectSetProperty(c->drm_fd, c->shell_plane, DRM_MODE_OBJECT_PLANE, c->shell_alpha, a);
+    }
+    backlight_set(c, light_level(c));
+}
+
+// Some app holds the screen on, and it counts: it is focused or the shell.
+static bool held(const struct vrx_compositor *c) {
+    for (int i = 0; i < MAX_APPS; i++) {
+        const struct app_client *a = &c->apps[i];
+        if (a->in_use && a->registered && a->hold && (i == c->focused || i == c->shell)) return true;
+    }
+    return false;
+}
+
+// The timer runs only while the screen is on, nothing holds it, the
+// setting allows it, and something can wake the screen again (D10).
 static void idle_arm(struct vrx_compositor *c) {
     if (c->idle_fd < 0) return;
-    struct itimerspec t = { .it_value = { .tv_sec = c->backlight[0] ? c->light_off : 0 } };
+    bool armed = c->light_off && !c->dark && !held(c) && c->wake_devices > 0;
+    struct itimerspec t = { .it_value = { .tv_sec = armed ? c->light_off : 0 } };
     timerfd_settime(c->idle_fd, 0, &t, NULL);
 }
 
-static void idle_read_conf(struct vrx_compositor *c) {
-    uint32_t light_off = 0;
-    FILE *f = fopen(VRX_SETTINGS_FILE, "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof line, f)) {
-            unsigned v;
-            if (sscanf(line, " light_off = %u", &v) == 1) light_off = v;
-        }
-        fclose(f);
+// Tell every app whether there is a screen to draw on.
+static void display_tell(struct vrx_compositor *c, int only) {
+    struct vrx_msg_display m = { .on = !c->dark };
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app_client *a = &c->apps[i];
+        if (!a->in_use || !a->registered || (only >= 0 && i != only)) continue;
+        client_send(c, a->fd, VRX_MSG_DISPLAY, &m, sizeof m, -1);
     }
-    if (light_off != c->light_off) {
-        fprintf(stderr, "[vrx-compositor] light off after %us idle%s\n", light_off, light_off ? "" : " (never)");
+}
+
+// Light first, then the panel; a flip still in flight finishes inside the
+// blocking DPMS commit, and nothing flips until the screen is back (D5).
+static void display_off(struct vrx_compositor *c, const char *why) {
+    if (c->dark) return;
+    c->dark = true;
+    c->light_after_flip = false;
+    backlight_set(c, 0);
+    if (c->dpms_prop && c->mode_set &&
+        drmModeConnectorSetProperty(c->drm_fd, c->connector_id, c->dpms_prop, DRM_MODE_DPMS_OFF) != 0) {
+        fprintf(stderr, "[vrx-compositor] DPMS off: %s\n", strerror(errno));
     }
-    c->light_off = light_off;
+    display_tell(c, -1);
+    idle_arm(c);
+    fprintf(stderr, "[vrx-compositor] screen off (%s)\n", why);
+}
+
+// The panel first, then the newest frame, then the light once that frame
+// is up, so the first thing seen is the current screen.
+static void display_on(struct vrx_compositor *c, const char *why) {
+    if (!c->dark) return;
+    c->dark = false;
+    if (c->dpms_prop && c->mode_set &&
+        drmModeConnectorSetProperty(c->drm_fd, c->connector_id, c->dpms_prop, DRM_MODE_DPMS_ON) != 0) {
+        fprintf(stderr, "[vrx-compositor] DPMS on: %s\n", strerror(errno));
+    }
+    display_tell(c, -1);
+    if (c->queued.valid && !c->pending.valid) {
+        c->light_after_flip = true;
+        flip_queued(c);
+        if (!c->pending.valid) c->light_after_flip = false;
+    }
+    if (!c->light_after_flip) screen_light(c);
+    idle_arm(c);
+    fprintf(stderr, "[vrx-compositor] screen on (%s)\n", why);
+}
+
+// A hold that starts counting wakes the screen; one that stops counting
+// restarts the full timeout rather than ending the screen at once.
+static void hold_changed(struct vrx_compositor *c, const char *why) {
+    bool h = held(c);
+    if (h == c->was_held) return;
+    c->was_held = h;
+    fprintf(stderr, "[vrx-compositor] screen %s (%s)\n", h ? "held on" : "no longer held", why);
+    if (h) display_on(c, why);
     idle_arm(c);
 }
 
-static void idle_init(struct vrx_compositor *c) {
+// A touch screen, a pointer, or a keyboard with letters (the HDMI CEC
+// remotes register as keyboards with no letter keys) can wake the screen.
+static void wake_devices_changed(struct vrx_compositor *c, int delta, const char *name) {
+    c->wake_devices += delta;
+    fprintf(stderr, "[vrx-compositor] %s %s: %d device%s can wake the screen%s\n", name,
+            delta > 0 ? "added" : "removed", c->wake_devices, c->wake_devices == 1 ? "" : "s",
+            c->wake_devices ? "" : "; it stays on");
+    if (!c->wake_devices) display_on(c, "nothing left to wake it");
+    idle_arm(c);
+}
+
+// The value of `key` in a key=value file; false when absent.
+static bool conf_value(const char *path, const char *key, char *out, size_t cap) {
+    FILE *f = fopen(path, "re");
+    if (!f) return false;
+    bool found = false;
+    char line[256];
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        char *v = line;
+        while (*v == ' ' || *v == '\t') v++;
+        if (strncmp(v, key, klen) != 0) continue;
+        v += klen;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v != '=') continue;
+        v++;
+        while (*v == ' ' || *v == '\t') v++;
+        v[strcspn(v, " \t\r\n#")] = 0;
+        snprintf(out, cap, "%s", v);
+        found = true;
+    }
+    fclose(f);
+    return found;
+}
+
+// A whole number, or `fallback` for anything else (garbage is logged).
+static int conf_int(const char *key, int fallback) {
+    char v[32];
+    if (!conf_value(SCREEN_FILE, key, v, sizeof v)) return fallback;
+    char *end;
+    long n = strtol(v, &end, 10);
+    if (end == v || *end) {
+        fprintf(stderr, "[vrx-compositor] %s: %s=%s is not a number; using %d\n", SCREEN_FILE, key, v, fallback);
+        return fallback;
+    }
+    return n < 0 ? 0 : n > 86400 ? 86400 : (int) n;
+}
+
+static void screen_read_conf(struct vrx_compositor *c) {
+    int light_off = conf_int("light_off", LIGHT_OFF_DEFAULT);
+    int brightness = conf_int("brightness", 100);
+    if (brightness > 100) brightness = 100;
+    if ((uint32_t) light_off != c->light_off) {
+        fprintf(stderr, "[vrx-compositor] screen off after %ds idle%s\n", light_off, light_off ? "" : " (never)");
+        c->light_off = (uint32_t) light_off;
+    }
+    if (brightness != c->brightness) {
+        fprintf(stderr, "[vrx-compositor] brightness %d%s\n", brightness, c->dim == DIM_NONE ? " (this screen cannot dim)" : "");
+        c->brightness = brightness;
+        screen_light(c);
+    }
+    idle_arm(c);
+}
+
+// What this screen can do, for the kit: whether a brightness slider means
+// anything here. Written once at start.
+static void screen_facts(const struct vrx_compositor *c) {
+    static const char *names[] = { "none", "backlight", "alpha" };
+    char tmp[] = SCREEN_FACTS ".tmp";
+    FILE *f = fopen(tmp, "we");
+    if (!f) {
+        fprintf(stderr, "[vrx-compositor] %s: %s\n", tmp, strerror(errno));
+        return;
+    }
+    fprintf(f, "dim=%s\n", names[c->dim]);
+    fclose(f);
+    chmod(tmp, 0644);
+    if (rename(tmp, SCREEN_FACTS) != 0) fprintf(stderr, "[vrx-compositor] %s: %s\n", SCREEN_FACTS, strerror(errno));
+}
+
+static uint32_t prop_id(int fd, uint32_t obj, uint32_t type, const char *name) {
+    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, obj, type);
+    uint32_t id = 0;
+    for (uint32_t i = 0; props && i < props->count_props && !id; i++) {
+        drmModePropertyRes *p = drmModeGetProperty(fd, props->props[i]);
+        if (p && strcmp(p->name, name) == 0) id = p->prop_id;
+        if (p) drmModeFreeProperty(p);
+    }
+    if (props) drmModeFreeObjectProperties(props);
+    return id;
+}
+
+static void screen_init(struct vrx_compositor *c) {
     c->idle_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     DIR *d = opendir("/sys/class/backlight");
     if (d) {
@@ -1160,54 +1368,54 @@ static void idle_init(struct vrx_compositor *c) {
         }
         closedir(d);
     }
-    if (!c->backlight[0]) fprintf(stderr, "[vrx-compositor] no backlight: the light never goes off\n");
-    // the directory, not the file: Settings writes a new file renamed over it
+    c->bl_max = c->backlight[0] ? sysfs_int(c->backlight, "max_brightness") : 0;
+    if (c->bl_max < 0) c->bl_max = 0;
+    c->dpms_prop = prop_id(c->drm_fd, c->connector_id, DRM_MODE_OBJECT_CONNECTOR, "DPMS");
+    c->primary_alpha = c->primary_plane ? prop_id(c->drm_fd, c->primary_plane, DRM_MODE_OBJECT_PLANE, "alpha") : 0;
+    c->shell_alpha = c->shell_plane ? prop_id(c->drm_fd, c->shell_plane, DRM_MODE_OBJECT_PLANE, "alpha") : 0;
+    c->dim = c->bl_max > 1 ? DIM_BACKLIGHT : c->primary_alpha ? DIM_ALPHA : DIM_NONE;
+    fprintf(stderr, "[vrx-compositor] screen: light %s (max %d), DPMS %s, dims by %s\n",
+            c->backlight[0] ? c->backlight : "none", c->bl_max, c->dpms_prop ? "yes" : "no",
+            c->dim == DIM_BACKLIGHT ? "the backlight" : c->dim == DIM_ALPHA ? "plane alpha" : "nothing");
+    screen_facts(c);
+    // the directory, not the file: a writer renames a new file over it
     c->conf_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
-    if (c->conf_fd >= 0 && inotify_add_watch(c->conf_fd, VRX_SETTINGS_DIR, IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
-        fprintf(stderr, "[vrx-compositor] watch %s: %s\n", VRX_SETTINGS_DIR, strerror(errno));
+    if (c->conf_fd >= 0 && inotify_add_watch(c->conf_fd, SCREEN_DIR, IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
+        fprintf(stderr, "[vrx-compositor] watch %s: %s\n", SCREEN_DIR, strerror(errno));
     }
-    idle_read_conf(c);
+    c->brightness = -1;  // logged and applied on the first read
+    screen_read_conf(c);
 }
 
-static void idle_conf_changed(struct vrx_compositor *c) {
+static void screen_conf_changed(struct vrx_compositor *c) {
     char buf[4096];
     while (read(c->conf_fd, buf, sizeof buf) > 0) {}
-    idle_read_conf(c);
+    screen_read_conf(c);
 }
 
 static void idle_fire(struct vrx_compositor *c) {
     uint64_t expirations;
     if (read(c->idle_fd, &expirations, sizeof expirations) != sizeof expirations) return;
-    if (c->dark || !c->backlight[0] || !c->light_off) return;
-    int level = backlight_get(c, "brightness");
-    // already off (Settings' Light): the next touch lights it at full
-    c->light_level = level > 0 ? level : backlight_get(c, "max_brightness");
-    if (level > 0) backlight_set(c, 0);
-    c->dark = true;
-    fprintf(stderr, "[vrx-compositor] idle %us: light off\n", c->light_off);
+    if (c->dark || !c->light_off || held(c) || !c->wake_devices) return;
+    display_off(c, "idle");
 }
 
-// Every input re-arms the timer. On a dark panel the first touch, click
-// or key lights it and is not delivered, nor is the rest of it (a touch
+// Every input re-arms the timer. On a dark screen the first touch, click
+// or key turns it on and is not delivered, nor is the rest of it (a touch
 // until every contact is up, a click until its buttons are, a key until
-// its release). A panel something else lit meanwhile (an alarm) is not
-// dark any more: that input goes through.
+// its release); motion wakes and goes through.
 static bool idle_swallows(struct vrx_compositor *c, const struct vrx_msg_input *m) {
-    idle_arm(c);
     if (m->kind == VRX_INPUT_TOUCH) {
         if (m->u.touch.kind == 0) c->touches++;
         if (m->u.touch.kind == 2 && c->touches > 0) c->touches--;
     }
     if (c->dark) {
-        c->dark = false;
-        if (backlight_get(c, "brightness") <= 0) {
-            backlight_set(c, c->light_level);
-            fprintf(stderr, "[vrx-compositor] input: light on\n");
-            if (m->kind == VRX_INPUT_TOUCH) c->swallow_touch = true;
-            if (m->kind == VRX_INPUT_POINTER && m->u.pointer.buttons) c->swallow_pointer = true;
-            if (m->kind == VRX_INPUT_KEY && m->u.key.state == 1) c->swallow_key = m->u.key.keycode;
-        }
+        display_on(c, "input");
+        if (m->kind == VRX_INPUT_TOUCH) c->swallow_touch = true;
+        if (m->kind == VRX_INPUT_POINTER && m->u.pointer.buttons) c->swallow_pointer = true;
+        if (m->kind == VRX_INPUT_KEY && m->u.key.state == 1) c->swallow_key = m->u.key.keycode;
     }
+    idle_arm(c);
     switch (m->kind) {
     case VRX_INPUT_TOUCH:
         if (!c->swallow_touch) return false;
@@ -1289,6 +1497,18 @@ static void li_dispatch(struct vrx_compositor *c) {
             if (libinput_device_config_tap_get_finger_count(d) > 0) {
                 libinput_device_config_tap_set_enabled(d, LIBINPUT_CONFIG_TAP_ENABLED);
             }
+            if (libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_TOUCH) ||
+                libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_POINTER) ||
+                (libinput_device_has_capability(d, LIBINPUT_DEVICE_CAP_KEYBOARD) &&
+                 libinput_device_keyboard_has_key(d, KEY_A) == 1)) {
+                libinput_device_set_user_data(d, c);
+                wake_devices_changed(c, +1, libinput_device_get_name(d));
+            }
+            break;
+        }
+        case LIBINPUT_EVENT_DEVICE_REMOVED: {
+            struct libinput_device *d = libinput_event_get_device(ev);
+            if (libinput_device_get_user_data(d) == c) wake_devices_changed(c, -1, libinput_device_get_name(d));
             break;
         }
         case LIBINPUT_EVENT_POINTER_MOTION:
@@ -1469,7 +1689,7 @@ int vrx_compositor_main(int argc, char **argv) {
         ev.data.u64 = TAG_REPEAT;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.repeat_fd, &ev);
     }
-    idle_init(&c);
+    screen_init(&c);
     if (c.idle_fd >= 0) {
         ev.data.u64 = TAG_IDLE;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.idle_fd, &ev);
@@ -1505,7 +1725,7 @@ int vrx_compositor_main(int argc, char **argv) {
             } else if (tag == TAG_IDLE) {
                 idle_fire(&c);
             } else if (tag == TAG_CONF) {
-                idle_conf_changed(&c);
+                screen_conf_changed(&c);
             } else {
                 int slot = (int) (uint32_t) tag;
                 int fd = (int) (tag >> 32);
