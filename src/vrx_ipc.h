@@ -66,6 +66,21 @@ enum vrx_msg_type {
     // had its first frame put on screen (2: what "the UI is up" means).
     // On CONTROL the compositor reports every app already registered.
     VRX_MSG_APP_STATE = 11,
+    // vrxhost -> comp: the app with this pid is the shell (0 = none). Its
+    // frames go to an overlay plane above the focused app, which no app
+    // can cover (plan 0008 D10); it is never focused.
+    VRX_MSG_SET_SHELL = 12,
+    // shell -> comp: its region, in output pixels from the top: the strip
+    // (input there goes to the shell, apps are told to keep clear), or the
+    // whole screen while its drawer is open (all input is the shell's).
+    VRX_MSG_SHELL_REGION = 13,
+    // comp -> app: keep clear of the top `top` pixels (the shell's strip);
+    // sent on REGISTER and whenever it changes.
+    VRX_MSG_INSETS = 14,
+    // app -> comp: give me the whole screen (hidden = 1) or the strip back
+    // (0). While that app is focused the shell's plane is off, its input
+    // goes to the app, and its insets are 0 (a keyboard on a 58mm panel).
+    VRX_MSG_CHROME = 15,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -122,6 +137,23 @@ enum vrx_app_state {
     VRX_APP_GONE = 0,
     VRX_APP_REGISTERED = 1,
     VRX_APP_SHOWN = 2,
+};
+
+struct vrx_msg_set_shell {
+    int32_t pid;
+};
+
+struct vrx_msg_shell_region {
+    uint32_t top;   // the strip's height in output pixels
+    uint32_t full;  // 1 while the drawer has the whole screen
+};
+
+struct vrx_msg_insets {
+    uint32_t top;
+};
+
+struct vrx_msg_chrome {
+    uint32_t hidden;  // 1: the app has the whole screen while focused
 };
 
 struct vrx_msg_app_state {

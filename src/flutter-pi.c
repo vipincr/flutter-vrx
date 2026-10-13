@@ -1983,6 +1983,48 @@ static void vrx_on_release(uint32_t sequence, void *userdata) {
     window_vrx_on_release(vrx_app.window, sequence);
 }
 
+// The shell's strip (plan 0008 D10): the compositor says how much of the
+// top to keep clear; vrx_kit adds it to MediaQuery's padding (the embedder
+// API has no safe-area padding of its own). Kept, so an app whose Dart side
+// starts after the message can ask (getInsets); later changes are pushed.
+static uint32_t vrx_insets_top;
+
+static void vrx_on_insets(uint32_t top, void *userdata) {
+    (void) userdata;
+    if (top == vrx_insets_top) return;
+    vrx_insets_top = top;
+    // before the engine runs there is no one to tell: Dart asks on start
+    if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
+    platch_call_json("vrx/insets", "insets", &JSONOBJECT1("top", JSONNUM(top)), NULL, NULL);
+}
+
+// vrx/shell: getInsets and setChrome {hidden} for every app; setRegion
+// {top, full} from the shell.
+static int on_vrx_shell_channel(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *handle) {
+    (void) channel;
+    if (strcmp(object->method, "getInsets") == 0) {
+        return platch_respond_success_json(handle, &JSONOBJECT1("top", JSONNUM(vrx_insets_top)));
+    }
+    if (strcmp(object->method, "setRegion") == 0) {
+        struct json_value *top = jsobject_get(&object->json_arg, "top");
+        struct json_value *full = jsobject_get(&object->json_arg, "full");
+        if (!top || !JSONVALUE_IS_NUM(*top)) return platch_respond_illegal_arg_json(handle, "setRegion: top must be a number");
+        struct vrx_msg_shell_region m = {
+            .top = JSONVALUE_AS_NUM(*top) < 0 ? 0 : (uint32_t) JSONVALUE_AS_NUM(*top),
+            .full = full && JSONVALUE_IS_BOOL(*full) && JSONVALUE_AS_BOOL(*full),
+        };
+        vrx_app_client_send(vrx_app.client, VRX_MSG_SHELL_REGION, &m, sizeof m, -1);
+        return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
+    }
+    if (strcmp(object->method, "setChrome") == 0) {
+        struct json_value *hidden = jsobject_get(&object->json_arg, "hidden");
+        struct vrx_msg_chrome m = { .hidden = hidden && JSONVALUE_IS_BOOL(*hidden) && JSONVALUE_AS_BOOL(*hidden) };
+        vrx_app_client_send(vrx_app.client, VRX_MSG_CHROME, &m, sizeof m, -1);
+        return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
+    }
+    return platch_respond_not_implemented(handle);
+}
+
 static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
     (void) s;
     (void) fd;
@@ -1991,6 +2033,7 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
         .on_focus = vrx_on_focus,
         .on_input = vrx_on_input,
         .on_release = vrx_on_release,
+        .on_insets = vrx_on_insets,
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to
@@ -3020,6 +3063,11 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     fpi->flutter.aot_data = aot_data;
     fpi->drmdev = drmdev;
     fpi->plugin_registry = plugin_registry;
+    if (cmd_args.vrx_app) {
+        // the shell's region and every app's insets (plan 0008 D10)
+        ok = plugin_registry_set_receiver_locked("vrx/shell", kJSONMethodCall, on_vrx_shell_channel);
+        if (ok != 0) LOG_ERROR("vrx: cannot listen on vrx/shell: %s\n", strerror(ok));
+    }
     fpi->texture_registry = texture_registry;
     fpi->libseat = libseat;
     return fpi;

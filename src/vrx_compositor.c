@@ -66,6 +66,8 @@ struct app_client {
     uid_t uid;
     bool registered;
     bool controller;    // this connection is vrxhost, not an app
+    bool no_chrome;     // asked for the whole screen: the shell steps aside
+                        // while it is focused
     char id[sizeof(struct vrx_msg_register)];
 };
 
@@ -116,6 +118,18 @@ struct vrx_compositor {
 
     struct app_client apps[MAX_APPS];
     int focused;               // slot, -1 = none
+
+    // the shell (plan 0008 D10): vrxhost names it by pid; its frames go to
+    // an overlay plane above the focused app; input inside its region goes
+    // to it. A touch belongs to whoever got its first contact.
+    int shell;                 // slot, -1 = none
+    pid_t want_shell;
+    uint32_t shell_top;        // the strip's height in output pixels
+    bool shell_full;           // its drawer has the whole screen
+    uint32_t shell_plane;      // the overlay plane, 0 = none found
+    struct frame shell_frame;  // on the plane now
+    int touch_owner[16];       // slot a touch slot's contact went to, -1
+    int pointer_owner;         // slot a held mouse button went to, -1
     int controller;            // slot of vrxhost's connection, -1 = none
     pid_t want_focus;          // the controller's choice, 0 = none; may name
                                // an app that has not registered yet
@@ -434,6 +448,8 @@ static bool frame_import(struct vrx_compositor *c, struct frame *f,
     return true;
 }
 
+static void shell_show(struct vrx_compositor *c);
+
 // Ask for the queued frame to be flipped in, if the flip slot is free.
 static void flip_queued(struct vrx_compositor *c) {
     if (!c->queued.valid || c->pending.valid) return;
@@ -448,6 +464,7 @@ static void flip_queued(struct vrx_compositor *c) {
         c->mode_set = true;
         cursor_update(c);
         if (getenv("VRX_PROBE_OVERLAY")) plane_probe_bar(c);
+        shell_show(c);
         c->on_screen = c->queued;
         memset(&c->queued, 0, sizeof c->queued);
         c->queued.dmabuf_fd = -1;
@@ -582,10 +599,64 @@ static void report_app(struct vrx_compositor *c, const struct app_client *a, uin
     client_send(c, c->apps[c->controller].fd, VRX_MSG_APP_STATE, &m, sizeof m, -1);
 }
 
+// The shell is on screen: there is one, and the focused app has not asked
+// for the whole screen.
+static bool chrome_shown(const struct vrx_compositor *c) {
+    return c->shell >= 0 && !(c->focused >= 0 && c->apps[c->focused].no_chrome);
+}
+
+// Tell every app but the shell how much of the top to keep clear (none
+// for an app that asked for the whole screen).
+static void send_insets(struct vrx_compositor *c, int only) {
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app_client *a = &c->apps[i];
+        if (!a->in_use || !a->registered || i == c->shell || (only >= 0 && i != only)) continue;
+        struct vrx_msg_insets m = { .top = c->shell >= 0 && !a->no_chrome ? c->shell_top : 0 };
+        client_send(c, a->fd, VRX_MSG_INSETS, &m, sizeof m, -1);
+    }
+}
+
+// Put the shell's current frame on its plane (once the CRTC is lit), or
+// take the plane off when there is none or the focused app has the whole
+// screen.
+static void shell_show(struct vrx_compositor *c) {
+    if (!c->shell_plane || !c->mode_set) return;
+    struct frame *f = &c->shell_frame;
+    if (!f->valid || !chrome_shown(c)) {
+        drmModeSetPlane(c->drm_fd, c->shell_plane, c->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        return;
+    }
+    if (drmModeSetPlane(c->drm_fd, c->shell_plane, c->crtc_id, f->fb_id, 0, 0, 0, c->width, c->height, 0, 0,
+                        c->width << 16, c->height << 16) != 0) {
+        fprintf(stderr, "[vrx-compositor] shell plane %u: %s\n", c->shell_plane, strerror(errno));
+    }
+}
+
+static void apply_want_shell(struct vrx_compositor *c) {
+    int slot = -1;
+    for (int i = 0; c->want_shell > 0 && i < MAX_APPS; i++) {
+        struct app_client *a = &c->apps[i];
+        if (a->in_use && a->registered && a->pid == c->want_shell) { slot = i; break; }
+    }
+    if (slot == c->shell) return;
+    c->shell = slot;
+    c->shell_full = false;
+    if (slot < 0) {
+        frame_release(c, &c->shell_frame);
+        shell_show(c);
+    } else {
+        fprintf(stderr, "[vrx-compositor] shell -> slot %d ('%s', pid %d), plane %u\n", slot, c->apps[slot].id,
+                (int) c->apps[slot].pid, c->shell_plane);
+    }
+    send_insets(c, -1);
+}
+
 static void focus_slot(struct vrx_compositor *c, int slot) {
     if (slot == c->focused) return;
     int old = c->focused;
     c->focused = slot;
+    // the shell steps aside for an app that has the whole screen
+    shell_show(c);
     // a key held into a focus change stops repeating into the new app
     repeat_arm(c, 0);
     if (old >= 0 && c->apps[old].in_use) {
@@ -644,7 +715,22 @@ static void drop_client(struct vrx_compositor *c, int slot) {
     a->fd = -1;
     // what comes next on screen is vrxhost's decision (it sees the exit
     // both here and as its child's status)
-    if (c->focused == slot) c->focused = -1;
+    if (c->focused == slot) {
+        c->focused = -1;
+        shell_show(c);
+    }
+    if (c->shell_frame.valid && c->shell_frame.app == slot) c->shell_frame.app = -1;
+    if (c->shell == slot) {
+        // its plane goes dark and apps may use the whole screen again
+        c->shell = -1;
+        frame_release(c, &c->shell_frame);
+        shell_show(c);
+        send_insets(c, -1);
+    }
+    for (int i = 0; i < 16; i++) {
+        if (c->touch_owner[i] == slot) c->touch_owner[i] = -1;
+    }
+    if (c->pointer_owner == slot) c->pointer_owner = -1;
 }
 
 // Handle one message. `fd` is the descriptor that rode it, or -1; this
@@ -653,8 +739,10 @@ static void client_handle(struct vrx_compositor *c, int slot,
                           const struct vrx_msg_header *h, void *payload, int fd) {
     struct app_client *a = &c->apps[slot];
     // a connection is an app (REGISTER) or the controller (CONTROL), once
-    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED;
-    if ((app_msg && !a->registered) || (h->type == VRX_MSG_SET_FOCUS && !a->controller) ||
+    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME;
+    if ((app_msg && !a->registered) ||
+        ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL) && !a->controller) ||
+        (h->type == VRX_MSG_SHELL_REGION && slot != c->shell) ||
         ((h->type == VRX_MSG_REGISTER || h->type == VRX_MSG_CONTROL) &&
          (a->registered || a->controller))) {
         goto bad;
@@ -670,7 +758,12 @@ static void client_handle(struct vrx_compositor *c, int slot,
                     slot, (int) a->pid);
             send_registered(c, a);
             report_app(c, a, VRX_APP_REGISTERED);
-            if (c->want_focus > 0 && a->pid == c->want_focus) focus_slot(c, slot);
+            if (c->want_shell > 0 && a->pid == c->want_shell) {
+                apply_want_shell(c);
+            } else {
+                send_insets(c, slot);
+            }
+            if (c->want_focus > 0 && a->pid == c->want_focus && slot != c->shell) focus_slot(c, slot);
             break;
         }
         case VRX_MSG_CONTROL: {
@@ -696,6 +789,32 @@ static void client_handle(struct vrx_compositor *c, int slot,
             apply_want_focus(c);
             break;
         }
+        case VRX_MSG_SET_SHELL: {
+            struct vrx_msg_set_shell *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            c->want_shell = m->pid;
+            apply_want_shell(c);
+            break;
+        }
+        case VRX_MSG_SHELL_REGION: {
+            struct vrx_msg_shell_region *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            uint32_t top = m->top > c->height ? c->height : m->top;
+            bool changed = top != c->shell_top;
+            c->shell_top = top;
+            c->shell_full = m->full != 0;
+            if (changed) send_insets(c, -1);
+            break;
+        }
+        case VRX_MSG_CHROME: {
+            struct vrx_msg_chrome *m = payload;
+            if (h->length < sizeof *m || slot == c->shell) goto bad;
+            if (a->no_chrome == (m->hidden != 0)) break;
+            a->no_chrome = m->hidden != 0;
+            send_insets(c, slot);
+            if (slot == c->focused) shell_show(c);
+            break;
+        }
         case VRX_MSG_BUFFER: {
             struct vrx_msg_buffer *b = payload;
             if (h->length < sizeof *b || fd < 0) goto bad;
@@ -704,6 +823,20 @@ static void client_handle(struct vrx_compositor *c, int slot,
                 .sequence = b->sequence, .dmabuf_fd = fd,
             };
             fd = -1;  // the frame owns it now
+            if (slot == c->shell) {
+                // the shell's plane: a legacy SetPlane on an atomic driver
+                // commits synchronously, so the frame it replaces is off
+                // screen when it returns and goes straight back
+                if (!c->shell_plane || !frame_import(c, &f, b)) {
+                    frame_release(c, &f);
+                    break;
+                }
+                struct frame old = c->shell_frame;
+                c->shell_frame = f;
+                shell_show(c);
+                frame_release(c, &old);
+                break;
+            }
             if (slot != c->focused || !frame_import(c, &f, b)) {
                 // unfocused (or unimportable): straight back to the app
                 frame_release(c, &f);
@@ -900,9 +1033,40 @@ static bool is_modifier(uint32_t key) {
     }
 }
 
+// Where an event goes: the shell inside its region (all of the screen
+// while its drawer is open), the focused app elsewhere. A touch stays
+// with whoever its first contact went to; so does a held mouse button.
+static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m) {
+    bool shell = chrome_shown(c);
+    switch (m->kind) {
+    case VRX_INPUT_TOUCH: {
+        uint32_t s = m->u.touch.slot < 16 ? m->u.touch.slot : 15;
+        if (m->u.touch.kind == 0) {
+            c->touch_owner[s] = shell && (c->shell_full || (uint32_t) m->u.touch.y < c->shell_top) ? c->shell : c->focused;
+        }
+        int t = c->touch_owner[s];
+        if (m->u.touch.kind == 2) c->touch_owner[s] = -1;
+        return t;
+    }
+    case VRX_INPUT_POINTER: {
+        if (c->pointer_owner >= 0) {
+            int t = c->pointer_owner;
+            if (m->u.pointer.buttons == 0) c->pointer_owner = -1;
+            return t;
+        }
+        int t = shell && (c->shell_full || (uint32_t) m->u.pointer.y < c->shell_top) ? c->shell : c->focused;
+        if (m->u.pointer.buttons != 0) c->pointer_owner = t;
+        return t;
+    }
+    default:
+        return shell && c->shell_full ? c->shell : c->focused;
+    }
+}
+
 static void send_input(struct vrx_compositor *c, const struct vrx_msg_input *m) {
-    if (c->focused < 0) return;
-    client_send(c, c->apps[c->focused].fd, VRX_MSG_INPUT, m, sizeof *m, -1);
+    int target = input_target(c, m);
+    if (target < 0 || !c->apps[target].in_use) return;
+    client_send(c, c->apps[target].fd, VRX_MSG_INPUT, m, sizeof *m, -1);
     bool press = (m->kind == VRX_INPUT_TOUCH && m->u.touch.kind == 0) ||
                  (m->kind == VRX_INPUT_KEY && m->u.key.state == 1);
     if (c->trace && press) {
@@ -1107,6 +1271,11 @@ int vrx_compositor_main(int argc, char **argv) {
     c.trace = getenv("VRX_TRACE_LATENCY") != NULL;
     c.focused = -1;
     c.controller = -1;
+    c.shell = -1;
+    c.pointer_owner = -1;
+    for (int i = 0; i < 16; i++) c.touch_owner[i] = -1;
+    c.shell_frame.dmabuf_fd = -1;
+    c.shell_frame.app = -1;
     struct frame *frames[] = { &c.on_screen, &c.pending, &c.queued };
     for (size_t i = 0; i < sizeof frames / sizeof frames[0]; i++) {
         frames[i]->dmabuf_fd = -1;
@@ -1114,6 +1283,7 @@ int vrx_compositor_main(int argc, char **argv) {
     }
     for (int i = 0; i < MAX_APPS; i++) c.apps[i].fd = -1;
     if (kms_init(&c, device) != 0) return 1;
+    c.shell_plane = plane_probe(&c, false);
     if (sock_init(&c) != 0) return 1;
     if (li_init(&c) != 0) {
         fprintf(stderr, "[vrx-compositor] libinput init failed; continuing without input\n");

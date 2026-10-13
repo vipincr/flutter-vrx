@@ -233,6 +233,11 @@ bool vrx_app_client_dispatch(struct vrx_app_client *c,
                 cb->on_release(((struct vrx_msg_release *) p)->sequence, cb->userdata);
             }
             break;
+        case VRX_MSG_INSETS:
+            if (h.length >= sizeof(struct vrx_msg_insets) && cb && cb->on_insets) {
+                cb->on_insets(((struct vrx_msg_insets *) p)->top, cb->userdata);
+            }
+            break;
         case VRX_MSG_SHUTDOWN:
             alive = false;
             break;
