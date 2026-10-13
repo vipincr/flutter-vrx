@@ -2569,6 +2569,23 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
             (int) vrx_app_client_width(vrx_app.client),
             (int) vrx_app_client_height(vrx_app.client)
         );
+        // Physical size from the compositor's connector: the pixel ratio
+        // makes 1 logical px = 1/VRX_DP_PER_MM mm, the density vrx_kit's
+        // metrics are written in. Unknown size keeps 1.0, said once. An
+        // explicit --pixelratio still wins (bench experiments).
+        uint32_t wmm = vrx_app_client_width_mm(vrx_app.client);
+        uint32_t hmm = vrx_app_client_height_mm(vrx_app.client);
+        if (wmm > 0 && hmm > 0) {
+            cmd_args.has_physical_dimensions = true;
+            cmd_args.physical_dimensions = VEC2I((int) wmm, (int) hmm);
+            if (!cmd_args.has_pixel_ratio) {
+                cmd_args.has_pixel_ratio = true;
+                cmd_args.pixel_ratio = ((double) cmd_args.dummy_display_size.x / wmm) / VRX_DP_PER_MM;
+            }
+            fprintf(stderr, "[vrx-app] panel %ux%umm: pixel ratio %.3f\n", wmm, hmm, cmd_args.pixel_ratio);
+        } else {
+            fprintf(stderr, "[vrx-app] panel size unknown: pixel ratio 1.0, mm metrics will not be physical\n");
+        }
         vrx_app.fpi = fpi;
     }
 

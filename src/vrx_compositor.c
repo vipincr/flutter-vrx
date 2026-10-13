@@ -81,6 +81,7 @@ struct vrx_compositor {
     uint32_t connector_id, crtc_id;
     drmModeModeInfo mode;
     uint32_t width, height;
+    uint32_t width_mm, height_mm;  // the connector's physical size, 0 = unknown
     bool mode_set;             // first frame did the modeset
 
     int sock_fd;               // listening socket
@@ -144,6 +145,8 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
     c->mode = conn->modes[mi];
     c->width = c->mode.hdisplay;
     c->height = c->mode.vdisplay;
+    c->width_mm = conn->mmWidth;
+    c->height_mm = conn->mmHeight;
 
     drmModeEncoder *enc = NULL;
     if (conn->encoder_id) enc = drmModeGetEncoder(c->drm_fd, conn->encoder_id);
@@ -170,8 +173,8 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
         fprintf(stderr, "[vrx-compositor] no crtc\n");
         return -1;
     }
-    fprintf(stderr, "[vrx-compositor] %s: %ux%u@%u on crtc %u\n",
-            path, c->width, c->height, c->mode.vrefresh, c->crtc_id);
+    fprintf(stderr, "[vrx-compositor] %s: %ux%u@%u on crtc %u, %ux%umm\n",
+            path, c->width, c->height, c->mode.vrefresh, c->crtc_id, c->width_mm, c->height_mm);
     return 0;
 }
 
@@ -347,6 +350,8 @@ static void send_registered(struct vrx_compositor *c, struct app_client *a) {
         .width = c->width,
         .height = c->height,
         .n_formats = 2,
+        .width_mm = c->width_mm,
+        .height_mm = c->height_mm,
     };
     r.formats[0] = DRM_FORMAT_XRGB8888;
     r.modifiers[0] = DRM_FORMAT_MOD_LINEAR;

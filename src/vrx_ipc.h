@@ -83,7 +83,18 @@ struct vrx_msg_registered {
     uint32_t n_formats;
     uint32_t formats[VRX_MAX_FORMATS];        // DRM fourccs
     uint64_t modifiers[VRX_MAX_FORMATS];      // per-format modifier, paired
+    // The panel's physical size (the DRM connector's, which panel drivers
+    // take from the device tree's width-mm/height-mm; EDID for HDMI);
+    // 0 = unknown. The app derives its pixel ratio from it, see
+    // VRX_DP_PER_MM.
+    uint32_t width_mm;
+    uint32_t height_mm;
 };
+
+// vrx's logical density: Flutter's 160 dp per inch, so 1mm = 6.299dp and
+// vrx_kit's mm-derived metrics (9mm touch minimum) hold on every panel.
+// An app's pixel ratio is therefore (px per mm) / VRX_DP_PER_MM.
+#define VRX_DP_PER_MM (160.0 / 25.4)
 
 struct vrx_msg_buffer {
     uint32_t width;

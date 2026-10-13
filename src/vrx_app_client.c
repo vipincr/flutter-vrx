@@ -92,6 +92,14 @@ uint32_t vrx_app_client_height(const struct vrx_app_client *c) {
     return c ? c->info.height : 0;
 }
 
+uint32_t vrx_app_client_width_mm(const struct vrx_app_client *c) {
+    return c ? c->info.width_mm : 0;
+}
+
+uint32_t vrx_app_client_height_mm(const struct vrx_app_client *c) {
+    return c ? c->info.height_mm : 0;
+}
+
 bool vrx_app_client_accepts_format(const struct vrx_app_client *c,
                                    uint32_t format, uint64_t modifier) {
     if (!c) return false;

@@ -23,6 +23,9 @@ void vrx_app_client_destroy(struct vrx_app_client *c);
 int vrx_app_client_fd(const struct vrx_app_client *c);
 uint32_t vrx_app_client_width(const struct vrx_app_client *c);
 uint32_t vrx_app_client_height(const struct vrx_app_client *c);
+// The panel's physical size from REGISTERED; 0 = unknown.
+uint32_t vrx_app_client_width_mm(const struct vrx_app_client *c);
+uint32_t vrx_app_client_height_mm(const struct vrx_app_client *c);
 bool vrx_app_client_accepts_format(const struct vrx_app_client *c,
                                    uint32_t format, uint64_t modifier);
 bool vrx_app_client_send(struct vrx_app_client *c, uint32_t type,
