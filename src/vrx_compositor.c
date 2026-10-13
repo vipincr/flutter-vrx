@@ -1825,6 +1825,10 @@ int vrx_compositor_main(int argc, char **argv) {
         ev.data.u64 = TAG_BUS;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, sd_bus_get_fd(c.bus), &ev);
     }
+    // libinput queues a DEVICE_ADDED per device at start without making its
+    // fd readable: read them now, or nothing counts as a wake device until
+    // the first input arrives
+    if (c.li) li_dispatch(&c);
     if (c.bl_mon) {
         ev.data.u64 = TAG_BACKLIGHT;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, udev_monitor_get_fd(c.bl_mon), &ev);
