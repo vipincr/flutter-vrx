@@ -176,6 +176,110 @@ static void output_wanted(char *out, size_t cap) {
     fclose(f);
 }
 
+// ─── overlay planes (plan 0008 Part C, step 1) ────────────────────────────
+//
+// The shell is meant to sit on a second KMS plane above the focused app,
+// so no app can hide or fake the status strip. Before building on that,
+// the bench proves the plane: every plane this CRTC can use is logged
+// (type, formats, alpha and blend properties), and VRX_PROBE_OVERLAY=1
+// puts a translucent bar on the first overlay plane.
+
+static const char *plane_type_name(uint64_t t) {
+    return t == DRM_PLANE_TYPE_PRIMARY ? "primary" : t == DRM_PLANE_TYPE_CURSOR ? "cursor" : "overlay";
+}
+
+static uint64_t plane_prop(int fd, uint32_t plane, const char *name, bool *found) {
+    *found = false;
+    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, plane, DRM_MODE_OBJECT_PLANE);
+    if (!props) return 0;
+    uint64_t value = 0;
+    for (uint32_t i = 0; i < props->count_props && !*found; i++) {
+        drmModePropertyRes *p = drmModeGetProperty(fd, props->props[i]);
+        if (p && strcmp(p->name, name) == 0) {
+            value = props->prop_values[i];
+            *found = true;
+        }
+        if (p) drmModeFreeProperty(p);
+    }
+    drmModeFreeObjectProperties(props);
+    return value;
+}
+
+// The first overlay plane the CRTC can use that takes ARGB8888, 0 if none.
+static uint32_t plane_probe(struct vrx_compositor *c, bool log) {
+    drmSetClientCap(c->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    drmModeRes *res = drmModeGetResources(c->drm_fd);
+    drmModePlaneRes *planes = drmModeGetPlaneResources(c->drm_fd);
+    uint32_t overlay = 0;
+    if (!res || !planes) goto out;
+    int crtc_index = -1;
+    for (int k = 0; k < res->count_crtcs; k++) {
+        if (res->crtcs[k] == c->crtc_id) crtc_index = k;
+    }
+    for (uint32_t i = 0; i < planes->count_planes; i++) {
+        drmModePlane *p = drmModeGetPlane(c->drm_fd, planes->planes[i]);
+        if (!p) continue;
+        if (crtc_index >= 0 && (p->possible_crtcs & (1u << crtc_index))) {
+            bool has_type, has_alpha, has_blend, has_zpos;
+            uint64_t type = plane_prop(c->drm_fd, p->plane_id, "type", &has_type);
+            uint64_t alpha = plane_prop(c->drm_fd, p->plane_id, "alpha", &has_alpha);
+            plane_prop(c->drm_fd, p->plane_id, "pixel blend mode", &has_blend);
+            uint64_t zpos = plane_prop(c->drm_fd, p->plane_id, "zpos", &has_zpos);
+            bool argb = false;
+            for (uint32_t f = 0; f < p->count_formats; f++) {
+                if (p->formats[f] == DRM_FORMAT_ARGB8888) argb = true;
+            }
+            if (log) {
+                fprintf(stderr, "[vrx-compositor] plane %u: %s, %u formats%s, alpha %s, blend %s, zpos %s%" PRIu64 "\n",
+                        p->plane_id, plane_type_name(type), p->count_formats, argb ? " (ARGB8888)" : "",
+                        has_alpha ? "yes" : "no", has_blend ? "yes" : "no", has_zpos ? "" : "none ", has_zpos ? zpos : 0);
+                (void) alpha;
+            }
+            if (!overlay && has_type && type == DRM_PLANE_TYPE_OVERLAY && argb) overlay = p->plane_id;
+        }
+        drmModeFreePlane(p);
+    }
+out:
+    if (planes) drmModeFreePlaneResources(planes);
+    if (res) drmModeFreeResources(res);
+    return overlay;
+}
+
+// VRX_PROBE_OVERLAY=1: a bar across the top, a sixth of the screen tall,
+// translucent blue fading to clear, on the overlay plane. The bench looks
+// at the panel: blended over the app, the shell can live on a plane.
+static void plane_probe_bar(struct vrx_compositor *c) {
+    uint32_t plane = plane_probe(c, false);
+    if (!plane) {
+        fprintf(stderr, "[vrx-compositor] probe: no ARGB8888 overlay plane on crtc %u\n", c->crtc_id);
+        return;
+    }
+    uint32_t w = c->width, h = c->height / 6;
+    struct drm_mode_create_dumb cd = { .width = w, .height = h, .bpp = 32 };
+    if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) != 0) return;
+    struct drm_mode_map_dumb md = { .handle = cd.handle };
+    if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &md) != 0) return;
+    uint32_t *px = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, c->drm_fd, md.offset);
+    if (px == MAP_FAILED) return;
+    for (uint32_t y = 0; y < h; y++) {
+        // premultiplied: alpha falls from 0xc0 at the top to 0 at the foot
+        uint32_t a = 0xc0 * (h - y) / h;
+        uint32_t b = a;  // blue at full intensity, premultiplied
+        for (uint32_t x = 0; x < w; x++) px[y * (cd.pitch / 4) + x] = (a << 24) | (b * 0x40 / 0xff << 16) | (b * 0x80 / 0xff << 8) | b;
+    }
+    munmap(px, cd.size);
+    uint32_t handles[4] = { cd.handle }, pitches[4] = { cd.pitch }, offsets[4] = { 0 }, fb = 0;
+    if (drmModeAddFB2(c->drm_fd, w, h, DRM_FORMAT_ARGB8888, handles, pitches, offsets, &fb, 0) != 0) {
+        fprintf(stderr, "[vrx-compositor] probe: AddFB2 %s\n", strerror(errno));
+        return;
+    }
+    if (drmModeSetPlane(c->drm_fd, plane, c->crtc_id, fb, 0, 0, 0, w, h, 0, 0, w << 16, h << 16) != 0) {
+        fprintf(stderr, "[vrx-compositor] probe: SetPlane %u: %s\n", plane, strerror(errno));
+        return;
+    }
+    fprintf(stderr, "[vrx-compositor] probe: bar on overlay plane %u (%ux%u ARGB8888)\n", plane, w, h);
+}
+
 static int kms_init(struct vrx_compositor *c, const char *device) {
     char found[64];
     const char *path = device;
@@ -270,6 +374,7 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
     }
     fprintf(stderr, "[vrx-compositor] %s %s: %ux%u@%u on crtc %u, %ux%umm\n",
             path, c->output, c->width, c->height, c->mode.vrefresh, c->crtc_id, c->width_mm, c->height_mm);
+    plane_probe(c, true);
     return 0;
 }
 
@@ -342,6 +447,7 @@ static void flip_queued(struct vrx_compositor *c) {
         }
         c->mode_set = true;
         cursor_update(c);
+        if (getenv("VRX_PROBE_OVERLAY")) plane_probe_bar(c);
         c->on_screen = c->queued;
         memset(&c->queued, 0, sizeof c->queued);
         c->queued.dmabuf_fd = -1;
