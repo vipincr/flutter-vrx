@@ -36,6 +36,7 @@
 #include <libudev.h>
 #include <linux/input.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <systemd/sd-event.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -1380,6 +1381,8 @@ static FlutterEngine create_flutter_engine(
     return engine;
 }
 
+static void vrx_engine_started(struct flutterpi *flutterpi);
+
 static int flutterpi_run(struct flutterpi *flutterpi) {
     FlutterEngineProcTable *procs;
     struct view_geometry geometry;
@@ -1432,6 +1435,8 @@ static int flutterpi_run(struct flutterpi *flutterpi) {
     if (ok != 0) {
         goto fail_shutdown_engine;
     }
+
+    vrx_engine_started(flutterpi);
 
     FlutterEngineDisplay display;
     memset(&display, 0, sizeof(display));
@@ -1863,7 +1868,12 @@ static struct {
     uint32_t mouse_buttons;
     struct keyboard_config *kbdcfg;
     struct keyboard_state *kbd;
-} vrx_app;
+    // what Flutter is told about being seen (plan 0010 D4, plan 0011 D3)
+    bool unfocused;     // the compositor took focus away (FOCUS 0)
+    bool screen_off;    // the compositor turned the screen off
+    const char *lifecycle;  // the state last sent, NULL = none yet
+    int etc_watch;      // inotify on /etc for locale.conf, -1 = none
+} vrx_app = { .etc_watch = -1 };
 
 // The keyboard half of user_input_interface for routed keys: the same
 // sinks the libinput path feeds, minus VT switching (an app owns no VT).
@@ -1967,11 +1977,35 @@ static void vrx_on_input(const struct vrx_msg_input *in, void *userdata) {
     on_flutter_pointer_event(vrx_app.fpi, events, n);
 }
 
+// Flutter is told it is seen (resumed) or not (hidden): not while the
+// screen is off (plan 0010 D4), nor once the compositor has taken focus
+// away (plan 0011 D3). Flutter stops scheduling frames while hidden, so
+// tickers and animations rest; Dart timers keep running. An app is
+// visible until told otherwise: one started warm in the background
+// renders its first frame (there is something to show when it is
+// focused), and the shell, which is never focused and never told it is
+// unfocused, stays resumed while the screen is on. The framework fills in
+// the states between. Before the engine runs nothing is sent; the engine
+// start sends the current state.
+static void vrx_lifecycle_update(void) {
+    if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
+    const char *state = vrx_app.unfocused || vrx_app.screen_off ? "AppLifecycleState.hidden" : "AppLifecycleState.resumed";
+    if (state == vrx_app.lifecycle) return;
+    // the first message is only needed when it is not the default
+    if (vrx_app.lifecycle == NULL && !vrx_app.unfocused && !vrx_app.screen_off) {
+        vrx_app.lifecycle = state;
+        return;
+    }
+    vrx_app.lifecycle = state;
+    flutterpi_send_platform_message(flutterpi, "flutter/lifecycle", (const uint8_t *) state, strlen(state), NULL);
+}
+
 static void vrx_on_focus(uint32_t focused, void *userdata) {
     (void) userdata;
+    vrx_app.unfocused = !focused;
+    vrx_lifecycle_update();
     // An idle app draws nothing new, so a focused app re-presents what it
-    // last rendered; otherwise the screen keeps showing the previous app.
-    // B4 turns unfocused into "stop pumping frames"; v1 keeps rendering.
+    // last rendered at once; the resumed app's next frame follows.
     if (focused && vrx_app.window != NULL) {
         window_vrx_present_front(vrx_app.window);
     }
@@ -2003,16 +2037,117 @@ static void vrx_on_back(void *userdata) {
     platch_call_json("vrx/chrome", "back", &(struct json_value){ .type = kJsonNull }, NULL, NULL);
 }
 
-// The screen went off or came back (plan 0010 D4): Flutter stops
-// scheduling frames while hidden, so tickers and animations rest; Dart
-// timers keep running (an alarm still fires). The framework fills in the
-// states between. Before the engine runs there is nobody to tell, and an
-// app started while the screen is off draws until the next wake.
+// The screen went off or came back (plan 0010 D4).
 static void vrx_on_display(uint32_t on, void *userdata) {
     (void) userdata;
-    if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
-    const char *state = on ? "AppLifecycleState.resumed" : "AppLifecycleState.hidden";
-    flutterpi_send_platform_message(flutterpi, "flutter/lifecycle", (const uint8_t *) state, strlen(state), NULL);
+    vrx_app.screen_off = !on;
+    vrx_lifecycle_update();
+}
+
+// ── the time format is the system locale's (plan 0011 D7) ───────────────
+// LC_TIME, else LANG, from /etc/locale.conf (systemd-localed writes it),
+// else the environment. A locale whose time format has %I, %l, %r or %p
+// keeps a 12-hour clock; any other (en_GB's %T, C's %H:%M:%S) is 24-hour.
+// Sent on flutter/settings at start and again when localed rewrites the
+// file; applets read MediaQuery.alwaysUse24HourFormatOf.
+#define VRX_LOCALE_CONF "/etc/locale.conf"
+
+static bool locale_conf_value(const char *key, char *out, size_t cap) {
+    FILE *f = fopen(VRX_LOCALE_CONF, "re");
+    if (f == NULL) return false;
+    bool found = false;
+    char line[256];
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, key, klen) != 0 || line[klen] != '=') continue;
+        char *v = line + klen + 1;
+        v[strcspn(v, "\r\n")] = 0;
+        size_t n = strlen(v);
+        if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) {
+            v[n - 1] = 0;
+            v++;
+        }
+        snprintf(out, cap, "%s", v);
+        found = out[0] != 0;
+    }
+    fclose(f);
+    return found;
+}
+
+static bool vrx_time_is_24h(char *name, size_t cap) {
+    if (!locale_conf_value("LC_TIME", name, cap) && !locale_conf_value("LANG", name, cap)) {
+        const char *env = getenv("LC_ALL");
+        if (env == NULL || !env[0]) env = getenv("LC_TIME");
+        if (env == NULL || !env[0]) env = getenv("LANG");
+        snprintf(name, cap, "%s", env != NULL && env[0] ? env : "C");
+    }
+    locale_t loc = newlocale(LC_TIME_MASK, name, (locale_t) 0);
+    if (loc == (locale_t) 0) {
+        LOG_ERROR("vrx: locale %s is not installed; the clock is 24-hour (the C locale's)\n", name);
+        return true;
+    }
+    const char *fmt = nl_langinfo_l(T_FMT, loc);
+    bool h12 = fmt != NULL && (strstr(fmt, "%I") || strstr(fmt, "%l") || strstr(fmt, "%r") || strstr(fmt, "%p"));
+    freelocale(loc);
+    return !h12;
+}
+
+static void vrx_send_settings(void) {
+    char name[96];
+    bool h24 = vrx_time_is_24h(name, sizeof name);
+    LOG_ERROR_UNPREFIXED("vrx: time format from %s: %s\n", name, h24 ? "24-hour" : "12-hour");
+    // the keys the framework reads on flutter/settings; brightness and
+    // text scale are the framework's own defaults (vrx_kit themes itself)
+    platch_send(
+        "flutter/settings",
+        &(struct platch_obj){
+            .codec = kJSONMessageCodec,
+            .json_value = JSONOBJECT3(
+                "textScaleFactor", JSONNUM(1.0),
+                "alwaysUse24HourFormat", JSONBOOL(h24),
+                "platformBrightness", JSONSTRING("light")
+            ),
+        },
+        kJSONMessageCodec,
+        NULL,
+        NULL
+    );
+}
+
+static int on_vrx_etc_changed(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+    (void) s;
+    (void) revents;
+    (void) userdata;
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    bool locale = false;
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof buf)) > 0) {
+        for (char *p = buf; p < buf + n;) {
+            struct inotify_event *e = (struct inotify_event *) p;
+            if (e->len && strcmp(e->name, "locale.conf") == 0) locale = true;
+            p += sizeof *e + e->len;
+        }
+    }
+    if (locale) vrx_send_settings();
+    return 0;
+}
+
+// The engine runs: tell it what it cannot know yet (seen or not, the time
+// format) and watch /etc for localed's renames.
+static void vrx_engine_started(struct flutterpi *fpi) {
+    (void) fpi;
+    if (vrx_app.client == NULL) return;
+    vrx_lifecycle_update();
+    vrx_send_settings();
+    if (vrx_app.etc_watch >= 0) return;
+    int fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+    if (fd < 0 || inotify_add_watch(fd, "/etc", IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
+        LOG_ERROR("vrx: cannot watch /etc for locale changes: %s\n", strerror(errno));
+        if (fd >= 0) close(fd);
+        return;
+    }
+    vrx_app.etc_watch = fd;
+    flutterpi_sd_event_add_io(NULL, fd, EPOLLIN, on_vrx_etc_changed, NULL);
 }
 
 // vrx/shell: getInsets and setChrome {hidden} for every app; setRegion
