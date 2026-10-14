@@ -59,6 +59,7 @@
 
 #include "vrx_ipc.h"
 #include "vrx_kms.h"
+#include "vrx_power_profile.h"
 
 // ─── app client ───────────────────────────────────────────────────────────
 
@@ -228,9 +229,7 @@ struct vrx_compositor {
     enum { STEP_NONE, STEP_SLEEP, STEP_DEEP } cascade_next;
     uint32_t sleep_after;      // seconds from the last input, 0 = never
     uint32_t deep_after;       // seconds from the last input, 0 = never
-    char sleep_state[16];      // the profile's sleep state, "" = none offered
-    char deep_action[16];      // the profile's deep sleep, "" = none offered
-    bool charger_sleep;        // the profile wants sleep on a charger too
+    struct vrx_power_profile profile; // what this board offers (sleep, deep, off)
     bool has_wakealarm;        // an RTC that can wake the board on a timer
     bool sleep_blocked;        // a logind `sleep` block inhibitor is held
     bool refusal_logged;       // this dark period's refusal was said once
@@ -2355,8 +2354,11 @@ static void screen_facts(const struct vrx_compositor *c) {
     }
     fprintf(f, "dim=%s\n", names[c->dim]);
     // the cascade's offered steps (plan 0012 D13), for Settings' rows
-    fprintf(f, "sleep=%s\n", c->sleep_state[0] && sleep_wake_source() ? c->sleep_state : "none");
-    fprintf(f, "deep=%s\n", c->deep_action[0] ? c->deep_action : "none");
+    fprintf(f, "sleep=%s\n", vrx_profile_sleep_offered(&c->profile, c->profile.sleep[0] && sleep_wake_source()));
+    fprintf(f, "deep=%s\n", vrx_profile_deep_offered(&c->profile));
+    // what a person's Power off does (plan 0020 D4), for Settings' sentence
+    fprintf(f, "off=%s\n", c->profile.off);
+    fprintf(f, "off_wake=%s\n", c->profile.off_wake);
     fprintf(f, "wakealarm=%s\n", c->has_wakealarm ? "yes" : "no");
     // input facts (plan 0013 D6, D7): the kit floors touch targets only
     // where a finger can touch, and the on-screen keyboard steps aside
@@ -2555,56 +2557,56 @@ static bool idle_swallows(struct vrx_compositor *c, const struct vrx_msg_input *
 // writes the state, logind tells everyone through PrepareForSleep.
 #define PROFILE_FILE "/usr/share/vrx/power-profile"
 #define PROFILE_DIR "/usr/share/vrx/power-profile.d"
+// read last, withdraw-only: what the device found at boot that the build
+// could not know (plan 0020 D3: a Pi bootloader without POWER_OFF_ON_HALT)
+#define PROFILE_RUN_DIR "/run/vrx/power-profile.d"
 
-static void profile_line(struct vrx_compositor *c, const char *line) {
-    char kind[16] = "", value[16] = "";
-    if (sscanf(line, " %15s %15s", kind, value) < 2) return;
-    if (strcmp(kind, "sleep") == 0 && strcmp(value, "none") != 0) {
-        snprintf(c->sleep_state, sizeof c->sleep_state, "%s", value);
-    } else if (strcmp(kind, "deep") == 0 && strcmp(value, "none") != 0) {
-        snprintf(c->deep_action, sizeof c->deep_action, "%s", value);
-    } else if (strcmp(kind, "charger-sleep") == 0) {
-        c->charger_sleep = strcmp(value, "yes") == 0;
-    }
+static void profile_raised(const char *line, void *ctx) {
+    fprintf(stderr, "[vrx-compositor] %s: \"%s\" would raise a step: ignored (runtime lines only withdraw)\n",
+            (const char *) ctx, line);
 }
 
-static void profile_file(struct vrx_compositor *c, const char *path) {
+static void profile_file(struct vrx_compositor *c, const char *path, bool runtime) {
     FILE *f = fopen(path, "re");
     if (!f) return;
-    char line[256];
-    while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "#\r\n")] = 0;
-        profile_line(c, line);
-    }
+    char text[8192];
+    size_t n = fread(text, 1, sizeof text - 1, f);
     fclose(f);
+    text[n] = 0;
+    vrx_profile_text(&c->profile, text, runtime, profile_raised, (void *) path);
 }
 
-// The family's profile, then each carrier's in power-profile.d (sorted).
-static void profile_read(struct vrx_compositor *c) {
-    profile_file(c, PROFILE_FILE);
+static void profile_dir(struct vrx_compositor *c, const char *dir, bool runtime) {
     struct dirent **names;
-    int n = scandir(PROFILE_DIR, &names, NULL, alphasort);
+    int n = scandir(dir, &names, NULL, alphasort);
     for (int i = 0; i < n; i++) {
         if (names[i]->d_name[0] != '.') {
             char path[320];
-            snprintf(path, sizeof path, "%s/%s", PROFILE_DIR, names[i]->d_name);
-            profile_file(c, path);
+            snprintf(path, sizeof path, "%s/%s", dir, names[i]->d_name);
+            profile_file(c, path, runtime);
         }
         free(names[i]);
     }
     if (n >= 0) free(names);
+}
+
+// The family's profile, then each carrier's in power-profile.d (sorted),
+// then the device's withdrawals in /run.
+static void profile_read(struct vrx_compositor *c) {
+    vrx_profile_init(&c->profile);
+    profile_file(c, PROFILE_FILE, false);
+    profile_dir(c, PROFILE_DIR, false);
+    profile_dir(c, PROFILE_RUN_DIR, true);
     c->has_wakealarm = access("/sys/class/rtc/rtc0/wakealarm", W_OK) == 0;
     // deep sleep is a halt the board cannot leave on its own: offered only
     // with a timed wake (the owner, 2026-10-14: no "Power off when idle"
     // on a board without one, it would lose alarms)
-    if (c->deep_action[0] && !c->has_wakealarm) {
-        fprintf(stderr, "[vrx-compositor] the profile offers deep sleep (%s) but no RTC can wake the board: not offered\n",
-                c->deep_action);
-        c->deep_action[0] = 0;
-    }
-    fprintf(stderr, "[vrx-compositor] cascade: sleep %s, deep sleep %s, timed wake %s\n",
-            c->sleep_state[0] ? c->sleep_state : "not offered", c->deep_action[0] ? c->deep_action : "not offered",
-            c->has_wakealarm ? "yes" : "no");
+    if (vrx_profile_finish(&c->profile, c->has_wakealarm))
+        fprintf(stderr, "[vrx-compositor] the profile offers deep sleep but no RTC can wake the board: not offered\n");
+    fprintf(stderr, "[vrx-compositor] cascade: sleep %s, deep sleep %s, timed wake %s, power off %s%s%s\n",
+            c->profile.sleep[0] ? c->profile.sleep : "not offered", c->profile.deep[0] ? c->profile.deep : "not offered",
+            c->has_wakealarm ? "yes" : "no", c->profile.off, c->profile.off_wake[0] ? ", wake by " : "",
+            c->profile.off_wake);
 }
 
 // A person can wake the board from sleep: an input device a person uses
@@ -2676,10 +2678,10 @@ static void cascade_set(struct vrx_compositor *c, int seconds) {
 // so a step after a sleep still counts the time asleep.
 static void cascade_arm(struct vrx_compositor *c) {
     c->cascade_next = STEP_NONE;
-    if (c->sleep_state[0] && c->sleep_after > c->light_off) {
+    if (c->profile.sleep[0] && c->sleep_after > c->light_off) {
         c->cascade_next = STEP_SLEEP;
         cascade_set(c, (int) (c->sleep_after - c->light_off));
-    } else if (c->deep_action[0] && c->deep_after > c->light_off) {
+    } else if (c->profile.deep[0] && c->deep_after > c->light_off) {
         c->cascade_next = STEP_DEEP;
         cascade_set(c, (int) (c->deep_after - c->light_off));
     } else {
@@ -2692,16 +2694,19 @@ static void cascade_disarm(struct vrx_compositor *c) {
     cascade_set(c, 0);
 }
 
-// Why this step must not happen now, or NULL.
+// Why this step must not happen now, or NULL (the rule is the pure
+// vrx_cascade_refusal; this gathers what the board says right now).
 static const char *cascade_refusal(struct vrx_compositor *c, int step) {
-    if (!c->dark) return "the screen is on";
-    if (held(c)) return "the screen is held on";
-    if (c->sleep_blocked) return "an applet holds sleep off";
-    if (!c->bus) return "no system bus";
-    if (step == STEP_SLEEP && !sleep_wake_source()) return "nothing a person uses can wake the board from sleep";
-    if (step == STEP_DEEP && !c->has_wakealarm) return "no RTC can wake the board";
-    if (!c->charger_sleep && on_charger()) return "on a charger";
-    return NULL;
+    struct vrx_cascade_inputs in = {
+        .dark = c->dark,
+        .held = held(c),
+        .sleep_blocked = c->sleep_blocked,
+        .bus = c->bus != NULL,
+        .wake_source = step == STEP_SLEEP && sleep_wake_source(),
+        .has_wakealarm = c->has_wakealarm,
+        .on_charger = !c->profile.charger_sleep && on_charger(),
+    };
+    return vrx_cascade_refusal(&c->profile, step == STEP_SLEEP ? VRX_STEP_SLEEP : VRX_STEP_DEEP, &in);
 }
 
 static void cascade_fire(struct vrx_compositor *c) {
@@ -2722,7 +2727,7 @@ static void cascade_fire(struct vrx_compositor *c) {
     }
     const char *method = step == STEP_SLEEP ? "Suspend" : "Halt";
     fprintf(stderr, "[vrx-compositor] idle: %s (%s)\n", step == STEP_SLEEP ? "sleep" : "deep sleep",
-            step == STEP_SLEEP ? c->sleep_state : c->deep_action);
+            step == STEP_SLEEP ? c->profile.sleep : c->profile.deep);
     sd_bus_error err = SD_BUS_ERROR_NULL;
     int r = sd_bus_call_method(c->bus, "org.freedesktop.login1", "/org/freedesktop/login1",
                                "org.freedesktop.login1.Manager", method, &err, NULL, "b", 0);
@@ -2734,7 +2739,7 @@ static void cascade_fire(struct vrx_compositor *c) {
     }
     c->cascade_next = STEP_NONE;
     // after a sleep, deep sleep follows from the same last input
-    if (step == STEP_SLEEP && c->deep_action[0] && c->deep_after > c->sleep_after) {
+    if (step == STEP_SLEEP && c->profile.deep[0] && c->deep_after > c->sleep_after) {
         c->cascade_next = STEP_DEEP;
         cascade_set(c, (int) (c->deep_after - c->sleep_after));
     }

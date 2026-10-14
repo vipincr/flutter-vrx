@@ -35,3 +35,18 @@ target_link_libraries(
 )
 
 add_test(vrx_camera_wire_test vrx_camera_wire_test)
+# the compositor's power profile and cascade rule (vrx plans 0012 D13, 0020
+# D3, D4; G030): pure, no logind, udev or files
+add_executable(vrx_power_profile_test
+    vrx_power_profile_test.c
+    ../src/vrx_power_profile.c
+)
+
+target_include_directories(vrx_power_profile_test PRIVATE ../src)
+
+target_link_libraries(
+    vrx_power_profile_test
+    Unity
+)
+
+add_test(vrx_power_profile_test vrx_power_profile_test)

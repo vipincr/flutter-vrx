@@ -119,6 +119,7 @@ add_executable(
   flutter-pi
   src/main.c
   src/vrx_compositor.c
+  src/vrx_power_profile.c
   src/vrx_app_client.c
   src/vrx_kms.c
 )
