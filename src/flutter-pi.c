@@ -1906,8 +1906,10 @@ static struct {
     bool screen_off;    // the compositor turned the screen off
     bool sleeping;      // the system is about to sleep (PrepareForSleep)
     const char *lifecycle;  // the state last sent, NULL = none yet
-    int etc_watch;      // inotify on /etc for locale.conf, -1 = none
-} vrx_app = { .etc_watch = -1 };
+    int etc_watch;      // inotify on /etc (locale.conf) and the screen settings directory, -1 = none
+    int screen_wd;      // the watch on the screen settings directory, -1 = none
+    int reduce_motion;  // what Flutter was last told (disableAnimations), -1 = nothing yet
+} vrx_app = { .etc_watch = -1, .screen_wd = -1, .reduce_motion = -1 };
 
 // The keyboard half of user_input_interface for routed keys: the same
 // sinks the libinput path feeds, minus VT switching (an app owns no VT).
@@ -2282,15 +2284,24 @@ static void vrx_on_sleep(uint32_t sleeping, void *userdata) {
 // file; applets read MediaQuery.alwaysUse24HourFormatOf.
 #define VRX_LOCALE_CONF "/etc/locale.conf"
 
-static bool locale_conf_value(const char *key, char *out, size_t cap) {
-    FILE *f = fopen(VRX_LOCALE_CONF, "re");
+// The value of `key` in a KEY=value file (locale.conf, the screen settings
+// file): spaces around the name and the = are allowed, a quoted value loses
+// its quotes, the last assignment wins.
+static bool vrx_conf_value(const char *path, const char *key, char *out, size_t cap) {
+    FILE *f = fopen(path, "re");
     if (f == NULL) return false;
     bool found = false;
     char line[256];
     size_t klen = strlen(key);
     while (fgets(line, sizeof line, f)) {
-        if (strncmp(line, key, klen) != 0 || line[klen] != '=') continue;
-        char *v = line + klen + 1;
+        char *v = line;
+        while (*v == ' ' || *v == '\t') v++;
+        if (strncmp(v, key, klen) != 0) continue;
+        v += klen;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v != '=') continue;
+        v++;
+        while (*v == ' ' || *v == '\t') v++;
         v[strcspn(v, "\r\n")] = 0;
         size_t n = strlen(v);
         if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) {
@@ -2305,7 +2316,7 @@ static bool locale_conf_value(const char *key, char *out, size_t cap) {
 }
 
 static bool vrx_time_is_24h(char *name, size_t cap) {
-    if (!locale_conf_value("LC_TIME", name, cap) && !locale_conf_value("LANG", name, cap)) {
+    if (!vrx_conf_value(VRX_LOCALE_CONF, "LC_TIME", name, cap) && !vrx_conf_value(VRX_LOCALE_CONF, "LANG", name, cap)) {
         const char *env = getenv("LC_ALL");
         if (env == NULL || !env[0]) env = getenv("LC_TIME");
         if (env == NULL || !env[0]) env = getenv("LANG");
@@ -2344,37 +2355,72 @@ static void vrx_send_settings(void) {
     );
 }
 
+// Reduce motion (plan 0017 D5): the screen settings file's `reduce_motion=0|1`
+// (the kit's ScreenSettings writes it, the compositor reads the same file
+// for light_off and brightness) goes to Flutter as the accessibility feature
+// disableAnimations, so it reaches every applet as MediaQuery.disableAnimations
+// and the kit's motion engine reads that one flag. Only a change is sent.
+#define VRX_SCREEN_DIR "/etc/vrx/display"
+#define VRX_SCREEN_CONF VRX_SCREEN_DIR "/screen.conf"
+
+static void vrx_send_accessibility(struct flutterpi *fpi) {
+    char v[16] = "";
+    bool reduce = vrx_conf_value(VRX_SCREEN_CONF, "reduce_motion", v, sizeof v) && strcmp(v, "1") == 0;
+    if (vrx_app.reduce_motion == (int) reduce) return;
+    FlutterEngineResult r = fpi->flutter.procs.UpdateAccessibilityFeatures(
+        fpi->flutter.engine,
+        (FlutterAccessibilityFeature) (reduce ? kFlutterAccessibilityFeatureDisableAnimations : 0)
+    );
+    if (r != kSuccess) {
+        LOG_ERROR("vrx: FlutterEngineUpdateAccessibilityFeatures: %s\n", FLUTTER_RESULT_TO_STRING(r));
+        return;  // not recorded: the next change or start tries again
+    }
+    vrx_app.reduce_motion = reduce;
+    LOG_ERROR_UNPREFIXED("vrx: reduce motion %s\n", reduce ? "on" : "off");
+}
+
 static int on_vrx_etc_changed(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
     (void) s;
     (void) revents;
     (void) userdata;
     char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
-    bool locale = false;
+    bool locale = false, screen = false;
     ssize_t n;
     while ((n = read(fd, buf, sizeof buf)) > 0) {
         for (char *p = buf; p < buf + n;) {
             struct inotify_event *e = (struct inotify_event *) p;
-            if (e->len && strcmp(e->name, "locale.conf") == 0) locale = true;
+            if (e->wd == vrx_app.screen_wd) {
+                if (e->len && strcmp(e->name, "screen.conf") == 0) screen = true;
+            } else if (e->len && strcmp(e->name, "locale.conf") == 0) {
+                locale = true;
+            }
             p += sizeof *e + e->len;
         }
     }
     if (locale) vrx_send_settings();
+    if (screen && vrx_app.fpi != NULL) vrx_send_accessibility(vrx_app.fpi);
     return 0;
 }
 
 // The engine runs: tell it what it cannot know yet (seen or not, the time
-// format) and watch /etc for localed's renames.
+// format, reduce motion) and watch /etc for localed's renames and the screen
+// settings directory for the kit's.
 static void vrx_engine_started(struct flutterpi *fpi) {
-    (void) fpi;
     if (vrx_app.client == NULL) return;
     vrx_lifecycle_update();
     vrx_send_settings();
+    vrx_send_accessibility(fpi);
     if (vrx_app.etc_watch >= 0) return;
     int fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
     if (fd < 0 || inotify_add_watch(fd, "/etc", IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
         LOG_ERROR("vrx: cannot watch /etc for locale changes: %s\n", strerror(errno));
         if (fd >= 0) close(fd);
         return;
+    }
+    // the directory, not the file: a writer renames a new file over it
+    vrx_app.screen_wd = inotify_add_watch(fd, VRX_SCREEN_DIR, IN_CLOSE_WRITE | IN_MOVED_TO);
+    if (vrx_app.screen_wd < 0) {
+        LOG_ERROR("vrx: cannot watch %s for the reduce motion setting: %s\n", VRX_SCREEN_DIR, strerror(errno));
     }
     vrx_app.etc_watch = fd;
     flutterpi_sd_event_add_io(NULL, fd, EPOLLIN, on_vrx_etc_changed, NULL);
