@@ -184,6 +184,14 @@ struct vrx_compositor {
     int bl_level;              // the backlight's level while lit, as set
     int sig_fd;                // SIGTERM / SIGINT
     int wake_devices;          // touch screens, pointers, keyboards present
+    // input facts for the kit (plan 0013 D6, D7): touchscreens and
+    // keyboards present, by udev's classification; a device's kinds are
+    // kept so its removal undoes exactly what its arrival did
+    int touchscreens, keyboards;
+    struct { struct libinput_device *dev; unsigned kinds; } inputs[32];
+    // one finger drives the UI (plan 0013 D8): the touch slot whose
+    // contact is delivered, -1 when no contact is down
+    int primary_touch;
     // the cascade after the screen (plan 0012 D13): sleep, then deep sleep,
     // counted from the same last input; what this board offers comes from
     // its power profile (sleep, deep, charger-sleep lines)
@@ -1808,6 +1816,49 @@ static bool can_wake(struct libinput_device *d) {
     return yes;
 }
 
+enum { INPUT_TOUCH = 1, INPUT_KEYBOARD = 2 };
+
+// The kinds a device is, for the kit's facts.
+static unsigned input_kinds(struct libinput_device *d) {
+    struct udev_device *u = libinput_device_get_udev_device(d);
+    unsigned k = 0;
+    const char *v;
+    if (u && (v = udev_device_get_property_value(u, "ID_INPUT_TOUCHSCREEN")) && strcmp(v, "1") == 0) k |= INPUT_TOUCH;
+    if (u && (v = udev_device_get_property_value(u, "ID_INPUT_KEYBOARD")) && strcmp(v, "1") == 0) k |= INPUT_KEYBOARD;
+    if (u) udev_device_unref(u);
+    return k;
+}
+
+static void input_facts_changed(struct vrx_compositor *c, struct libinput_device *d, bool added) {
+    unsigned kinds = 0;
+    if (added) {
+        kinds = input_kinds(d);
+        if (!kinds) return;
+        for (size_t i = 0; i < sizeof c->inputs / sizeof c->inputs[0]; i++) {
+            if (!c->inputs[i].dev) {
+                c->inputs[i].dev = d;
+                c->inputs[i].kinds = kinds;
+                break;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < sizeof c->inputs / sizeof c->inputs[0]; i++) {
+            if (c->inputs[i].dev == d) {
+                kinds = c->inputs[i].kinds;
+                c->inputs[i].dev = NULL;
+                break;
+            }
+        }
+        if (!kinds) return;
+    }
+    int step = added ? 1 : -1;
+    if (kinds & INPUT_TOUCH) c->touchscreens += step;
+    if (kinds & INPUT_KEYBOARD) c->keyboards += step;
+    fprintf(stderr, "[vrx-compositor] input: %d touchscreen%s, %d keyboard%s\n", c->touchscreens,
+            c->touchscreens == 1 ? "" : "s", c->keyboards, c->keyboards == 1 ? "" : "s");
+    screen_facts(c);
+}
+
 static void wake_devices_changed(struct vrx_compositor *c, int delta, const char *name) {
     c->wake_devices += delta;
     fprintf(stderr, "[vrx-compositor] %s %s: %d device%s can wake the screen%s\n", name,
@@ -1880,7 +1931,8 @@ static void screen_read_conf(struct vrx_compositor *c) {
 }
 
 // What this screen can do, for the kit: whether a brightness slider means
-// anything here. Written once at start.
+// anything here, which cascade steps exist, and what input is present.
+// Written at start and whenever an input device comes or goes.
 static void screen_facts(const struct vrx_compositor *c) {
     static const char *names[] = { "none", "backlight", "alpha" };
     char tmp[] = SCREEN_FACTS ".tmp";
@@ -1894,6 +1946,11 @@ static void screen_facts(const struct vrx_compositor *c) {
     fprintf(f, "sleep=%s\n", c->sleep_state[0] && sleep_wake_source() ? c->sleep_state : "none");
     fprintf(f, "deep=%s\n", c->deep_action[0] ? c->deep_action : "none");
     fprintf(f, "wakealarm=%s\n", c->has_wakealarm ? "yes" : "no");
+    // input facts (plan 0013 D6, D7): the kit floors touch targets only
+    // where a finger can touch, and the on-screen keyboard steps aside
+    // where a physical one is plugged in
+    fprintf(f, "touch=%d\n", c->touchscreens > 0);
+    fprintf(f, "keyboard=%d\n", c->keyboards > 0);
     fclose(f);
     chmod(tmp, 0644);
     if (rename(tmp, SCREEN_FACTS) != 0) fprintf(stderr, "[vrx-compositor] %s: %s\n", SCREEN_FACTS, strerror(errno));
@@ -2404,11 +2461,13 @@ static void li_dispatch(struct vrx_compositor *c) {
                 libinput_device_set_user_data(d, c);
                 wake_devices_changed(c, +1, libinput_device_get_name(d));
             }
+            input_facts_changed(c, d, true);
             break;
         }
         case LIBINPUT_EVENT_DEVICE_REMOVED: {
             struct libinput_device *d = libinput_event_get_device(ev);
             if (libinput_device_get_user_data(d) == c) wake_devices_changed(c, -1, libinput_device_get_name(d));
+            input_facts_changed(c, d, false);
             break;
         }
         case LIBINPUT_EVENT_POINTER_MOTION:
@@ -2477,12 +2536,23 @@ static void li_dispatch(struct vrx_compositor *c) {
             send_input(c, &m);
             break;
         }
+        case LIBINPUT_EVENT_TOUCH_CANCEL:
+            // the kernel took the touch back: no contact is down any more
+            c->primary_touch = -1;
+            break;
         case LIBINPUT_EVENT_TOUCH_DOWN:
         case LIBINPUT_EVENT_TOUCH_MOTION:
         case LIBINPUT_EVENT_TOUCH_UP: {
             struct libinput_event_touch *th = libinput_event_get_touch_event(ev);
             uint32_t kind = t == LIBINPUT_EVENT_TOUCH_DOWN ? 0 :
                             t == LIBINPUT_EVENT_TOUCH_MOTION ? 1 : 2;
+            // one finger drives the UI (plan 0013 D8): the first contact
+            // down is delivered, later ones are held back until it lifts,
+            // so two fingers cannot press two controls at once
+            int slot = libinput_event_touch_get_slot(th);
+            if (kind == 0 && c->primary_touch < 0) c->primary_touch = slot;
+            if (slot != c->primary_touch) break;
+            if (kind == 2) c->primary_touch = -1;
             struct vrx_msg_input m = { .kind = VRX_INPUT_TOUCH };
             m.u.touch = (struct vrx_input_touch){
                 .time_ns = (uint64_t) libinput_event_touch_get_time_usec(th) * 1000,
@@ -2572,6 +2642,7 @@ int vrx_compositor_main(int argc, char **argv) {
     c.shell = -1;
     c.pointer_owner = -1;
     for (int i = 0; i < 16; i++) c.touch_owner[i] = -1;
+    c.primary_touch = -1;
     c.shell_frame.dmabuf_fd = -1;
     c.shell_frame.app = -1;
     struct frame *frames[] = { &c.on_screen, &c.pending, &c.queued };
