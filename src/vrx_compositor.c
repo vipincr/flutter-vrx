@@ -826,9 +826,6 @@ static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_
                (unsigned long long) ((c->trace_buffer_ns - c->trace_input_ns) / 1000));
         marker(c, "C|%d|vrx.input_to_screen_us|%llu", (int) pid,
                (unsigned long long) ((flip_ns - c->trace_input_ns) / 1000));
-        fprintf(stderr, "[vrx-compositor] latency: input→buffer %.1f ms, input→screen %.1f ms\n",
-                (double) (c->trace_buffer_ns - c->trace_input_ns) / 1e6,
-                (double) (flip_ns - c->trace_input_ns) / 1e6);
         c->trace_input_ns = 0;
     }
     c->last_flip_seq = seq;
