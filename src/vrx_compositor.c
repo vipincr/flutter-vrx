@@ -138,6 +138,11 @@ struct vrx_compositor {
     uint32_t dpms_prop;        // the connector's DPMS property, 0 = none
     uint32_t primary_plane;    // the CRTC's primary plane
     uint32_t primary_alpha, shell_alpha;  // their alpha properties, 0 = none
+    // the panel is mounted upside down (vrx plan 0013 D10): the
+    // connector's standard "panel orientation" says so (a carrier sets it
+    // on the kernel command line, video=<conn>:panel_orientation=...); the
+    // planes scan out turned, touch is turned back, the cursor drawn turned
+    bool upside_down;
     bool dark;                 // the screen is off
     bool light_after_flip;     // waking: light once the newest frame is up
     bool was_held;             // an app held the screen on, last we looked
@@ -220,6 +225,65 @@ static void connector_name(const drmModeConnector *conn, char *out, size_t cap) 
 }
 
 static bool conf_value(const char *path, const char *key, char *out, size_t cap);
+
+// The connector's "panel orientation" (Normal, Upside Down, Left Side
+// Up, Right Side Up), or "" when the kernel knows none.
+static void panel_orientation(int fd, uint32_t connector, char *out, size_t cap) {
+    out[0] = 0;
+    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, connector, DRM_MODE_OBJECT_CONNECTOR);
+    for (uint32_t i = 0; props && i < props->count_props && !out[0]; i++) {
+        drmModePropertyRes *p = drmModeGetProperty(fd, props->props[i]);
+        if (p && strcmp(p->name, "panel orientation") == 0) {
+            for (int e = 0; e < p->count_enums; e++) {
+                if (p->enums[e].value == props->prop_values[i]) snprintf(out, cap, "%s", p->enums[e].name);
+            }
+        }
+        if (p) drmModeFreeProperty(p);
+    }
+    if (props) drmModeFreeObjectProperties(props);
+}
+
+// A plane's rotation property and whether it offers `want` (a
+// DRM_MODE_ROTATE_* bit); 0 when the plane has no rotation at all.
+static uint32_t plane_rotation(int fd, uint32_t plane, uint64_t want, bool *offers) {
+    *offers = false;
+    uint32_t id = 0;
+    drmModeObjectProperties *props = drmModeObjectGetProperties(fd, plane, DRM_MODE_OBJECT_PLANE);
+    for (uint32_t i = 0; props && i < props->count_props && !id; i++) {
+        drmModePropertyRes *p = drmModeGetProperty(fd, props->props[i]);
+        if (p && strcmp(p->name, "rotation") == 0) {
+            id = p->prop_id;
+            for (int e = 0; e < p->count_enums; e++) {
+                if ((1ull << p->enums[e].value) == want) *offers = true;
+            }
+        }
+        if (p) drmModeFreeProperty(p);
+    }
+    if (props) drmModeFreeObjectProperties(props);
+    return id;
+}
+
+// Turn the planes this compositor scans out with by 180 degrees, once
+// the CRTC is lit: the panel is mounted upside down. A quarter turn is
+// refused loudly: vc4's planes offer only 0 and 180 (and the
+// reflections), and drawing sideways content unrotated beats a wrong
+// guess at the geometry.
+static void planes_rotate(struct vrx_compositor *c) {
+    if (!c->upside_down) return;
+    const uint32_t planes[] = { c->primary_plane, c->shell_plane };
+    for (size_t i = 0; i < sizeof planes / sizeof planes[0]; i++) {
+        if (!planes[i]) continue;
+        bool offers;
+        uint32_t prop = plane_rotation(c->drm_fd, planes[i], DRM_MODE_ROTATE_180, &offers);
+        if (!prop || !offers) {
+            fprintf(stderr, "[vrx-compositor] plane %u cannot turn 180 degrees: the panel stays upside down\n", planes[i]);
+            continue;
+        }
+        if (drmModeObjectSetProperty(c->drm_fd, planes[i], DRM_MODE_OBJECT_PLANE, prop, DRM_MODE_ROTATE_180) != 0) {
+            fprintf(stderr, "[vrx-compositor] plane %u rotate-180: %s\n", planes[i], strerror(errno));
+        }
+    }
+}
 
 // The output asked for: VRX_OUTPUT, else `output=` in the screen settings
 // file (/etc/vrx/display/screen.conf, the one display settings file), else
@@ -400,6 +464,15 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
         if (conn->modes[i].type & DRM_MODE_TYPE_PREFERRED) { mi = i; break; }
     }
     c->connector_id = conn->connector_id;
+    char orientation[32];
+    panel_orientation(c->drm_fd, c->connector_id, orientation, sizeof orientation);
+    c->upside_down = strcmp(orientation, "Upside Down") == 0;
+    if (strcmp(orientation, "Left Side Up") == 0 || strcmp(orientation, "Right Side Up") == 0) {
+        fprintf(stderr, "[vrx-compositor] %s is mounted %s: a quarter turn is not supported here; drawing unrotated\n",
+                c->output[0] ? c->output : "the panel", orientation);
+    } else if (c->upside_down) {
+        fprintf(stderr, "[vrx-compositor] the panel is mounted upside down: scanning out turned 180 degrees\n");
+    }
     c->mode = conn->modes[mi];
     c->width = c->mode.hdisplay;
     c->height = c->mode.vdisplay;
@@ -512,6 +585,7 @@ static void flip_queued(struct vrx_compositor *c) {
             return;
         }
         c->mode_set = true;
+        planes_rotate(c);
         screen_light(c);
         cursor_update(c);
         if (getenv("VRX_PROBE_OVERLAY")) plane_probe_bar(c);
@@ -1071,7 +1145,13 @@ static void cursor_init(struct vrx_compositor *c) {
                             !in_arrow(gx, gy - k) || !in_arrow(gx, gy + k);
                 v = edge ? 0xFF000000u : 0xFFFFFFFFu;
             }
-            px[y * stride + x] = v;
+            // on an upside-down panel the cursor plane is not turned: draw
+            // the arrow turned, so it points up-left to the person
+            if (c->upside_down) {
+                px[(CURSOR_SIZE - 1 - y) * stride + (CURSOR_SIZE - 1 - x)] = v;
+            } else {
+                px[y * stride + x] = v;
+            }
         }
     }
     munmap(px, cd.size);
@@ -1092,7 +1172,16 @@ static void cursor_update(struct vrx_compositor *c) {
         drmModeSetCursor(c->drm_fd, c->crtc_id, 0, 0, 0);
         c->cursor_shown = false;
     }
-    if (c->cursor_shown) drmModeMoveCursor(c->drm_fd, c->crtc_id, (int) c->px, (int) c->py);
+    if (c->cursor_shown) {
+        // the pointer is in the person's frame; the cursor plane in the
+        // panel's: turned, the arrow's tip is the image's far corner
+        if (c->upside_down) {
+            drmModeMoveCursor(c->drm_fd, c->crtc_id, (int) c->width - 1 - (int) c->px - (CURSOR_SIZE - 1),
+                              (int) c->height - 1 - (int) c->py - (CURSOR_SIZE - 1));
+        } else {
+            drmModeMoveCursor(c->drm_fd, c->crtc_id, (int) c->px, (int) c->py);
+        }
+    }
 }
 
 // ─── input ────────────────────────────────────────────────────────────────
@@ -2052,6 +2141,13 @@ static void li_dispatch(struct vrx_compositor *c) {
                 .x = kind == 2 ? 0 : (int32_t) libinput_event_touch_get_x_transformed(th, c->width),
                 .y = kind == 2 ? 0 : (int32_t) libinput_event_touch_get_y_transformed(th, c->height),
             };
+            // the glass turned with the panel: its coordinates are the
+            // panel's, so they turn back with the picture (a mouse moves in
+            // the person's frame and is left alone)
+            if (c->upside_down && kind != 2) {
+                m.u.touch.x = (int32_t) c->width - 1 - m.u.touch.x;
+                m.u.touch.y = (int32_t) c->height - 1 - m.u.touch.y;
+            }
             // a finger on the glass: the arrow would only be in the way
             if (c->cursor_wanted) {
                 c->cursor_wanted = false;
