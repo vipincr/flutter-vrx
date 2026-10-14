@@ -35,7 +35,8 @@ What the bench changed relative to the design below:
 - **VRX_MSG_RELEASE**: the compositor returns each buffer once it is off
   screen or superseded; the app holds at most two (GBM surfaces have four
   buffers) and skips a frame rather than starve the surface.
-- **Modeset once, then page flips**, with a one-deep queue (newest wins).
+- **Modeset once, then one atomic commit per vblank** for every plane, with a
+  one-deep queue per source (newest wins); see "The scene" below (plan 0017 D9).
 - **Focus gain re-presents** the app's current front buffer: an idle app has
   no new frame to show otherwise.
 
@@ -70,6 +71,76 @@ The surveyed design follows as it was recorded.
    (xkb translation via the existing keyboard.c path).
 4. Focus: VRX_MSG_FOCUS(0) → stop pumping frames (suspend policy, B4
    refines).
+
+## The scene (plan 0017 D9)
+
+What is on the panel is one scene: the focused app's frame on the primary
+plane, the shell's frame on an overlay above it, and the dim plane (brightness
+on a screen without a dimmable backlight) above both. The cursor stays on the
+legacy cursor ioctls. Every change to the scene goes out as one atomic commit
+flagged `DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT`, so the
+compositor's one epoll thread never waits for a vblank. The legacy
+`drmModeSetPlane`, `drmModePageFlip` and plane `drmModeObjectSetProperty` calls
+are gone (each waited a vblank); the CRTC's first `drmModeSetCrtc` is the one
+legacy call. Every commit sets every plane's properties, so the state is never
+inherited: FB_ID, CRTC_ID, SRC_*, CRTC_*, alpha 0xffff, and rotation 180 where
+the panel is mounted upside down. The dim plane carries the dim alpha; a plane
+with no frame (shell hidden, dim 0) is sent with FB_ID 0.
+
+Frames wait in slots, one set per source:
+
+| App (primary) | Shell (overlay) | Meaning |
+|---|---|---|
+| `queued` | `shell_queued` | newest frame, not yet in a commit (a newer one supersedes it) |
+| `pending` | `shell_pending` | carried by the commit in flight |
+| `on_screen` | `shell_frame` | scanned out; freed when a commit replaces it |
+
+Frame arrival to commit:
+
+```
+BUFFER from app or shell
+  -> import dmabuf as a framebuffer
+  -> shell frame, shell hidden or no modeset yet?  keep it as shell_frame, done
+  -> store in queued / shell_queued (release the one it supersedes)
+  -> scene_commit()
+       dark                -> return (the wake sends it)
+       commit in flight    -> return (the flip event sends it)
+       nothing changed     -> return
+       else build one atomic request, send it
+         EBUSY             -> stay dirty; retry on the event, or in 4 ms
+                              when nothing is known to be in flight
+         refused           -> test-only commits find the dim plane or the
+                              shell's plane; that plane is turned off for
+                              good and the commit sent again; else the
+                              frames are returned and the refusal counted
+         sent              -> queued -> pending, commit_pending = true
+```
+
+Flip event to next commit:
+
+```
+page flip event (vblank time)
+  -> commit_pending = false
+  -> flip record: one ring entry per commit that carried a frame, headed by
+     the frame that arrived last, with a `planes` column (P app, S shell,
+     D dim, W wake); a commit with no frame only moves the vblank phase
+  -> pending -> on_screen, shell_pending -> shell_frame (the replaced frames
+     are released to their apps)
+  -> tell the apps the vblank phase
+  -> scene_commit()   (anything that went dirty meanwhile, as one commit)
+  -> waking and nothing in flight?  light the screen
+```
+
+Screen power: off is a waiting atomic commit setting the CRTC's `ACTIVE` to 0
+(with `ALLOW_MODESET`, after the light goes to 0); a commit still in flight
+finishes inside it. On is the scene's next commit with `ACTIVE` 1, the newest
+frames and the dim alpha in one request, after which the light comes up on the
+flip event. Frames that arrive while the screen is off wait in `queued`.
+
+The pointer grab: a button press records its owner (the shell inside its
+region, else the focused app) and every pointer event goes there until the
+last button is released, as a touch contact does; hover keeps the position
+rule (`input_target`).
 
 ## Compositor-side follow-ups
 

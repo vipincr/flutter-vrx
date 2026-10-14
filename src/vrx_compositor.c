@@ -67,6 +67,9 @@
 // 0.1.0077), and 8 refused the shell's restart on the bench
 #define MAX_APPS 32
 
+// the dim plane's black buffer, stretched over the whole CRTC
+#define DIM_FB_SIZE 64
+
 struct app_client {
     bool in_use;        // slot occupied; slots never move (epoll holds them)
     int fd;
@@ -82,6 +85,16 @@ struct app_client {
     bool region_full;     // reports on its first frame and vrxhost may
                           // name it after that
     char id[sizeof(struct vrx_msg_register)];
+};
+
+// One KMS plane and the ids of the properties an atomic request sets on it
+// (plan 0017 D9). 0 = the plane does not have that property.
+struct kplane {
+    uint32_t id;
+    uint32_t fb, crtc, src_x, src_y, src_w, src_h, crtc_x, crtc_y, crtc_w, crtc_h;
+    uint32_t alpha;     // opaque (0xffff) every commit where the plane has it
+    uint32_t rotation;  // set to rotate_180 where the panel is upside down
+    uint64_t rotate_180;
 };
 
 // One presented buffer on its way to (or on) the screen.
@@ -158,7 +171,7 @@ struct vrx_compositor {
     // how brightness is shown: the backlight's levels, or a black plane
     // over everything at partial alpha (DIM_ALPHA), or not at all
     enum { DIM_NONE, DIM_BACKLIGHT, DIM_ALPHA } dim;
-    uint32_t dpms_prop;        // the connector's DPMS property, 0 = none
+    uint32_t active_prop;      // the CRTC's ACTIVE property: the screen's power
     uint32_t primary_plane;    // the CRTC's primary plane
     // the dim plane (DIM_ALPHA): an overlay above the shell's, scanning
     // out a small black buffer stretched over the CRTC. The app's and the
@@ -166,7 +179,21 @@ struct vrx_compositor {
     // shell's drawer see-through over the app (bench, CM4, 2026-10-14).
     uint32_t dim_plane, dim_alpha;  // the plane and its alpha property, 0 = none
     uint32_t dim_fb;           // the black buffer's framebuffer, 0 = none
-    bool dim_shown;            // the dim plane is on the CRTC now
+    uint64_t dim_want;         // the alpha the scene shows the dim plane at, 0 = off
+    uint64_t dim_sent;         // what the last commit showed
+    // the scene (plan 0017 D9): every plane goes out in one non-blocking
+    // atomic commit per vblank. Frames from the app and from the shell
+    // wait in `queued` and `shell_queued`, ride a commit as `pending` and
+    // `shell_pending`, and become `on_screen` and `shell_frame` when the
+    // flip event says that commit was scanned out.
+    struct kplane kp_primary, kp_shell, kp_dim;
+    bool commit_pending;       // a commit is in flight: its event is due
+    bool scene_dirty;          // something changed since the last commit
+    bool scene_retry;          // the last commit met EBUSY with nothing in flight
+    bool wake_pending;         // the next commit turns the CRTC back on
+    uint32_t commit_planes;    // SCENE_* planes the pending commit changed
+    uint32_t probe_fb;         // VRX_PROBE_OVERLAY's bar, shown while the shell has no frame
+    uint32_t probe_w, probe_h;
     // the panel is mounted upside down (vrx plan 0013 D10): the
     // connector's standard "panel orientation" says so (a carrier sets it
     // on the kernel command line, video=<conn>:panel_orientation=...); the
@@ -228,6 +255,7 @@ struct vrx_compositor {
     bool shell_full;           // its drawer has the whole screen
     uint32_t shell_plane;      // the overlay plane, 0 = none found
     struct frame shell_frame;  // on the plane now
+    struct frame shell_queued, shell_pending;
     int touch_owner[16];       // slot a touch slot's contact went to, -1
     int pointer_owner;         // slot a held mouse button went to, -1
     int controller;            // slot of vrxhost's connection, -1 = none
@@ -242,6 +270,7 @@ struct vrx_compositor {
 };
 
 static void cursor_update(struct vrx_compositor *c);
+static uint32_t prop_id(int fd, uint32_t obj, uint32_t type, const char *name);
 static uint64_t mode_period_ns(const drmModeModeInfo *m);
 static void repeat_arm(struct vrx_compositor *c, uint32_t key);
 
@@ -301,28 +330,6 @@ static uint32_t plane_rotation(int fd, uint32_t plane, uint64_t want, bool *offe
     }
     if (props) drmModeFreeObjectProperties(props);
     return id;
-}
-
-// Turn the planes this compositor scans out with by 180 degrees, once
-// the CRTC is lit: the panel is mounted upside down. A quarter turn is
-// refused loudly: vc4's planes offer only 0 and 180 (and the
-// reflections), and drawing sideways content unrotated beats a wrong
-// guess at the geometry.
-static void planes_rotate(struct vrx_compositor *c) {
-    if (!c->upside_down) return;
-    const uint32_t planes[] = { c->primary_plane, c->shell_plane };
-    for (size_t i = 0; i < sizeof planes / sizeof planes[0]; i++) {
-        if (!planes[i]) continue;
-        bool offers;
-        uint32_t prop = plane_rotation(c->drm_fd, planes[i], DRM_MODE_ROTATE_180, &offers);
-        if (!prop || !offers) {
-            fprintf(stderr, "[vrx-compositor] plane %u cannot turn 180 degrees: the panel stays upside down\n", planes[i]);
-            continue;
-        }
-        if (drmModeObjectSetProperty(c->drm_fd, planes[i], DRM_MODE_OBJECT_PLANE, prop, DRM_MODE_ROTATE_180) != 0) {
-            fprintf(stderr, "[vrx-compositor] plane %u rotate-180: %s\n", planes[i], strerror(errno));
-        }
-    }
 }
 
 // The output asked for: VRX_OUTPUT, else `output=` in the screen settings
@@ -409,10 +416,12 @@ out:
 }
 
 // VRX_PROBE_OVERLAY=1: a bar across the top, a sixth of the screen tall,
-// translucent blue fading to clear, on the overlay plane. The bench looks
-// at the panel: blended over the app, the shell can live on a plane.
+// translucent blue fading to clear, on the shell's overlay plane. The
+// bench looks at the panel: blended over the app, the shell can live on a
+// plane. The bar is a framebuffer the scene commit shows on that plane
+// while the shell has no frame of its own (plan 0017 D9).
 static void plane_probe_bar(struct vrx_compositor *c) {
-    uint32_t plane = plane_probe(c, false);
+    uint32_t plane = c->shell_plane;
     if (!plane) {
         fprintf(stderr, "[vrx-compositor] probe: no ARGB8888 overlay plane on crtc %u\n", c->crtc_id);
         return;
@@ -436,10 +445,9 @@ static void plane_probe_bar(struct vrx_compositor *c) {
         fprintf(stderr, "[vrx-compositor] probe: AddFB2 %s\n", strerror(errno));
         return;
     }
-    if (drmModeSetPlane(c->drm_fd, plane, c->crtc_id, fb, 0, 0, 0, w, h, 0, 0, w << 16, h << 16) != 0) {
-        fprintf(stderr, "[vrx-compositor] probe: SetPlane %u: %s\n", plane, strerror(errno));
-        return;
-    }
+    c->probe_fb = fb;
+    c->probe_w = w;
+    c->probe_h = h;
     fprintf(stderr, "[vrx-compositor] probe: bar on overlay plane %u (%ux%u ARGB8888)\n", plane, w, h);
 }
 
@@ -463,6 +471,14 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
         // kmscon, weston leftover) would make us useless, so report loudly.
         fprintf(stderr, "[vrx-compositor] DRMSetMaster failed: %s (another master owns the card?)\n",
                 strerror(errno));
+    }
+    // every plane is committed atomically (plan 0017 D9): there is no
+    // legacy path to fall back to, so a driver without atomic is refused
+    // here, loudly, rather than on the first frame
+    if (drmSetClientCap(c->drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0 ||
+        drmSetClientCap(c->drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
+        fprintf(stderr, "[vrx-compositor] %s has no atomic modesetting: %s\n", path, strerror(errno));
+        return -1;
     }
     // flip events carry the vblank's CLOCK_MONOTONIC time where the driver
     // says so (plan 0014 D5, D6); otherwise the record uses arrival time
@@ -613,53 +629,301 @@ static bool frame_import(struct vrx_compositor *c, struct frame *f,
     return true;
 }
 
-static void shell_show(struct vrx_compositor *c);
 static void screen_light(struct vrx_compositor *c);
 static void screen_report(struct vrx_compositor *c);
+static void screen_facts(const struct vrx_compositor *c);
 static void display_on(struct vrx_compositor *c, const char *why);
 static void display_off(struct vrx_compositor *c, const char *why);
 static void display_tell(struct vrx_compositor *c, int only);
 static void hold_changed(struct vrx_compositor *c, const char *why);
+static bool chrome_shown(const struct vrx_compositor *c);
+static uint64_t dim_alpha(const struct vrx_compositor *c);
 
-// Ask for the queued frame to be flipped in, if the flip slot is free and
-// the screen is on (a flip on a CRTC that is off is refused; the newest
-// frame waits in `queued` for the wake, plan 0010 D5).
-static void flip_queued(struct vrx_compositor *c) {
-    if (!c->queued.valid || c->pending.valid || c->dark) return;
-    c->queued.commit_ns = now_ns();
-    if (!c->mode_set) {
-        // the very first frame: one modeset, after which everything flips
-        if (drmModeSetCrtc(c->drm_fd, c->crtc_id, c->queued.fb_id, 0, 0,
-                           &c->connector_id, 1, &c->mode) != 0) {
-            fprintf(stderr, "[vrx-compositor] drmModeSetCrtc: %s\n", strerror(errno));
-            frame_release(c, &c->queued);
-            return;
+// ─── the scene (plan 0017 D9) ─────────────────────────────────────────────
+//
+// What is on the panel is one scene: the focused app's frame on the primary
+// plane, the shell's frame on an overlay above it, and the dim plane above
+// both. Every change to any of them goes out as ONE atomic commit, flagged
+// non-blocking with a flip event, so this thread never waits for a vblank
+// (the legacy per-plane and page-flip calls each did, and a shell frame
+// per vblank stalled the app plane, input and the socket behind it).
+//
+// A frame from either app lands in `queued` / `shell_queued` (a newer one
+// supersedes it) and marks the scene dirty. scene_commit() sends the scene
+// when no commit is in flight; the frames it carried become `pending` /
+// `shell_pending`. The flip event (on_page_flip) retires the frames the
+// commit replaced and sends again if the scene went dirty meanwhile: at
+// most one commit is ever in flight per CRTC. The CRTC's first modeset
+// stays drmModeSetCrtc (it needs a framebuffer and a mode, once).
+static uint64_t commit_errors;  // scene commits the driver refused outright (the flip ring's header)
+enum { SCENE_PRIMARY = 1, SCENE_SHELL = 2, SCENE_DIM = 4, SCENE_WAKE = 8 };
+
+static void kplane_init(struct vrx_compositor *c, struct kplane *k, uint32_t plane, bool rotate) {
+    memset(k, 0, sizeof *k);
+    if (!plane) return;
+    const int fd = c->drm_fd;
+    k->id = plane;
+    k->fb = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "FB_ID");
+    k->crtc = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+    k->src_x = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_X");
+    k->src_y = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+    k->src_w = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_W");
+    k->src_h = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "SRC_H");
+    k->crtc_x = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+    k->crtc_y = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+    k->crtc_w = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_W");
+    k->crtc_h = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+    k->alpha = prop_id(fd, plane, DRM_MODE_OBJECT_PLANE, "alpha");
+    if (!k->fb || !k->crtc || !k->src_w || !k->crtc_w) {
+        fprintf(stderr, "[vrx-compositor] plane %u is missing atomic properties: not used\n", plane);
+        memset(k, 0, sizeof *k);
+        return;
+    }
+    if (rotate) {
+        // the panel is mounted upside down: the planes scan out turned. A
+        // quarter turn is refused loudly: vc4's planes offer only 0 and 180
+        // (and the reflections), and drawing sideways content unrotated
+        // beats a wrong guess at the geometry.
+        bool offers;
+        k->rotation = plane_rotation(fd, plane, DRM_MODE_ROTATE_180, &offers);
+        if (!k->rotation || !offers) {
+            fprintf(stderr, "[vrx-compositor] plane %u cannot turn 180 degrees: the panel stays upside down\n", plane);
+            k->rotation = 0;
+        } else {
+            k->rotate_180 = DRM_MODE_ROTATE_180;
         }
-        c->mode_set = true;
-        planes_rotate(c);
-        screen_light(c);
-        cursor_update(c);
-        if (getenv("VRX_PROBE_OVERLAY")) plane_probe_bar(c);
-        shell_show(c);
-        c->on_screen = c->queued;
-        memset(&c->queued, 0, sizeof c->queued);
-        c->queued.dmabuf_fd = -1;
-        c->queued.app = -1;
-        fprintf(stderr, "[vrx-compositor] modeset: first frame from app %d on screen\n",
-                c->on_screen.app);
-        if (c->on_screen.app >= 0) report_app(c, &c->apps[c->on_screen.app], VRX_APP_SHOWN);
-        return;
     }
-    if (drmModePageFlip(c->drm_fd, c->crtc_id, c->queued.fb_id,
-                        DRM_MODE_PAGE_FLIP_EVENT, c) != 0) {
-        fprintf(stderr, "[vrx-compositor] drmModePageFlip: %s\n", strerror(errno));
+}
+
+static void kadd(drmModeAtomicReq *req, uint32_t obj, uint32_t prop, uint64_t value) {
+    if (obj && prop) drmModeAtomicAddProperty(req, obj, prop, value);
+}
+
+// Put `fb` (sw x sh pixels) on the plane, stretched to dw x dh at the CRTC's origin.
+static void kplane_place(drmModeAtomicReq *req, const struct kplane *k, uint32_t crtc, uint32_t fb,
+                         uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh) {
+    kadd(req, k->id, k->fb, fb);
+    kadd(req, k->id, k->crtc, crtc);
+    kadd(req, k->id, k->src_x, 0);
+    kadd(req, k->id, k->src_y, 0);
+    kadd(req, k->id, k->src_w, (uint64_t) sw << 16);
+    kadd(req, k->id, k->src_h, (uint64_t) sh << 16);
+    kadd(req, k->id, k->crtc_x, 0);
+    kadd(req, k->id, k->crtc_y, 0);
+    kadd(req, k->id, k->crtc_w, dw);
+    kadd(req, k->id, k->crtc_h, dh);
+}
+
+static void kplane_off(drmModeAtomicReq *req, const struct kplane *k) {
+    kadd(req, k->id, k->fb, 0);
+    kadd(req, k->id, k->crtc, 0);
+}
+
+// Build the scene and send it with `flags`. `planes` reports which planes
+// the commit changes (what the frames it carries will have replaced).
+// Returns drmModeAtomicCommit's result with errno kept.
+static int scene_send(struct vrx_compositor *c, bool with_dim, bool with_shell, uint32_t flags, uint32_t *planes) {
+    drmModeAtomicReq *req = drmModeAtomicAlloc();
+    if (!req) {
+        errno = ENOMEM;
+        return -1;
+    }
+    *planes = 0;
+    if (c->wake_pending) {
+        kadd(req, c->crtc_id, c->active_prop, 1);
+        *planes |= SCENE_WAKE;
+    }
+    // primary: the app's newest frame, else what is on it now
+    const struct frame *p = c->queued.valid ? &c->queued : &c->on_screen;
+    if (p->valid) {
+        kplane_place(req, &c->kp_primary, c->crtc_id, p->fb_id, c->width, c->height, c->width, c->height);
+        kadd(req, c->kp_primary.id, c->kp_primary.alpha, 0xffff);
+        kadd(req, c->kp_primary.id, c->kp_primary.rotation, c->kp_primary.rotate_180);
+        if (c->queued.valid) *planes |= SCENE_PRIMARY;
+    }
+    // shell: its newest frame while the chrome is shown (the bench probe's
+    // bar while it has none), else the plane is off
+    if (c->kp_shell.id) {
+        const struct frame *sf = NULL;
+        if (with_shell && chrome_shown(c)) {
+            sf = c->shell_queued.valid ? &c->shell_queued : c->shell_frame.valid ? &c->shell_frame : NULL;
+        }
+        if (sf) {
+            kplane_place(req, &c->kp_shell, c->crtc_id, sf->fb_id, c->width, c->height, c->width, c->height);
+        } else if (with_shell && c->probe_fb) {
+            kplane_place(req, &c->kp_shell, c->crtc_id, c->probe_fb, c->probe_w, c->probe_h, c->probe_w, c->probe_h);
+        } else {
+            kplane_off(req, &c->kp_shell);
+        }
+        if (sf || c->probe_fb) {
+            kadd(req, c->kp_shell.id, c->kp_shell.alpha, 0xffff);
+            kadd(req, c->kp_shell.id, c->kp_shell.rotation, c->kp_shell.rotate_180);
+        }
+        if (sf && sf == &c->shell_queued) *planes |= SCENE_SHELL;
+    }
+    // dim: a black buffer over everything at the wanted alpha
+    if (c->kp_dim.id) {
+        uint64_t want = with_dim ? c->dim_want : 0;
+        if (want) {
+            kplane_place(req, &c->kp_dim, c->crtc_id, c->dim_fb, DIM_FB_SIZE, DIM_FB_SIZE, c->width, c->height);
+            kadd(req, c->kp_dim.id, c->kp_dim.alpha, want);
+        } else {
+            kplane_off(req, &c->kp_dim);
+        }
+        if (want != c->dim_sent) *planes |= SCENE_DIM;
+    }
+    int r = drmModeAtomicCommit(c->drm_fd, req, flags, c);
+    int e = errno;
+    drmModeAtomicFree(req);
+    errno = e;
+    return r;
+}
+
+// The driver refused the scene. Say so once per cause, then find the plane
+// it will not take: the dim plane first (a screen that does not dim is a
+// fair price), then the shell's. A test-only commit tells which without
+// touching the screen. The compositor goes on with that plane off.
+static int scene_refused(struct vrx_compositor *c, uint32_t flags, uint32_t *planes) {
+    int cause = errno;
+    static uint64_t said;
+    if (cause < 64 && !(said & (1ull << cause))) {
+        said |= 1ull << cause;
+        fprintf(stderr, "[vrx-compositor] atomic commit refused: %s\n", strerror(cause));
+    }
+    uint32_t test = (flags & DRM_MODE_ATOMIC_ALLOW_MODESET) | DRM_MODE_ATOMIC_TEST_ONLY, scratch;
+    if (c->kp_dim.id && c->dim_want && scene_send(c, false, true, test, &scratch) == 0) {
+        fprintf(stderr, "[vrx-compositor] dim plane %u refused (%s): this screen does not dim\n", c->dim_plane,
+                strerror(cause));
+        memset(&c->kp_dim, 0, sizeof c->kp_dim);
+        c->dim_plane = 0;
+        c->dim_want = 0;
+        c->dim = DIM_NONE;
+        screen_facts(c);
+        return scene_send(c, true, true, flags, planes);
+    }
+    if (c->kp_shell.id && scene_send(c, true, false, test, &scratch) == 0) {
+        fprintf(stderr, "[vrx-compositor] shell plane %u refused (%s): the shell has no plane\n", c->shell_plane,
+                strerror(cause));
+        memset(&c->kp_shell, 0, sizeof c->kp_shell);
+        c->shell_plane = 0;
+        frame_release(c, &c->shell_queued);
+        frame_release(c, &c->shell_frame);
+        return scene_send(c, true, true, flags, planes);
+    }
+    errno = cause;
+    return -1;
+}
+
+// The first frame: one modeset (drmModeSetCrtc, the one legacy call), after
+// which the planes and everything else go by commit.
+static bool scene_modeset(struct vrx_compositor *c) {
+    if (!c->queued.valid) return false;
+    c->queued.commit_ns = now_ns();
+    if (drmModeSetCrtc(c->drm_fd, c->crtc_id, c->queued.fb_id, 0, 0, &c->connector_id, 1, &c->mode) != 0) {
+        fprintf(stderr, "[vrx-compositor] drmModeSetCrtc: %s\n", strerror(errno));
         frame_release(c, &c->queued);
-        return;
+        return false;
     }
-    c->pending = c->queued;
+    c->mode_set = true;
+    c->on_screen = c->queued;
     memset(&c->queued, 0, sizeof c->queued);
     c->queued.dmabuf_fd = -1;
     c->queued.app = -1;
+    c->scene_dirty = true;
+    if (c->dim == DIM_ALPHA) c->dim_want = dim_alpha(c);
+    cursor_update(c);
+    fprintf(stderr, "[vrx-compositor] modeset: first frame from app %d on screen\n", c->on_screen.app);
+    if (c->on_screen.app >= 0) report_app(c, &c->apps[c->on_screen.app], VRX_APP_SHOWN);
+    return true;
+}
+
+// Send the scene if something changed and nothing is in flight. Called by
+// everything that changes it; the flip event calls it again.
+static void scene_commit(struct vrx_compositor *c) {
+    if (c->dark) return;  // the newest frames wait for the wake
+    bool first = false;
+    if (!c->mode_set) {
+        if (!scene_modeset(c)) return;
+        first = true;
+    }
+    if (c->commit_pending || !c->scene_dirty) return;
+    // a wake turns the CRTC on, which needs ALLOW_MODESET and is the one
+    // commit that waits (DPMS-on did too, and nothing animates across it)
+    uint32_t flags = c->wake_pending ? DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_PAGE_FLIP_EVENT
+                                     : DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+    uint64_t t = now_ns();
+    if (c->queued.valid) c->queued.commit_ns = t;
+    if (c->shell_queued.valid) c->shell_queued.commit_ns = t;
+    uint32_t planes = 0;
+    c->scene_dirty = false;
+    int r = scene_send(c, true, true, flags, &planes);
+    if (r != 0 && errno == EBUSY) {
+        // the driver still has the last one; its event (or the loop's
+        // retry, when nothing is known to be in flight) sends this again
+        c->scene_dirty = true;
+        c->scene_retry = !c->commit_pending;
+        return;
+    }
+    if (r != 0) r = scene_refused(c, flags, &planes);
+    if (r != 0) {
+        // nothing the driver takes: the frames never show and are returned
+        commit_errors++;
+        frame_release(c, &c->queued);
+        frame_release(c, &c->shell_queued);
+        if (c->wake_pending) {
+            // a screen that cannot be lit is worse than a stale one: turn
+            // the CRTC on with whatever its planes already hold
+            drmModeAtomicReq *req = drmModeAtomicAlloc();
+            if (req) {
+                kadd(req, c->crtc_id, c->active_prop, 1);
+                drmModeAtomicCommit(c->drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+                drmModeAtomicFree(req);
+            }
+            c->wake_pending = false;
+        }
+        return;
+    }
+    c->scene_retry = false;
+    c->wake_pending = false;
+    c->commit_pending = true;
+    c->commit_planes = planes;
+    c->dim_sent = c->kp_dim.id ? c->dim_want : 0;
+    if (planes & SCENE_PRIMARY) {
+        c->pending = c->queued;
+        memset(&c->queued, 0, sizeof c->queued);
+        c->queued.dmabuf_fd = -1;
+        c->queued.app = -1;
+    }
+    if (planes & SCENE_SHELL) {
+        c->shell_pending = c->shell_queued;
+        memset(&c->shell_queued, 0, sizeof c->shell_queued);
+        c->shell_queued.dmabuf_fd = -1;
+        c->shell_queued.app = -1;
+    }
+    if (first) screen_light(c);
+}
+
+// The scene changed under the commit (the shell came or went, the chrome
+// was hidden or shown, focus moved): send it.
+static void scene_update(struct vrx_compositor *c) {
+    c->scene_dirty = true;
+    scene_commit(c);
+}
+
+// The planes the scene uses, once the KMS device and the screen are known.
+static void scene_init(struct vrx_compositor *c) {
+    kplane_init(c, &c->kp_primary, c->primary_plane, c->upside_down);
+    kplane_init(c, &c->kp_shell, c->shell_plane, c->upside_down);
+    kplane_init(c, &c->kp_dim, c->dim_plane, false);
+    if (!c->kp_dim.id && c->dim_plane) {
+        c->dim_plane = 0;
+        c->dim = DIM_NONE;
+    }
+    if (!c->kp_shell.id) c->shell_plane = 0;
+    if (!c->kp_primary.id || !c->active_prop) {
+        fprintf(stderr, "[vrx-compositor] the CRTC or its primary plane lacks atomic properties\n");
+    }
+    if (getenv("VRX_PROBE_OVERLAY")) plane_probe_bar(c);
 }
 
 // ─── the semantics trees (plan 0014 D8) ─────────────────────────────────
@@ -805,13 +1069,14 @@ struct flip_entry {
     uint64_t flip_ns, recv_ns, commit_ns;
     uint32_t seq, delta, skipped;
     uint8_t cause;
-    char id[23];
+    uint8_t planes;  // SCENE_* planes the commit changed
+    char id[22];
 };
 static struct flip_entry flip_ring[FLIP_RING_LEN];
 static uint32_t flip_ring_next, flip_ring_count;
 
 static void flip_ring_push(const struct frame *f, const char *id, uint32_t seq, uint32_t delta,
-                           uint32_t skipped, enum flip_cause cause, uint64_t flip_ns) {
+                           uint32_t skipped, enum flip_cause cause, uint32_t planes, uint64_t flip_ns) {
     struct flip_entry *e = &flip_ring[flip_ring_next];
     e->flip_ns = flip_ns;
     e->recv_ns = f->recv_ns;
@@ -820,6 +1085,7 @@ static void flip_ring_push(const struct frame *f, const char *id, uint32_t seq, 
     e->delta = delta;
     e->skipped = skipped;
     e->cause = (uint8_t) cause;
+    e->planes = (uint8_t) planes;
     size_t n = strnlen(id, sizeof e->id - 1);
     memcpy(e->id, id, n);
     e->id[n] = 0;
@@ -839,15 +1105,20 @@ static void flip_ring_dump(const char *why) {
     uint32_t first = (flip_ring_next + FLIP_RING_LEN - flip_ring_count) % FLIP_RING_LEN;
     uint64_t newest = flip_ring_count ? flip_ring[(flip_ring_next + FLIP_RING_LEN - 1) % FLIP_RING_LEN].flip_ns : 0;
     fprintf(out, "# vrx flip ring (plan 0014 D5), the last 60 s, oldest first (%s)\n", why);
-    fprintf(out, "# flip_ns\tseq\tdelta\tskipped\tapp\tarrival_to_screen_us\tcommit_to_screen_us\tcause\n");
+    fprintf(out, "# scene commits refused since start: %" PRIu64 "\n", commit_errors);
+    fprintf(out, "# planes: the planes the commit changed, P primary (the app), S shell, D dim, W wake (plan 0017 D9)\n");
+    fprintf(out, "# flip_ns\tseq\tdelta\tskipped\tapp\tarrival_to_screen_us\tcommit_to_screen_us\tcause\tplanes\n");
     unsigned written = 0;
     for (uint32_t i = 0; i < flip_ring_count; i++) {
         const struct flip_entry *e = &flip_ring[(first + i) % FLIP_RING_LEN];
         if (newest > FLIP_RING_NS && e->flip_ns < newest - FLIP_RING_NS) continue;
-        fprintf(out, "%" PRIu64 "\t%u\t%u\t%u\t%s\t%" PRIu64 "\t%" PRIu64 "\t%s\n", e->flip_ns, e->seq, e->delta,
+        char planes[5] = "";
+        snprintf(planes, sizeof planes, "%s%s%s%s", e->planes & SCENE_PRIMARY ? "P" : "", e->planes & SCENE_SHELL ? "S" : "",
+                 e->planes & SCENE_DIM ? "D" : "", e->planes & SCENE_WAKE ? "W" : "");
+        fprintf(out, "%" PRIu64 "\t%u\t%u\t%u\t%s\t%" PRIu64 "\t%" PRIu64 "\t%s\t%s\n", e->flip_ns, e->seq, e->delta,
                 e->skipped, e->id, e->recv_ns && e->flip_ns > e->recv_ns ? (e->flip_ns - e->recv_ns) / 1000 : 0,
                 e->commit_ns && e->flip_ns > e->commit_ns ? (e->flip_ns - e->commit_ns) / 1000 : 0,
-                flip_cause_name[e->cause]);
+                flip_cause_name[e->cause], planes[0] ? planes : "-");
         written++;
     }
     fclose(out);
@@ -867,7 +1138,8 @@ static void flip_ring_dump(const char *why) {
 // the previous flip): arrived late, the app was late; arrived in time but
 // committed late, the compositor was late; committed in time and the HVS
 // underrun count moved, an underrun.
-static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_t seq, uint64_t flip_ns) {
+static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_t seq, uint32_t planes,
+                        uint64_t flip_ns) {
     pid_t pid = getpid();
     const char *id = f->app >= 0 && f->app < MAX_APPS ? c->apps[f->app].id : "gone";
     uint32_t delta = 0, skipped_ring = 0;
@@ -917,12 +1189,16 @@ static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_
                (unsigned long long) ((flip_ns - c->trace_input_ns) / 1000));
         c->trace_input_ns = 0;
     }
-    flip_ring_push(f, id, seq, delta, skipped_ring, cause_ring, flip_ns);
+    flip_ring_push(f, id, seq, delta, skipped_ring, cause_ring, planes, flip_ns);
     c->last_flip_seq = seq;
     c->last_flip_ns = flip_ns;
 }
 
-// DRM says the requested flip happened: the old screen buffer is free.
+// DRM says the commit was scanned out: the frames it replaced are free. A
+// commit that changed no frame (the dim plane's alpha, a wake) only moves
+// the vblank phase; the record keeps one entry per commit that did, headed
+// by the frame that arrived last, so a late shell frame and a late app
+// frame are each seen as what they are.
 static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
                          unsigned int usec, void *data) {
     (void) fd;
@@ -930,25 +1206,49 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
     // the event's timestamp is the vblank's, when the driver stamps with
     // CLOCK_MONOTONIC; otherwise now is the nearest honest time
     uint64_t flip_ns = c->flip_ts_monotonic ? (uint64_t) sec * 1000000000ull + (uint64_t) usec * 1000ull : now_ns();
-    flip_record(c, &c->pending, seq, flip_ns);
-    if (c->on_screen.app_fd != c->pending.app_fd) {
-        fprintf(stderr, "[vrx-compositor] screen switched to slot %d ('%s')\n", c->pending.app,
-                c->pending.app >= 0 ? c->apps[c->pending.app].id : "?");
-        if (c->pending.app >= 0) report_app(c, &c->apps[c->pending.app], VRX_APP_SHOWN);
+    c->commit_pending = false;
+    const struct frame *head = NULL;
+    if (c->pending.valid && c->shell_pending.valid) {
+        head = c->shell_pending.recv_ns > c->pending.recv_ns ? &c->shell_pending : &c->pending;
+    } else if (c->pending.valid) {
+        head = &c->pending;
+    } else if (c->shell_pending.valid) {
+        head = &c->shell_pending;
     }
-    frame_release(c, &c->on_screen);
-    c->on_screen = c->pending;
-    memset(&c->pending, 0, sizeof c->pending);
-    c->pending.dmabuf_fd = -1;
-    c->pending.app = -1;
-    if (c->light_after_flip) {
+    if (head) {
+        flip_record(c, head, seq, c->commit_planes, flip_ns);
+    } else {
+        c->last_flip_seq = seq;
+        c->last_flip_ns = flip_ns;
+    }
+    if (c->pending.valid) {
+        if (c->on_screen.app_fd != c->pending.app_fd) {
+            fprintf(stderr, "[vrx-compositor] screen switched to slot %d ('%s')\n", c->pending.app,
+                    c->pending.app >= 0 ? c->apps[c->pending.app].id : "?");
+            if (c->pending.app >= 0) report_app(c, &c->apps[c->pending.app], VRX_APP_SHOWN);
+        }
+        frame_release(c, &c->on_screen);
+        c->on_screen = c->pending;
+        memset(&c->pending, 0, sizeof c->pending);
+        c->pending.dmabuf_fd = -1;
+        c->pending.app = -1;
+    }
+    if (c->shell_pending.valid) {
+        frame_release(c, &c->shell_frame);
+        c->shell_frame = c->shell_pending;
+        memset(&c->shell_pending, 0, sizeof c->shell_pending);
+        c->shell_pending.dmabuf_fd = -1;
+        c->shell_pending.app = -1;
+    }
+    c->commit_planes = 0;
+    send_vblank(c, c->on_screen.app, false);
+    send_vblank(c, c->shell, false);
+    scene_commit(c);
+    if (c->light_after_flip && !c->commit_pending) {
         // waking: the current screen is up, now it can be seen
         c->light_after_flip = false;
         screen_light(c);
     }
-    send_vblank(c, c->on_screen.app, false);
-    send_vblank(c, c->shell, false);
-    flip_queued(c);
 }
 
 static void drm_readable(struct vrx_compositor *c) {
@@ -1058,22 +1358,6 @@ static void send_insets(struct vrx_compositor *c, int only) {
     }
 }
 
-// Put the shell's current frame on its plane (once the CRTC is lit), or
-// take the plane off when there is none or the focused app has the whole
-// screen.
-static void shell_show(struct vrx_compositor *c) {
-    if (!c->shell_plane || !c->mode_set) return;
-    struct frame *f = &c->shell_frame;
-    if (!f->valid || !chrome_shown(c)) {
-        drmModeSetPlane(c->drm_fd, c->shell_plane, c->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        return;
-    }
-    if (drmModeSetPlane(c->drm_fd, c->shell_plane, c->crtc_id, f->fb_id, 0, 0, 0, c->width, c->height, 0, 0,
-                        c->width << 16, c->height << 16) != 0) {
-        fprintf(stderr, "[vrx-compositor] shell plane %u: %s\n", c->shell_plane, strerror(errno));
-    }
-}
-
 static void apply_want_shell(struct vrx_compositor *c) {
     int slot = -1;
     for (int i = 0; c->want_shell > 0 && i < MAX_APPS; i++) {
@@ -1085,8 +1369,9 @@ static void apply_want_shell(struct vrx_compositor *c) {
     c->shell_top = slot >= 0 ? c->apps[slot].region_top : 0;
     c->shell_full = slot >= 0 && c->apps[slot].region_full;
     if (slot < 0) {
+        frame_release(c, &c->shell_queued);
         frame_release(c, &c->shell_frame);
-        shell_show(c);
+        scene_update(c);
     } else {
         fprintf(stderr, "[vrx-compositor] shell -> slot %d ('%s', pid %d), plane %u\n", slot, c->apps[slot].id,
                 (int) c->apps[slot].pid, c->shell_plane);
@@ -1099,16 +1384,16 @@ static void focus_slot(struct vrx_compositor *c, int slot) {
     if (slot == c->focused) return;
     int old = c->focused;
     c->focused = slot;
+    // a frame from the old focus still waiting for the flip slot never shows
+    frame_release(c, &c->queued);
     // the shell steps aside for an app that has the whole screen
-    shell_show(c);
+    scene_update(c);
     // a key held into a focus change stops repeating into the new app
     repeat_arm(c, 0);
     if (old >= 0 && c->apps[old].in_use) {
         client_send(c, c->apps[old].fd, VRX_MSG_FOCUS,
                     &(struct vrx_msg_focus){ .focused = 0 }, sizeof(struct vrx_msg_focus), -1);
     }
-    // a frame from the old focus still waiting for the flip slot never shows
-    frame_release(c, &c->queued);
     // a hold counts only while its app is in front
     hold_changed(c, "focus changed");
     if (slot < 0) {
@@ -1154,7 +1439,8 @@ static void drop_client(struct vrx_compositor *c, int slot) {
     // Frames it presented stay valid (we hold our own fd and import): the
     // screen keeps its last frame until the next focused app's frame
     // replaces it. Only the RELEASE goes nowhere, which frame_release checks.
-    struct frame *frames[] = { &c->on_screen, &c->pending, &c->queued };
+    struct frame *frames[] = { &c->on_screen, &c->pending, &c->queued, &c->shell_frame, &c->shell_pending,
+                               &c->shell_queued };
     for (size_t i = 0; i < sizeof frames / sizeof frames[0]; i++) {
         if (frames[i]->valid && frames[i]->app == slot) frames[i]->app = -1;
     }
@@ -1164,14 +1450,14 @@ static void drop_client(struct vrx_compositor *c, int slot) {
     // both here and as its child's status)
     if (c->focused == slot) {
         c->focused = -1;
-        shell_show(c);
+        scene_update(c);
     }
-    if (c->shell_frame.valid && c->shell_frame.app == slot) c->shell_frame.app = -1;
     if (c->shell == slot) {
         // its plane goes dark and apps may use the whole screen again
         c->shell = -1;
+        frame_release(c, &c->shell_queued);
         frame_release(c, &c->shell_frame);
-        shell_show(c);
+        scene_update(c);
         send_insets(c, -1);
     }
     for (int i = 0; i < 16; i++) {
@@ -1326,7 +1612,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
             if (h->length < sizeof *m || slot == c->shell) goto bad;
             if (a->no_chrome == (m->hidden != 0)) break;
             a->no_chrome = m->hidden != 0;
-            if (slot == c->focused) shell_show(c);
+            if (slot == c->focused) scene_update(c);
             break;
         }
         case VRX_MSG_BUFFER: {
@@ -1341,17 +1627,22 @@ static void client_handle(struct vrx_compositor *c, int slot,
             a->last_recv_ns = arrived;
             fd = -1;  // the frame owns it now
             if (slot == c->shell) {
-                // the shell's plane: a legacy SetPlane on an atomic driver
-                // commits synchronously, so the frame it replaces is off
-                // screen when it returns and goes straight back
+                // the shell's plane: the frame rides the next scene commit,
+                // and a newer one supersedes it if that is still waiting
                 if (!c->shell_plane || !frame_import(c, &f, b)) {
                     frame_release(c, &f);
                     break;
                 }
-                struct frame old = c->shell_frame;
-                c->shell_frame = f;
-                shell_show(c);
-                frame_release(c, &old);
+                if ((!chrome_shown(c) || !c->mode_set) && !c->shell_pending.valid) {
+                    // nothing on the panel shows the shell: it only keeps
+                    // its newest frame for when the chrome comes back
+                    frame_release(c, &c->shell_frame);
+                    c->shell_frame = f;
+                    break;
+                }
+                frame_release(c, &c->shell_queued);
+                c->shell_queued = f;
+                scene_update(c);
                 break;
             }
             if (slot != c->focused || !frame_import(c, &f, b)) {
@@ -1364,7 +1655,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
             // superseded and returned
             frame_release(c, &c->queued);
             c->queued = f;
-            flip_queued(c);
+            scene_update(c);
             break;
         }
         case VRX_MSG_CLOSED:
@@ -1615,8 +1906,6 @@ static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m)
 // 13 % of full luminance, since alpha scales encoded values
 #define BACKLIGHT_FLOOR 0.1
 #define DIM_LEVEL_FLOOR 0.4
-// the dim plane's black buffer, stretched over the whole CRTC
-#define DIM_FB_SIZE 64
 
 static void screen_facts(const struct vrx_compositor *c);
 
@@ -1671,28 +1960,13 @@ static uint64_t dim_alpha(const struct vrx_compositor *c) {
 }
 
 // Show the dim plane at `alpha` over the whole CRTC, or take it off at 0.
-// A plane that refuses (no scaling, a commit error) leaves the screen
-// undimmed and says so once: dim=none, never a per-plane alpha again.
+// The alpha rides the scene's next commit (the one in flight finishes
+// first), so the slider moves with whatever else is moving. A plane the
+// driver refuses leaves the screen undimmed and says so once (scene_refused).
 static void dim_show(struct vrx_compositor *c, uint64_t alpha) {
-    if (!c->dim_plane || !c->mode_set) return;
-    if (alpha == 0) {
-        if (c->dim_shown) drmModeSetPlane(c->drm_fd, c->dim_plane, c->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        c->dim_shown = false;
-        return;
-    }
-    if (drmModeObjectSetProperty(c->drm_fd, c->dim_plane, DRM_MODE_OBJECT_PLANE, c->dim_alpha, alpha) != 0 ||
-        drmModeSetPlane(c->drm_fd, c->dim_plane, c->crtc_id, c->dim_fb, 0, 0, 0, c->width, c->height,
-                        0, 0, DIM_FB_SIZE << 16, DIM_FB_SIZE << 16) != 0) {
-        fprintf(stderr, "[vrx-compositor] dim plane %u refused (%s): this screen does not dim\n", c->dim_plane,
-                strerror(errno));
-        drmModeSetPlane(c->drm_fd, c->dim_plane, c->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        c->dim_shown = false;
-        c->dim_plane = 0;
-        c->dim = DIM_NONE;
-        screen_facts(c);
-        return;
-    }
-    c->dim_shown = true;
+    if (!c->dim_plane || !c->mode_set || alpha == c->dim_want) return;
+    c->dim_want = alpha;
+    scene_update(c);
 }
 
 // Light the screen at the set brightness: the backlight, and on a light
@@ -1872,19 +2146,28 @@ static void display_tell(struct vrx_compositor *c, int only) {
     }
 }
 
-// Light first, then the panel; a flip still in flight finishes inside the
-// blocking DPMS commit, and nothing flips until the screen is back (D5).
+// Light first, then the panel: the CRTC's ACTIVE property goes to 0 in a
+// commit that waits, so a commit still in flight finishes inside it (its
+// event is read as usual), and nothing is committed until the screen is
+// back (plan 0010 D5, plan 0017 D9).
 static void display_off(struct vrx_compositor *c, const char *why) {
     if (c->dark) return;
     c->dark = true;
     c->light_after_flip = false;
+    c->wake_pending = false;
     // the sequence counter is not meaningful across an off CRTC: the next
     // flip starts the record again instead of counting the dark as drops
     c->last_flip_ns = 0;
     backlight_set(c, 0);
-    if (c->dpms_prop && c->mode_set &&
-        drmModeConnectorSetProperty(c->drm_fd, c->connector_id, c->dpms_prop, DRM_MODE_DPMS_OFF) != 0) {
-        fprintf(stderr, "[vrx-compositor] DPMS off: %s\n", strerror(errno));
+    if (c->active_prop && c->mode_set) {
+        drmModeAtomicReq *req = drmModeAtomicAlloc();
+        if (req) {
+            kadd(req, c->crtc_id, c->active_prop, 0);
+            if (drmModeAtomicCommit(c->drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) != 0) {
+                fprintf(stderr, "[vrx-compositor] CRTC off: %s\n", strerror(errno));
+            }
+            drmModeAtomicFree(req);
+        }
     }
     display_tell(c, -1);
     idle_arm(c);
@@ -1894,22 +2177,22 @@ static void display_off(struct vrx_compositor *c, const char *why) {
     screen_report(c);
 }
 
-// The panel first, then the newest frame, then the light once that frame
-// is up, so the first thing seen is the current screen.
+// The panel and the newest scene in one commit, then the light once that
+// commit is up, so the first thing seen is the current screen.
 static void display_on(struct vrx_compositor *c, const char *why) {
     if (!c->dark) return;
     c->dark = false;
-    if (c->dpms_prop && c->mode_set &&
-        drmModeConnectorSetProperty(c->drm_fd, c->connector_id, c->dpms_prop, DRM_MODE_DPMS_ON) != 0) {
-        fprintf(stderr, "[vrx-compositor] DPMS on: %s\n", strerror(errno));
-    }
     display_tell(c, -1);
-    if (c->queued.valid && !c->pending.valid) {
+    if (c->active_prop && c->mode_set) {
+        c->wake_pending = true;
+        c->scene_dirty = true;
         c->light_after_flip = true;
-        flip_queued(c);
-        if (!c->pending.valid) c->light_after_flip = false;
+        scene_commit(c);
     }
-    if (!c->light_after_flip) screen_light(c);
+    if (!c->commit_pending) {
+        c->light_after_flip = false;
+        screen_light(c);
+    }
     idle_arm(c);
     cascade_disarm(c);
     fprintf(stderr, "[vrx-compositor] screen on (%s)\n", why);
@@ -2182,14 +2465,8 @@ static void screen_init(struct vrx_compositor *c) {
     }
     c->bl_max = c->backlight[0] ? sysfs_int(c->backlight, "max_brightness") : 0;
     if (c->bl_max < 0) c->bl_max = 0;
-    c->dpms_prop = prop_id(c->drm_fd, c->connector_id, DRM_MODE_OBJECT_CONNECTOR, "DPMS");
-    // the app's and the shell's planes are opaque, whatever an earlier
-    // compositor left in their alpha properties
-    const uint32_t opaque[] = { c->primary_plane, c->shell_plane };
-    for (size_t i = 0; i < sizeof opaque / sizeof opaque[0]; i++) {
-        uint32_t a = opaque[i] ? prop_id(c->drm_fd, opaque[i], DRM_MODE_OBJECT_PLANE, "alpha") : 0;
-        if (a) drmModeObjectSetProperty(c->drm_fd, opaque[i], DRM_MODE_OBJECT_PLANE, a, 0xffff);
-    }
+    // (the app's and the shell's planes are made opaque by every scene
+    // commit, whatever an earlier compositor left in their alpha properties)
     if (c->bl_max <= 1) dim_init(c);
     c->dim = c->bl_max > 1 ? DIM_BACKLIGHT : c->dim_fb ? DIM_ALPHA : DIM_NONE;
     // the level systemd-backlight restored at boot is the brightness
@@ -2203,7 +2480,7 @@ static void screen_init(struct vrx_compositor *c) {
         }
     }
     fprintf(stderr, "[vrx-compositor] screen: light %s (max %d), DPMS %s, dims by %s\n",
-            c->backlight[0] ? c->backlight : "none", c->bl_max, c->dpms_prop ? "yes" : "no",
+            c->backlight[0] ? c->backlight : "none", c->bl_max, c->active_prop ? "yes" : "no",
             c->dim == DIM_BACKLIGHT ? "the backlight" : c->dim == DIM_ALPHA ? "a black plane over the screen" : "nothing");
     screen_facts(c);
     // the directory, not the file: a writer renames a new file over it
@@ -2772,9 +3049,8 @@ int vrx_compositor_main(int argc, char **argv) {
     c.pointer_owner = -1;
     for (int i = 0; i < 16; i++) c.touch_owner[i] = -1;
     c.primary_touch = -1;
-    c.shell_frame.dmabuf_fd = -1;
-    c.shell_frame.app = -1;
-    struct frame *frames[] = { &c.on_screen, &c.pending, &c.queued };
+    struct frame *frames[] = { &c.on_screen, &c.pending, &c.queued, &c.shell_frame, &c.shell_pending,
+                               &c.shell_queued };
     for (size_t i = 0; i < sizeof frames / sizeof frames[0]; i++) {
         frames[i]->dmabuf_fd = -1;
         frames[i]->app = -1;
@@ -2801,7 +3077,9 @@ int vrx_compositor_main(int argc, char **argv) {
         ev.data.u64 = TAG_REPEAT;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.repeat_fd, &ev);
     }
+    c.active_prop = prop_id(c.drm_fd, c.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
     screen_init(&c);
+    scene_init(&c);
     if (c.idle_fd >= 0) {
         ev.data.u64 = TAG_IDLE;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.idle_fd, &ev);
@@ -2851,11 +3129,14 @@ int vrx_compositor_main(int argc, char **argv) {
     fprintf(stderr, "[vrx-compositor] running (socket %s)\n", VRX_UI_SOCKET);
     while (c.running) {
         struct epoll_event out[8];
-        int n = epoll_wait(c.epoll_fd, out, 8, -1);
+        // a commit the driver turned away with nothing in flight has no
+        // event to retry it: look again in a few ms
+        int n = epoll_wait(c.epoll_fd, out, 8, c.scene_retry ? 4 : -1);
         if (n < 0) {
             if (errno == EINTR) continue;
             break;
         }
+        if (c.scene_retry && !c.commit_pending) scene_commit(&c);
         for (int i = 0; i < n; i++) {
             uint64_t tag = out[i].data.u64;
             if (tag == TAG_LISTENER) {
