@@ -117,6 +117,10 @@ struct vrx_compositor {
     uint64_t last_flip_ns;     // 0 = no flip yet (or reset by DPMS)
     uint64_t drops_app, drops_compositor, drops_underrun, drops_unattributed;
     uint64_t underruns_seen;
+    // walks find controls by label (plan 0014 D8): the apps build their
+    // semantics trees while this is on, and each tree lands in
+    // /run/vrx-ui/semantics/<id>.json
+    bool semantics;
     bool logged_format;        // first frame's format/modifier logged
     uint32_t connector_id, crtc_id;
     char output[32];           // the connector's name, HDMI-A-1
@@ -645,6 +649,62 @@ static void flip_queued(struct vrx_compositor *c) {
     c->queued.app = -1;
 }
 
+// ─── the semantics trees (plan 0014 D8) ─────────────────────────────────
+#define SEMANTICS_DIR VRX_UI_SOCKET_DIR "/semantics"
+
+static void semantics_tell(struct vrx_compositor *c, int only) {
+    struct vrx_msg_semantics m = { .on = c->semantics };
+    for (int i = 0; i < MAX_APPS; i++) {
+        struct app_client *a = &c->apps[i];
+        if (!a->in_use || !a->registered || (only >= 0 && i != only)) continue;
+        client_send(c, a->fd, VRX_MSG_SEMANTICS, &m, sizeof m, -1);
+    }
+}
+
+static void semantics_set(struct vrx_compositor *c, bool on) {
+    if (on == c->semantics) return;
+    c->semantics = on;
+    if (on) {
+        mkdir(SEMANTICS_DIR, 0755);
+    } else {
+        DIR *d = opendir(SEMANTICS_DIR);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.') continue;
+                char path[256];
+                snprintf(path, sizeof path, SEMANTICS_DIR "/%s", e->d_name);
+                unlink(path);
+            }
+            closedir(d);
+        }
+    }
+    fprintf(stderr, "[vrx-compositor] semantics %s\n", on ? "on: trees in " SEMANTICS_DIR : "off");
+    semantics_tell(c, -1);
+}
+
+// An app's tree, as JSON in the memfd it sent: written atomically for the
+// walk driver. Bounded: a tree over 1 MiB is refused.
+static void semantics_store(struct vrx_compositor *c, const struct app_client *a, int fd, uint32_t length) {
+    if (!c->semantics || length == 0 || length > (1u << 20)) return;
+    char *json = malloc(length);
+    if (!json) return;
+    ssize_t n = pread(fd, json, length, 0);
+    if (n == (ssize_t) length) {
+        char path[256], tmp[256];
+        snprintf(path, sizeof path, SEMANTICS_DIR "/%s.json", a->id);
+        snprintf(tmp, sizeof tmp, SEMANTICS_DIR "/.%s.json", a->id);
+        int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (out >= 0) {
+            bool ok = write(out, json, length) == (ssize_t) length;
+            close(out);
+            if (ok) rename(tmp, path);
+            else unlink(tmp);
+        }
+    }
+    free(json);
+}
+
 // ─── the flip record (plan 0014 D5, D6, D7) ─────────────────────────────
 
 // One line on ftrace's trace_marker, while profiling is on. Perfetto's
@@ -1042,10 +1102,11 @@ static void client_handle(struct vrx_compositor *c, int slot,
                           const struct vrx_msg_header *h, void *payload, int fd) {
     struct app_client *a = &c->apps[slot];
     // a connection is an app (REGISTER) or the controller (CONTROL), once
-    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME;
+    bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME ||
+                   h->type == VRX_MSG_SEMANTICS_TREE;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL || h->type == VRX_MSG_LIGHT_CAP ||
-          h->type == VRX_MSG_PROFILING) &&
+          h->type == VRX_MSG_PROFILING || h->type == VRX_MSG_SEMANTICS) &&
          !a->controller) ||
         (h->type == VRX_MSG_SHELL_REGION && !a->registered) ||
         (h->type == VRX_MSG_BACK && slot != c->shell) ||
@@ -1066,6 +1127,8 @@ static void client_handle(struct vrx_compositor *c, int slot,
             report_app(c, a, VRX_APP_REGISTERED);
             // an app starting while the screen is off starts hidden
             if (c->dark) display_tell(c, slot);
+            // and one starting during a walk's planning builds its tree
+            if (c->semantics) semantics_tell(c, slot);
             if (c->want_shell > 0 && a->pid == c->want_shell) {
                 apply_want_shell(c);
             } else {
@@ -1102,6 +1165,18 @@ static void client_handle(struct vrx_compositor *c, int slot,
             if (h->length < sizeof *m) goto bad;
             c->want_shell = m->pid;
             apply_want_shell(c);
+            break;
+        }
+        case VRX_MSG_SEMANTICS: {
+            struct vrx_msg_semantics *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            semantics_set(c, m->on != 0);
+            break;
+        }
+        case VRX_MSG_SEMANTICS_TREE: {
+            struct vrx_msg_semantics_tree *m = payload;
+            if (h->length < sizeof *m || fd < 0) goto bad;
+            semantics_store(c, a, fd, m->length);
             break;
         }
         case VRX_MSG_PROFILING: {

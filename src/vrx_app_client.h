@@ -25,6 +25,8 @@ struct vrx_app_client_callbacks {
     // the panel's vblank phase: a real flip's time and the refresh period
     // (plan 0014 D6)
     void (*on_vblank)(uint64_t flip_ns, uint64_t period_ns, void *userdata);
+    // build the semantics tree or stop (plan 0014 D8)
+    void (*on_semantics)(uint32_t on, void *userdata);
     void *userdata;
 };
 

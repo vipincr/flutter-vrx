@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -531,6 +532,11 @@ UNUSED static void on_begin_frame(void *userdata, uint64_t vblank_ns, uint64_t n
 fail_free_req:
     free(req);
     return;
+}
+
+static void vrx_on_semantics_update(const FlutterSemanticsUpdate2 *update, void *userdata);
+static void vrx_on_semantics_update_trampoline(const FlutterSemanticsUpdate2 *update, void *userdata) {
+    vrx_on_semantics_update(update, userdata);
 }
 
 /// The panel's vblank phase from the vrx compositor (plan 0014 D6): a real
@@ -1394,6 +1400,8 @@ static FlutterEngine create_flutter_engine(
     project_args.log_tag = NULL;
     project_args.on_pre_engine_restart_callback = NULL;
     project_args.update_semantics_callback = NULL;
+    // walks find controls by label (plan 0014 D8): built only while asked
+    project_args.update_semantics_callback2 = vrx_vsync ? vrx_on_semantics_update_trampoline : NULL;
     project_args.update_semantics_callback2 = NULL;
 
     // spin up the engine
@@ -2080,6 +2088,186 @@ static void vrx_on_vblank(uint64_t flip_ns, uint64_t period_ns, void *userdata) 
     atomic_store(&vrx_vblank_flip_ns, flip_ns);
 }
 
+// ── the semantics tree for walks (plan 0014 D8) ─────────────────────────
+// While the compositor asks (VRX_MSG_SEMANTICS, from vrxhost's
+// io.vrx.Host.Semantics), the engine builds the semantics tree and hands
+// it over in update_semantics_callback2 batches. The app keeps every node,
+// and after each batch sends the compositor the whole tree as JSON in a
+// memfd: each labelled or tappable node with its rect in panel pixels
+// (every ancestor's transform applied, the device pixel ratio included).
+// The compositor writes it where the walk driver reads it.
+struct vrx_sem_node {
+    bool used;
+    int32_t id;
+    char *label, *value, *hint, *tooltip;
+    FlutterRect rect;
+    FlutterTransformation transform;
+    int64_t actions, flags;
+    int32_t *children;
+    size_t child_count;
+};
+static struct {
+    bool on;
+    struct vrx_sem_node *nodes;  // indexed by id
+    size_t cap;
+} vrx_sem;
+
+static void vrx_sem_free_node(struct vrx_sem_node *n) {
+    free(n->label); free(n->value); free(n->hint); free(n->tooltip); free(n->children);
+    memset(n, 0, sizeof *n);
+}
+
+static void vrx_sem_clear(void) {
+    for (size_t i = 0; i < vrx_sem.cap; i++) vrx_sem_free_node(&vrx_sem.nodes[i]);
+    free(vrx_sem.nodes);
+    vrx_sem.nodes = NULL;
+    vrx_sem.cap = 0;
+}
+
+static char *vrx_dup(const char *s) {
+    return s && *s ? strdup(s) : NULL;
+}
+
+struct vrx_buf { char *p; size_t len, cap; };
+static void vrx_buf_put(struct vrx_buf *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->len + n + 1) cap *= 2;
+        char *p = realloc(b->p, cap);
+        if (!p) return;
+        b->p = p;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+static void vrx_buf_printf(struct vrx_buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void vrx_buf_printf(struct vrx_buf *b, const char *fmt, ...) {
+    char tmp[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n > 0) vrx_buf_put(b, tmp, (size_t) (n < (int) sizeof tmp ? n : (int) sizeof tmp - 1));
+}
+static void vrx_buf_string(struct vrx_buf *b, const char *s) {
+    vrx_buf_put(b, "\"", 1);
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char) *s;
+        if (c == '"' || c == '\\') { char e[2] = { '\\', (char) c }; vrx_buf_put(b, e, 2); }
+        else if (c < 0x20) vrx_buf_printf(b, "\\u%04x", c);
+        else vrx_buf_put(b, (const char *) &c, 1);
+    }
+    vrx_buf_put(b, "\"", 1);
+}
+
+// parent * child, affine (perspective ignored: Flutter's 2D transforms)
+static FlutterTransformation vrx_mul(FlutterTransformation a, FlutterTransformation b) {
+    return (FlutterTransformation){
+        .scaleX = a.scaleX * b.scaleX + a.skewX * b.skewY,
+        .skewX = a.scaleX * b.skewX + a.skewX * b.scaleY,
+        .transX = a.scaleX * b.transX + a.skewX * b.transY + a.transX,
+        .skewY = a.skewY * b.scaleX + a.scaleY * b.skewY,
+        .scaleY = a.skewY * b.skewX + a.scaleY * b.scaleY,
+        .transY = a.skewY * b.transX + a.scaleY * b.transY + a.transY,
+        .pers2 = 1,
+    };
+}
+
+static void vrx_sem_walk(struct vrx_buf *b, int32_t id, FlutterTransformation parent, int depth, bool *first) {
+    if (id < 0 || (size_t) id >= vrx_sem.cap || !vrx_sem.nodes[id].used || depth > 256) return;
+    struct vrx_sem_node *n = &vrx_sem.nodes[id];
+    FlutterTransformation t = vrx_mul(parent, n->transform);
+    bool tap = n->actions & kFlutterSemanticsActionTap;
+    if (n->label || n->value || n->tooltip || tap) {
+        double xs[4] = { n->rect.left, n->rect.right, n->rect.left, n->rect.right };
+        double ys[4] = { n->rect.top, n->rect.top, n->rect.bottom, n->rect.bottom };
+        double l = 1e9, tp = 1e9, r = -1e9, bt = -1e9;
+        for (int i = 0; i < 4; i++) {
+            double x = t.scaleX * xs[i] + t.skewX * ys[i] + t.transX;
+            double y = t.skewY * xs[i] + t.scaleY * ys[i] + t.transY;
+            if (x < l) l = x;
+            if (x > r) r = x;
+            if (y < tp) tp = y;
+            if (y > bt) bt = y;
+        }
+        vrx_buf_printf(b, "%s{\"id\":%d,\"rect\":[%.0f,%.0f,%.0f,%.0f],\"actions\":%lld,\"flags\":%lld,\"tap\":%s",
+                       *first ? "" : ",", id, l, tp, r, bt, (long long) n->actions, (long long) n->flags,
+                       tap ? "true" : "false");
+        if (n->label) { vrx_buf_put(b, ",\"label\":", 9); vrx_buf_string(b, n->label); }
+        if (n->value) { vrx_buf_put(b, ",\"value\":", 9); vrx_buf_string(b, n->value); }
+        if (n->hint) { vrx_buf_put(b, ",\"hint\":", 8); vrx_buf_string(b, n->hint); }
+        if (n->tooltip) { vrx_buf_put(b, ",\"tooltip\":", 11); vrx_buf_string(b, n->tooltip); }
+        vrx_buf_put(b, "}", 1);
+        *first = false;
+    }
+    for (size_t i = 0; i < n->child_count; i++) vrx_sem_walk(b, n->children[i], t, depth + 1, first);
+}
+
+static void vrx_sem_send(void) {
+    struct vrx_buf b = { 0 };
+    bool first = true;
+    vrx_buf_put(&b, "{\"nodes\":[", 10);
+    FlutterTransformation identity = { .scaleX = 1, .scaleY = 1, .pers2 = 1 };
+    vrx_sem_walk(&b, 0, identity, 0, &first);
+    vrx_buf_put(&b, "]}\n", 3);
+    if (!b.p) return;
+    int fd = memfd_create("vrx-semantics", MFD_CLOEXEC);
+    if (fd >= 0 && write(fd, b.p, b.len) == (ssize_t) b.len) {
+        struct vrx_msg_semantics_tree m = { .length = (uint32_t) b.len };
+        vrx_app_client_send(vrx_app.client, VRX_MSG_SEMANTICS_TREE, &m, sizeof m, fd);
+    }
+    if (fd >= 0) close(fd);
+    free(b.p);
+}
+
+static void vrx_on_semantics_update(const FlutterSemanticsUpdate2 *update, void *userdata) {
+    (void) userdata;
+    if (!vrx_sem.on) return;
+    for (size_t i = 0; i < update->node_count; i++) {
+        const FlutterSemanticsNode2 *src = update->nodes[i];
+        if (src->id < 0) continue;
+        if ((size_t) src->id >= vrx_sem.cap) {
+            size_t cap = vrx_sem.cap ? vrx_sem.cap : 64;
+            while (cap <= (size_t) src->id) cap *= 2;
+            struct vrx_sem_node *p = realloc(vrx_sem.nodes, cap * sizeof *p);
+            if (!p) return;
+            memset(p + vrx_sem.cap, 0, (cap - vrx_sem.cap) * sizeof *p);
+            vrx_sem.nodes = p;
+            vrx_sem.cap = cap;
+        }
+        struct vrx_sem_node *n = &vrx_sem.nodes[src->id];
+        vrx_sem_free_node(n);
+        n->used = true;
+        n->id = src->id;
+        n->label = vrx_dup(src->label);
+        n->value = vrx_dup(src->value);
+        n->hint = vrx_dup(src->hint);
+        n->tooltip = vrx_dup(src->tooltip);
+        n->rect = src->rect;
+        n->transform = src->transform;
+        n->actions = (int64_t) src->actions;
+        n->flags = (int64_t) src->flags;
+        if (src->child_count) {
+            n->children = malloc(src->child_count * sizeof *n->children);
+            if (n->children) {
+                memcpy(n->children, src->children_in_traversal_order, src->child_count * sizeof *n->children);
+                n->child_count = src->child_count;
+            }
+        }
+    }
+    vrx_sem_send();
+}
+
+static void vrx_on_semantics(uint32_t on, void *userdata) {
+    (void) userdata;
+    if ((on != 0) == vrx_sem.on || flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
+    vrx_sem.on = on != 0;
+    if (!vrx_sem.on) vrx_sem_clear();
+    flutterpi->flutter.procs.UpdateSemanticsEnabled(flutterpi->flutter.engine, vrx_sem.on);
+}
+
 static void vrx_on_sleep(uint32_t sleeping, void *userdata) {
     (void) userdata;
     vrx_app.sleeping = sleeping != 0;
@@ -2236,6 +2424,7 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
         .on_display = vrx_on_display,
         .on_sleep = vrx_on_sleep,
         .on_vblank = vrx_on_vblank,
+        .on_semantics = vrx_on_semantics,
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to

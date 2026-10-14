@@ -257,6 +257,11 @@ bool vrx_app_client_dispatch(struct vrx_app_client *c,
                 cb->on_vblank(v->flip_ns, v->period_ns, cb->userdata);
             }
             break;
+        case VRX_MSG_SEMANTICS:
+            if (h.length >= sizeof(struct vrx_msg_semantics) && cb && cb->on_semantics) {
+                cb->on_semantics(((struct vrx_msg_semantics *) p)->on, cb->userdata);
+            }
+            break;
         case VRX_MSG_SHUTDOWN:
             alive = false;
             break;

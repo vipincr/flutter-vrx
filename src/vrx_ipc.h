@@ -109,6 +109,15 @@ enum vrx_msg_type {
     // the next, where it used the engine's timer-based guess. Sent on
     // focus and then at most once a second while the app draws.
     VRX_MSG_VBLANK = 21,
+    // vrxhost -> comp -> every app: build the semantics tree (on = 1) or
+    // stop (0) (plan 0014 D8). Walks find controls by label while it is
+    // on; the tree costs a build pass per frame, so timing runs keep it
+    // off.
+    VRX_MSG_SEMANTICS = 22,
+    // app -> comp: the app's semantics tree as JSON in a memfd (the one fd
+    // riding the message), written by the compositor to
+    // /run/vrx-ui/semantics/<app id>.json for the walk driver.
+    VRX_MSG_SEMANTICS_TREE = 23,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -198,6 +207,14 @@ struct vrx_msg_sleep {
 
 struct vrx_msg_profiling {
     uint32_t on;  // 0/1
+};
+
+struct vrx_msg_semantics {
+    uint32_t on;  // 0/1
+};
+
+struct vrx_msg_semantics_tree {
+    uint32_t length;  // bytes of JSON in the memfd
 };
 
 struct vrx_msg_vblank {
