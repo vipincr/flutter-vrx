@@ -134,10 +134,18 @@ struct vrx_compositor {
     int brightness;            // the setting, 0-100, mapped above a floor
     char backlight[96];        // /sys/class/backlight/<name>, "" = none
     int bl_max;                // its max_brightness, 0 = no backlight
-    enum { DIM_NONE, DIM_BACKLIGHT, DIM_ALPHA } dim;  // how brightness is shown
+    // how brightness is shown: the backlight's levels, or a black plane
+    // over everything at partial alpha (DIM_ALPHA), or not at all
+    enum { DIM_NONE, DIM_BACKLIGHT, DIM_ALPHA } dim;
     uint32_t dpms_prop;        // the connector's DPMS property, 0 = none
     uint32_t primary_plane;    // the CRTC's primary plane
-    uint32_t primary_alpha, shell_alpha;  // their alpha properties, 0 = none
+    // the dim plane (DIM_ALPHA): an overlay above the shell's, scanning
+    // out a small black buffer stretched over the CRTC. The app's and the
+    // shell's planes stay opaque; dimming them by their own alpha made the
+    // shell's drawer see-through over the app (bench, CM4, 2026-10-14).
+    uint32_t dim_plane, dim_alpha;  // the plane and its alpha property, 0 = none
+    uint32_t dim_fb;           // the black buffer's framebuffer, 0 = none
+    bool dim_shown;            // the dim plane is on the CRTC now
     // the panel is mounted upside down (vrx plan 0013 D10): the
     // connector's standard "panel orientation" says so (a carrier sets it
     // on the kernel command line, video=<conn>:panel_orientation=...); the
@@ -1255,10 +1263,15 @@ static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m)
 #define SCREEN_FILE SCREEN_DIR "/screen.conf"
 #define SCREEN_FACTS VRX_UI_SOCKET_DIR "/screen"
 #define LIGHT_OFF_DEFAULT 120
-// the floors (D8): a tenth of a dimmable backlight; plane alpha 0.4, about
+// the floors (D8): a tenth of a dimmable backlight; with a dim plane, the
+// screen at 0.4 of its full level (the black plane at alpha 0.6), about
 // 13 % of full luminance, since alpha scales encoded values
 #define BACKLIGHT_FLOOR 0.1
-#define ALPHA_FLOOR 0.4
+#define DIM_LEVEL_FLOOR 0.4
+// the dim plane's black buffer, stretched over the whole CRTC
+#define DIM_FB_SIZE 64
+
+static void screen_facts(const struct vrx_compositor *c);
 
 static int sysfs_int(const char *dir, const char *what) {
     char path[160];
@@ -1300,22 +1313,46 @@ static int light_level(const struct vrx_compositor *c) {
     return level > cap ? cap : level;
 }
 
-static uint64_t plane_alpha(const struct vrx_compositor *c) {
-    if (c->dim != DIM_ALPHA) return 0xffff;
+// The dim plane's alpha for the set brightness (and the battery's cap):
+// 0 at full, 1 - DIM_LEVEL_FLOOR at the floor.
+static uint64_t dim_alpha(const struct vrx_compositor *c) {
     double share = c->brightness / 100.0, cap = c->light_cap / 1000.0;
     if (share > cap) share = cap;
-    return (uint64_t) (0xffff * (ALPHA_FLOOR + (1 - ALPHA_FLOOR) * share) + 0.5);
+    if (share < 0) share = 0;
+    double level = DIM_LEVEL_FLOOR + (1 - DIM_LEVEL_FLOOR) * share;
+    return (uint64_t) (0xffff * (1 - level) + 0.5);
+}
+
+// Show the dim plane at `alpha` over the whole CRTC, or take it off at 0.
+// A plane that refuses (no scaling, a commit error) leaves the screen
+// undimmed and says so once: dim=none, never a per-plane alpha again.
+static void dim_show(struct vrx_compositor *c, uint64_t alpha) {
+    if (!c->dim_plane || !c->mode_set) return;
+    if (alpha == 0) {
+        if (c->dim_shown) drmModeSetPlane(c->drm_fd, c->dim_plane, c->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        c->dim_shown = false;
+        return;
+    }
+    if (drmModeObjectSetProperty(c->drm_fd, c->dim_plane, DRM_MODE_OBJECT_PLANE, c->dim_alpha, alpha) != 0 ||
+        drmModeSetPlane(c->drm_fd, c->dim_plane, c->crtc_id, c->dim_fb, 0, 0, 0, c->width, c->height,
+                        0, 0, DIM_FB_SIZE << 16, DIM_FB_SIZE << 16) != 0) {
+        fprintf(stderr, "[vrx-compositor] dim plane %u refused (%s): this screen does not dim\n", c->dim_plane,
+                strerror(errno));
+        drmModeSetPlane(c->drm_fd, c->dim_plane, c->crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        c->dim_shown = false;
+        c->dim_plane = 0;
+        c->dim = DIM_NONE;
+        screen_facts(c);
+        return;
+    }
+    c->dim_shown = true;
 }
 
 // Light the screen at the set brightness: the backlight, and on a light
-// that cannot dim, every plane's alpha over the CRTC's black background.
+// that cannot dim, the black dim plane over everything.
 static void screen_light(struct vrx_compositor *c) {
     if (c->dark) return;
-    if (c->dim == DIM_ALPHA && c->mode_set) {
-        uint64_t a = plane_alpha(c);
-        if (c->primary_alpha) drmModeObjectSetProperty(c->drm_fd, c->primary_plane, DRM_MODE_OBJECT_PLANE, c->primary_alpha, a);
-        if (c->shell_alpha) drmModeObjectSetProperty(c->drm_fd, c->shell_plane, DRM_MODE_OBJECT_PLANE, c->shell_alpha, a);
-    }
+    if (c->dim == DIM_ALPHA) dim_show(c, dim_alpha(c));
     backlight_set(c, light_level(c));
 }
 
@@ -1633,6 +1670,72 @@ static uint32_t prop_id(int fd, uint32_t obj, uint32_t type, const char *name) {
     return id;
 }
 
+// The dim plane: an overlay this CRTC can use, other than the shell's,
+// with an alpha property, highest in z (above the shell when both say),
+// and a black XRGB buffer of DIM_FB_SIZE square the HVS stretches over the
+// whole screen. None found: the screen does not dim (dim=none).
+static void dim_init(struct vrx_compositor *c) {
+    drmModeRes *res = drmModeGetResources(c->drm_fd);
+    drmModePlaneRes *planes = drmModeGetPlaneResources(c->drm_fd);
+    int crtc_index = -1;
+    for (int k = 0; res && k < res->count_crtcs; k++) {
+        if (res->crtcs[k] == c->crtc_id) crtc_index = k;
+    }
+    bool shell_has_z = false;
+    uint64_t shell_z = c->shell_plane ? plane_prop(c->drm_fd, c->shell_plane, "zpos", &shell_has_z) : 0;
+    uint64_t best_z = 0;
+    for (uint32_t i = 0; planes && crtc_index >= 0 && i < planes->count_planes; i++) {
+        drmModePlane *p = drmModeGetPlane(c->drm_fd, planes->planes[i]);
+        if (!p) continue;
+        bool has_type, has_z, xrgb = false;
+        uint64_t type = plane_prop(c->drm_fd, p->plane_id, "type", &has_type);
+        uint64_t z = plane_prop(c->drm_fd, p->plane_id, "zpos", &has_z);
+        for (uint32_t f = 0; f < p->count_formats; f++) xrgb |= p->formats[f] == DRM_FORMAT_XRGB8888;
+        bool usable = (p->possible_crtcs & (1u << crtc_index)) && has_type && type == DRM_PLANE_TYPE_OVERLAY &&
+                      p->plane_id != c->shell_plane && xrgb &&
+                      prop_id(c->drm_fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "alpha") &&
+                      (!shell_has_z || !has_z || z > shell_z);
+        if (usable && (!c->dim_plane || (has_z && z > best_z))) {
+            c->dim_plane = p->plane_id;
+            best_z = has_z ? z : 0;
+        }
+        drmModeFreePlane(p);
+    }
+    if (planes) drmModeFreePlaneResources(planes);
+    if (res) drmModeFreeResources(res);
+    if (!c->dim_plane) {
+        fprintf(stderr, "[vrx-compositor] no overlay plane above the shell's: this screen does not dim\n");
+        return;
+    }
+    c->dim_alpha = prop_id(c->drm_fd, c->dim_plane, DRM_MODE_OBJECT_PLANE, "alpha");
+    struct drm_mode_create_dumb cd = { .width = DIM_FB_SIZE, .height = DIM_FB_SIZE, .bpp = 32 };
+    struct drm_mode_map_dumb md = { 0 };
+    uint32_t *px = MAP_FAILED;
+    if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) == 0) {
+        md.handle = cd.handle;
+        if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &md) == 0) {
+            px = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, c->drm_fd, md.offset);
+        }
+    }
+    uint32_t handles[4] = { cd.handle }, pitches[4] = { cd.pitch }, offsets[4] = { 0 };
+    int r = -1;
+    if (px != MAP_FAILED) {
+        memset(px, 0, cd.size);  // black: XRGB zero
+        munmap(px, cd.size);
+        r = drmModeAddFB2(c->drm_fd, DIM_FB_SIZE, DIM_FB_SIZE, DRM_FORMAT_XRGB8888, handles, pitches, offsets,
+                          &c->dim_fb, 0);
+    }
+    if (r != 0) {
+        fprintf(stderr, "[vrx-compositor] dim plane %u: no black buffer (%s): this screen does not dim\n",
+                c->dim_plane, strerror(errno));
+        c->dim_plane = 0;
+        c->dim_fb = 0;
+        return;
+    }
+    fprintf(stderr, "[vrx-compositor] dim plane %u (zpos %" PRIu64 ") over the shell's %u\n", c->dim_plane, best_z,
+            c->shell_plane);
+}
+
 static void screen_init(struct vrx_compositor *c) {
     c->idle_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     c->cascade_fd = timerfd_create(CLOCK_BOOTTIME, TFD_CLOEXEC | TFD_NONBLOCK);
@@ -1653,9 +1756,15 @@ static void screen_init(struct vrx_compositor *c) {
     c->bl_max = c->backlight[0] ? sysfs_int(c->backlight, "max_brightness") : 0;
     if (c->bl_max < 0) c->bl_max = 0;
     c->dpms_prop = prop_id(c->drm_fd, c->connector_id, DRM_MODE_OBJECT_CONNECTOR, "DPMS");
-    c->primary_alpha = c->primary_plane ? prop_id(c->drm_fd, c->primary_plane, DRM_MODE_OBJECT_PLANE, "alpha") : 0;
-    c->shell_alpha = c->shell_plane ? prop_id(c->drm_fd, c->shell_plane, DRM_MODE_OBJECT_PLANE, "alpha") : 0;
-    c->dim = c->bl_max > 1 ? DIM_BACKLIGHT : c->primary_alpha ? DIM_ALPHA : DIM_NONE;
+    // the app's and the shell's planes are opaque, whatever an earlier
+    // compositor left in their alpha properties
+    const uint32_t opaque[] = { c->primary_plane, c->shell_plane };
+    for (size_t i = 0; i < sizeof opaque / sizeof opaque[0]; i++) {
+        uint32_t a = opaque[i] ? prop_id(c->drm_fd, opaque[i], DRM_MODE_OBJECT_PLANE, "alpha") : 0;
+        if (a) drmModeObjectSetProperty(c->drm_fd, opaque[i], DRM_MODE_OBJECT_PLANE, a, 0xffff);
+    }
+    if (c->bl_max <= 1) dim_init(c);
+    c->dim = c->bl_max > 1 ? DIM_BACKLIGHT : c->dim_fb ? DIM_ALPHA : DIM_NONE;
     // the level systemd-backlight restored at boot is the brightness
     c->bl_level = c->backlight[0] ? sysfs_int(c->backlight, "brightness") : 0;
     if (c->dim == DIM_BACKLIGHT) {
@@ -1668,7 +1777,7 @@ static void screen_init(struct vrx_compositor *c) {
     }
     fprintf(stderr, "[vrx-compositor] screen: light %s (max %d), DPMS %s, dims by %s\n",
             c->backlight[0] ? c->backlight : "none", c->bl_max, c->dpms_prop ? "yes" : "no",
-            c->dim == DIM_BACKLIGHT ? "the backlight" : c->dim == DIM_ALPHA ? "plane alpha" : "nothing");
+            c->dim == DIM_BACKLIGHT ? "the backlight" : c->dim == DIM_ALPHA ? "a black plane over the screen" : "nothing");
     screen_facts(c);
     // the directory, not the file: a writer renames a new file over it
     c->conf_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
