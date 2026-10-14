@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -532,8 +533,18 @@ fail_free_req:
     return;
 }
 
+/// The panel's vblank phase from the vrx compositor (plan 0014 D6): a real
+/// flip's CLOCK_MONOTONIC time and the refresh period, written on the
+/// platform thread, read on whichever thread the engine asks a frame on.
+static bool vrx_vsync;
+static _Atomic uint64_t vrx_vblank_flip_ns, vrx_vblank_period_ns;
+
 /// Called on some flutter internal thread to request a frame,
 /// and also get the vblank timestamp of the pageflip preceding that frame.
+/// Under the vrx compositor (plan 0014 D6) the answer is the panel's real
+/// phase: the last vblank at or before now and the one after it. Until
+/// the compositor has told the phase (the app has not been on screen yet)
+/// it is the time of the request and one refresh later, said once.
 UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
     FlutterEngineResult engine_result;
     struct flutterpi *flutterpi;
@@ -553,8 +564,20 @@ UNUSED static void on_frame_request(void *userdata, intptr_t baton) {
 
     req->flutterpi = flutterpi;
     req->baton = baton;
-    req->vblank_ns = get_monotonic_time();
-    req->next_vblank_ns = req->vblank_ns + (1000000000.0 / compositor_get_refresh_rate(flutterpi->compositor));
+    uint64_t now = get_monotonic_time();
+    uint64_t ref = atomic_load(&vrx_vblank_flip_ns), period = atomic_load(&vrx_vblank_period_ns);
+    if (vrx_vsync && ref && period) {
+        req->vblank_ns = ref + (now > ref ? (now - ref) / period : 0) * period;
+        req->next_vblank_ns = req->vblank_ns + period;
+    } else {
+        static bool said;
+        if (vrx_vsync && !said) {
+            LOG_DEBUG("vrx: no vblank phase from the compositor yet; frames use the request time\n");
+            said = true;
+        }
+        req->vblank_ns = now;
+        req->next_vblank_ns = req->vblank_ns + (1000000000.0 / compositor_get_refresh_rate(flutterpi->compositor));
+    }
 
     if (flutterpi_runs_platform_tasks_on_current_thread(req->flutterpi)) {
         TRACER_INSTANT(req->flutterpi->tracer, "FlutterEngineOnVsync");
@@ -1355,7 +1378,9 @@ static FlutterEngine create_flutter_engine(
     project_args.update_semantics_custom_action_callback = NULL;
     project_args.persistent_cache_path = paths->asset_bundle_path;
     project_args.is_persistent_cache_read_only = false;
-    project_args.vsync_callback = NULL;  // on_frame_request, /* broken since 2.2, kinda *
+    // under the vrx compositor frames follow the panel's real vblank phase
+    // (plan 0014 D6); elsewhere the engine's own timer, as upstream
+    project_args.vsync_callback = vrx_vsync ? on_frame_request : NULL;
     project_args.custom_dart_entrypoint = NULL;
     project_args.custom_task_runners = &custom_task_runners;
     project_args.shutdown_dart_vm_when_done = true;
@@ -2049,6 +2074,12 @@ static void vrx_on_display(uint32_t on, void *userdata) {
     vrx_lifecycle_update();
 }
 
+static void vrx_on_vblank(uint64_t flip_ns, uint64_t period_ns, void *userdata) {
+    (void) userdata;
+    atomic_store(&vrx_vblank_period_ns, period_ns);
+    atomic_store(&vrx_vblank_flip_ns, flip_ns);
+}
+
 static void vrx_on_sleep(uint32_t sleeping, void *userdata) {
     (void) userdata;
     vrx_app.sleeping = sleeping != 0;
@@ -2204,6 +2235,7 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
         .on_back = vrx_on_back,
         .on_display = vrx_on_display,
         .on_sleep = vrx_on_sleep,
+        .on_vblank = vrx_on_vblank,
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to
@@ -2816,6 +2848,7 @@ struct flutterpi *flutterpi_new_from_args(int argc, char **argv) {
     }
 
     if (cmd_args.vrx_app) {
+        vrx_vsync = true;
         // The compositor decides the geometry, so connect before any window
         // exists. No compositor means nothing to show: refuse to start.
         if (renderer_type != kOpenGL_RendererType) {

@@ -22,6 +22,9 @@ struct vrx_app_client_callbacks {
     void (*on_display)(uint32_t on, void *userdata);
     // the system is about to sleep (1) or woke (0)
     void (*on_sleep)(uint32_t sleeping, void *userdata);
+    // the panel's vblank phase: a real flip's time and the refresh period
+    // (plan 0014 D6)
+    void (*on_vblank)(uint64_t flip_ns, uint64_t period_ns, void *userdata);
     void *userdata;
 };
 

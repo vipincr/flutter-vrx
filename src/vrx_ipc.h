@@ -99,6 +99,16 @@ enum vrx_msg_type {
     // a second for this (plan 0012 D14). The app saves what it must
     // (Flutter: AppLifecycleState.paused).
     VRX_MSG_SLEEP = 19,
+    // vrxhost -> comp: the profiler's switch (on = 1/0, plan 0014 D1, D5).
+    // While on, the compositor writes its flip record to ftrace's
+    // trace_marker: per-frame spans, drops by cause, input-to-screen.
+    VRX_MSG_PROFILING = 20,
+    // comp -> app: the panel's vblank phase (plan 0014 D6): the timestamp
+    // of a real flip (CLOCK_MONOTONIC) and the refresh period. The app
+    // answers the engine's frame requests with the last real vblank and
+    // the next, where it used the engine's timer-based guess. Sent on
+    // focus and then at most once a second while the app draws.
+    VRX_MSG_VBLANK = 21,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -184,6 +194,15 @@ struct vrx_msg_light_cap {
 
 struct vrx_msg_sleep {
     uint32_t sleeping;  // 0/1
+};
+
+struct vrx_msg_profiling {
+    uint32_t on;  // 0/1
+};
+
+struct vrx_msg_vblank {
+    uint64_t flip_ns;    // a real flip's timestamp, CLOCK_MONOTONIC
+    uint64_t period_ns;  // the refresh period
 };
 
 struct vrx_msg_app_state {

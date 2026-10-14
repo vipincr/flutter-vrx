@@ -37,6 +37,7 @@
 #include <inttypes.h>
 #include <libinput.h>
 #include <libudev.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,8 @@ struct app_client {
     pid_t pid;          // SO_PEERCRED at accept: who vrxhost spawned
     uid_t uid;
     bool registered;
+    uint64_t last_recv_ns;    // its previous frame's arrival (plan 0014 D5)
+    uint64_t vblank_sent_ns;  // when it was last told the vblank phase (D6)
     bool controller;    // this connection is vrxhost, not an app
     bool no_chrome;     // asked for the whole screen: the shell steps aside
                         // while it is focused
@@ -90,16 +93,30 @@ struct frame {
     int dmabuf_fd;
     uint32_t handle;    // GEM handle in the KMS device (from the dmabuf)
     uint32_t fb_id;
+    // the flip record (plan 0014 D5): when the buffer arrived, when the
+    // app's frame before it arrived (0 = none: a still screen), and when
+    // its flip was committed
+    uint64_t recv_ns, prev_recv_ns, commit_ns;
 };
 
 struct vrx_compositor {
     int drm_fd;
-    // VRX_TRACE_LATENCY=1: log input-to-screen latency per touch/key, the
-    // number a person feels as responsiveness (input sent → the app's next
-    // buffer arrives → that buffer is flipped onto the panel)
-    bool trace;
-    uint64_t trace_input_ns;   // the untraced input being answered, 0 = none
+    // the profiler's switch (plan 0014 D1, D5; vrxhost's VRX_MSG_PROFILING).
+    // While on, every flip is recorded on ftrace's trace_marker: each
+    // applet's arrival-to-screen time, the refreshes it skipped, drops by
+    // cause, and input-to-screen latency (input sent -> the app's next
+    // buffer -> its flip), the number a person feels as responsiveness
+    bool profiling;
+    int marker_fd;             // trace_marker, -1 = closed
+    uint64_t trace_input_ns;   // the input being answered, 0 = none
     uint64_t trace_buffer_ns;  // when the answering buffer arrived
+    // the panel's vblank phase (D5, D6), from flip events
+    bool flip_ts_monotonic;    // DRM_CAP_TIMESTAMP_MONOTONIC: events carry it
+    uint64_t period_ns;        // one refresh, from the mode's timings
+    uint32_t last_flip_seq;
+    uint64_t last_flip_ns;     // 0 = no flip yet (or reset by DPMS)
+    uint64_t drops_app, drops_compositor, drops_underrun, drops_unattributed;
+    uint64_t underruns_seen;
     bool logged_format;        // first frame's format/modifier logged
     uint32_t connector_id, crtc_id;
     char output[32];           // the connector's name, HDMI-A-1
@@ -211,6 +228,7 @@ struct vrx_compositor {
 };
 
 static void cursor_update(struct vrx_compositor *c);
+static uint64_t mode_period_ns(const drmModeModeInfo *m);
 static void repeat_arm(struct vrx_compositor *c, uint32_t key);
 
 static uint64_t now_ns(void) {
@@ -432,6 +450,12 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
         fprintf(stderr, "[vrx-compositor] DRMSetMaster failed: %s (another master owns the card?)\n",
                 strerror(errno));
     }
+    // flip events carry the vblank's CLOCK_MONOTONIC time where the driver
+    // says so (plan 0014 D5, D6); otherwise the record uses arrival time
+    uint64_t mono = 0;
+    c->flip_ts_monotonic = drmGetCap(c->drm_fd, DRM_CAP_TIMESTAMP_MONOTONIC, &mono) == 0 && mono;
+    fprintf(stderr, "[vrx-compositor] flip timestamps: %s\n",
+            c->flip_ts_monotonic ? "CLOCK_MONOTONIC (the vblank's own)" : "not monotonic: the record uses arrival time");
 
     drmModeRes *res = drmModeGetResources(c->drm_fd);
     if (!res) {
@@ -482,6 +506,7 @@ static int kms_init(struct vrx_compositor *c, const char *device) {
         fprintf(stderr, "[vrx-compositor] the panel is mounted upside down: scanning out turned 180 degrees\n");
     }
     c->mode = conn->modes[mi];
+    c->period_ns = mode_period_ns(&c->mode);
     c->width = c->mode.hdisplay;
     c->height = c->mode.vdisplay;
     c->width_mm = conn->mmWidth;
@@ -584,6 +609,7 @@ static void hold_changed(struct vrx_compositor *c, const char *why);
 // frame waits in `queued` for the wake, plan 0010 D5).
 static void flip_queued(struct vrx_compositor *c) {
     if (!c->queued.valid || c->pending.valid || c->dark) return;
+    c->queued.commit_ns = now_ns();
     if (!c->mode_set) {
         // the very first frame: one modeset, after which everything flips
         if (drmModeSetCrtc(c->drm_fd, c->crtc_id, c->queued.fb_id, 0, 0,
@@ -619,18 +645,145 @@ static void flip_queued(struct vrx_compositor *c) {
     c->queued.app = -1;
 }
 
+// ─── the flip record (plan 0014 D5, D6, D7) ─────────────────────────────
+
+// One line on ftrace's trace_marker, while profiling is on. Perfetto's
+// systrace importer reads `C|pid|name|value` as a counter track.
+static void marker(struct vrx_compositor *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void marker(struct vrx_compositor *c, const char *fmt, ...) {
+    if (!c->profiling || c->marker_fd < 0) return;
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n > 0 && write(c->marker_fd, line, (size_t) (n < (int) sizeof line ? n : (int) sizeof line - 1)) < 0) {
+        fprintf(stderr, "[vrx-compositor] trace_marker: %s; the flip record stops\n", strerror(errno));
+        close(c->marker_fd);
+        c->marker_fd = -1;
+    }
+}
+
+static void profiling_set(struct vrx_compositor *c, bool on) {
+    if (on == c->profiling) return;
+    c->profiling = on;
+    if (on) {
+        c->marker_fd = open("/sys/kernel/tracing/trace_marker", O_WRONLY | O_CLOEXEC);
+        if (c->marker_fd < 0) c->marker_fd = open("/sys/kernel/debug/tracing/trace_marker", O_WRONLY | O_CLOEXEC);
+        fprintf(stderr, "[vrx-compositor] profiling on: flip record %s\n",
+                c->marker_fd >= 0 ? "to trace_marker" : "not written (tracefs is not mounted)");
+        c->drops_app = c->drops_compositor = c->drops_underrun = c->drops_unattributed = 0;
+    } else {
+        if (c->marker_fd >= 0) close(c->marker_fd);
+        c->marker_fd = -1;
+        c->trace_input_ns = 0;
+        fprintf(stderr, "[vrx-compositor] profiling off\n");
+    }
+}
+
+// One refresh, from the mode's own timings (the vrefresh field rounds).
+static uint64_t mode_period_ns(const drmModeModeInfo *m) {
+    if (m->clock && m->htotal && m->vtotal) return (uint64_t) m->htotal * m->vtotal * 1000000ull / m->clock;
+    return 1000000000ull / (m->vrefresh ? m->vrefresh : 60);
+}
+
+// The vc4 HVS underrun count (debugfs); 0 where there is none.
+static uint64_t hvs_underruns(void) {
+    uint64_t total = 0;
+    for (int i = 0; i < 4; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/sys/kernel/debug/dri/%d/hvs_underrun", i);
+        FILE *f = fopen(path, "re");
+        if (!f) continue;
+        unsigned long long n = 0;
+        if (fscanf(f, "%llu", &n) == 1) total += n;
+        fclose(f);
+    }
+    return total;
+}
+
+// Tell an app the panel's vblank phase (D6): on focus, then at most once a
+// second while its frames flip (the phase does not drift; a message per
+// flip would only cost wakes).
+static void send_vblank(struct vrx_compositor *c, int slot, bool now) {
+    if (slot < 0 || slot >= MAX_APPS || !c->apps[slot].in_use || !c->apps[slot].registered || !c->last_flip_ns) return;
+    uint64_t t = now_ns();
+    if (!now && t - c->apps[slot].vblank_sent_ns < 1000000000ull) return;
+    c->apps[slot].vblank_sent_ns = t;
+    struct vrx_msg_vblank m = { .flip_ns = c->last_flip_ns, .period_ns = c->period_ns };
+    client_send(c, c->apps[slot].fd, VRX_MSG_VBLANK, &m, sizeof m, -1);
+}
+
+// A flip completed: record it (D5). A refresh counts as dropped only when
+// the sequence skipped while the frame's applet was producing frames
+// steadily (its previous frame came within three refreshes): a still
+// screen skips refreshes by design. The cause is named by when the frame
+// arrived and was committed against the deadline (the first vblank after
+// the previous flip): arrived late, the app was late; arrived in time but
+// committed late, the compositor was late; committed in time and the HVS
+// underrun count moved, an underrun.
+static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_t seq, uint64_t flip_ns) {
+    pid_t pid = getpid();
+    const char *id = f->app >= 0 && f->app < MAX_APPS ? c->apps[f->app].id : "gone";
+    if (c->last_flip_ns && c->period_ns && seq > c->last_flip_seq) {
+        uint32_t delta = seq - c->last_flip_seq;
+        uint64_t deadline = c->last_flip_ns + c->period_ns;
+        bool producing = f->prev_recv_ns && f->recv_ns - f->prev_recv_ns < 3 * c->period_ns;
+        marker(c, "C|%d|vrx.flip.seq_delta|%u", (int) pid, delta);
+        if (delta > 1 && producing) {
+            uint64_t underruns = hvs_underruns();
+            uint64_t skipped = delta - 1;
+            const char *cause;
+            if (f->recv_ns >= deadline) {
+                c->drops_app += skipped;
+                cause = "app_late";
+            } else if (f->commit_ns >= deadline) {
+                c->drops_compositor += skipped;
+                cause = "compositor_late";
+            } else if (underruns > c->underruns_seen) {
+                c->drops_underrun += skipped;
+                cause = "underrun";
+            } else {
+                c->drops_unattributed += skipped;
+                cause = "unattributed";
+            }
+            c->underruns_seen = underruns;
+            marker(c, "C|%d|vrx.dropped.%s|%llu", (int) pid, cause,
+                   (unsigned long long) (!strcmp(cause, "app_late") ? c->drops_app
+                                         : !strcmp(cause, "compositor_late") ? c->drops_compositor
+                                         : !strcmp(cause, "underrun") ? c->drops_underrun
+                                                                       : c->drops_unattributed));
+            marker(c, "C|%d|vrx.%s.dropped|%llu", (int) pid, id, (unsigned long long) skipped);
+        }
+    }
+    if (f->recv_ns && flip_ns > f->recv_ns) {
+        marker(c, "C|%d|vrx.%s.arrival_to_screen_us|%llu", (int) pid, id,
+               (unsigned long long) ((flip_ns - f->recv_ns) / 1000));
+    }
+    // input to screen (D7): the input this frame answered
+    if (c->trace_input_ns && c->trace_buffer_ns && flip_ns > c->trace_input_ns) {
+        marker(c, "C|%d|vrx.input_to_buffer_us|%llu", (int) pid,
+               (unsigned long long) ((c->trace_buffer_ns - c->trace_input_ns) / 1000));
+        marker(c, "C|%d|vrx.input_to_screen_us|%llu", (int) pid,
+               (unsigned long long) ((flip_ns - c->trace_input_ns) / 1000));
+        fprintf(stderr, "[vrx-compositor] latency: input→buffer %.1f ms, input→screen %.1f ms\n",
+                (double) (c->trace_buffer_ns - c->trace_input_ns) / 1e6,
+                (double) (flip_ns - c->trace_input_ns) / 1e6);
+        c->trace_input_ns = 0;
+    }
+    c->last_flip_seq = seq;
+    c->last_flip_ns = flip_ns;
+}
+
 // DRM says the requested flip happened: the old screen buffer is free.
 static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
                          unsigned int usec, void *data) {
-    (void) fd; (void) seq; (void) sec; (void) usec;
+    (void) fd;
     struct vrx_compositor *c = data;
-    if (c->trace && c->trace_input_ns && c->trace_buffer_ns) {
-        uint64_t now = now_ns();
-        fprintf(stderr, "[vrx-compositor] latency: input→buffer %.1f ms, input→screen %.1f ms\n",
-                (double) (c->trace_buffer_ns - c->trace_input_ns) / 1e6,
-                (double) (now - c->trace_input_ns) / 1e6);
-        c->trace_input_ns = 0;
-    }
+    // the event's timestamp is the vblank's, when the driver stamps with
+    // CLOCK_MONOTONIC; otherwise now is the nearest honest time
+    uint64_t flip_ns = c->flip_ts_monotonic ? (uint64_t) sec * 1000000000ull + (uint64_t) usec * 1000ull : now_ns();
+    flip_record(c, &c->pending, seq, flip_ns);
     if (c->on_screen.app_fd != c->pending.app_fd) {
         fprintf(stderr, "[vrx-compositor] screen switched to slot %d ('%s')\n", c->pending.app,
                 c->pending.app >= 0 ? c->apps[c->pending.app].id : "?");
@@ -646,6 +799,8 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
         c->light_after_flip = false;
         screen_light(c);
     }
+    send_vblank(c, c->on_screen.app, false);
+    send_vblank(c, c->shell, false);
     flip_queued(c);
 }
 
@@ -819,6 +974,7 @@ static void focus_slot(struct vrx_compositor *c, int slot) {
     // has nothing new to draw), which is what flips the screen to it
     client_send(c, c->apps[slot].fd, VRX_MSG_FOCUS,
                 &(struct vrx_msg_focus){ .focused = 1 }, sizeof(struct vrx_msg_focus), -1);
+    send_vblank(c, slot, true);
 }
 
 // Apply the controller's choice if that app is here; if it has not
@@ -888,7 +1044,8 @@ static void client_handle(struct vrx_compositor *c, int slot,
     // a connection is an app (REGISTER) or the controller (CONTROL), once
     bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME;
     if ((app_msg && !a->registered) ||
-        ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL || h->type == VRX_MSG_LIGHT_CAP) &&
+        ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL || h->type == VRX_MSG_LIGHT_CAP ||
+          h->type == VRX_MSG_PROFILING) &&
          !a->controller) ||
         (h->type == VRX_MSG_SHELL_REGION && !a->registered) ||
         (h->type == VRX_MSG_BACK && slot != c->shell) ||
@@ -947,6 +1104,12 @@ static void client_handle(struct vrx_compositor *c, int slot,
             apply_want_shell(c);
             break;
         }
+        case VRX_MSG_PROFILING: {
+            struct vrx_msg_profiling *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            profiling_set(c, m->on != 0);
+            break;
+        }
         case VRX_MSG_LIGHT_CAP: {
             struct vrx_msg_light_cap *m = payload;
             if (h->length < sizeof *m) goto bad;
@@ -988,10 +1151,13 @@ static void client_handle(struct vrx_compositor *c, int slot,
         case VRX_MSG_BUFFER: {
             struct vrx_msg_buffer *b = payload;
             if (h->length < sizeof *b || fd < 0) goto bad;
+            uint64_t arrived = now_ns();
             struct frame f = {
                 .valid = true, .app = slot, .app_fd = a->fd,
                 .sequence = b->sequence, .dmabuf_fd = fd,
+                .recv_ns = arrived, .prev_recv_ns = a->last_recv_ns,
             };
+            a->last_recv_ns = arrived;
             fd = -1;  // the frame owns it now
             if (slot == c->shell) {
                 // the shell's plane: a legacy SetPlane on an atomic driver
@@ -1012,7 +1178,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
                 frame_release(c, &f);
                 break;
             }
-            if (c->trace && c->trace_input_ns && !c->trace_buffer_ns) c->trace_buffer_ns = now_ns();
+            if (c->profiling && c->trace_input_ns && !c->trace_buffer_ns) c->trace_buffer_ns = now_ns();
             // newest wins: a frame still waiting for the flip slot is
             // superseded and returned
             frame_release(c, &c->queued);
@@ -1506,6 +1672,9 @@ static void display_off(struct vrx_compositor *c, const char *why) {
     if (c->dark) return;
     c->dark = true;
     c->light_after_flip = false;
+    // the sequence counter is not meaningful across an off CRTC: the next
+    // flip starts the record again instead of counting the dark as drops
+    c->last_flip_ns = 0;
     backlight_set(c, 0);
     if (c->dpms_prop && c->mode_set &&
         drmModeConnectorSetProperty(c->drm_fd, c->connector_id, c->dpms_prop, DRM_MODE_DPMS_OFF) != 0) {
@@ -2103,7 +2272,7 @@ static void send_input(struct vrx_compositor *c, const struct vrx_msg_input *m) 
     client_send(c, c->apps[target].fd, VRX_MSG_INPUT, m, sizeof *m, -1);
     bool press = (m->kind == VRX_INPUT_TOUCH && m->u.touch.kind == 0) ||
                  (m->kind == VRX_INPUT_KEY && m->u.key.state == 1);
-    if (c->trace && press) {
+    if (c->profiling && press) {
         c->trace_input_ns = now_ns();
         c->trace_buffer_ns = 0;
     }
@@ -2325,7 +2494,7 @@ int vrx_compositor_main(int argc, char **argv) {
         if (i + 1 < argc && !strcmp(argv[i], "--device")) device = argv[++i];
     }
     struct vrx_compositor c = {0};
-    c.trace = getenv("VRX_TRACE_LATENCY") != NULL;
+    c.marker_fd = -1;
     c.focused = -1;
     c.controller = -1;
     c.shell = -1;
