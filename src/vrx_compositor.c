@@ -173,6 +173,8 @@ struct vrx_compositor {
     // planes scan out turned, touch is turned back, the cursor drawn turned
     bool upside_down;
     bool dark;                 // the screen is off
+    struct vrx_msg_screen reported_screen;  // the last VRX_MSG_SCREEN sent
+    bool reported_screen_valid;
     bool light_after_flip;     // waking: light once the newest frame is up
     bool was_held;             // an app held the screen on, last we looked
     // holds are logind's idle inhibitors (plan 0010 D3): the pids holding
@@ -613,6 +615,9 @@ static bool frame_import(struct vrx_compositor *c, struct frame *f,
 
 static void shell_show(struct vrx_compositor *c);
 static void screen_light(struct vrx_compositor *c);
+static void screen_report(struct vrx_compositor *c);
+static void display_on(struct vrx_compositor *c, const char *why);
+static void display_off(struct vrx_compositor *c, const char *why);
 static void display_tell(struct vrx_compositor *c, int only);
 static void hold_changed(struct vrx_compositor *c, const char *why);
 
@@ -1188,7 +1193,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
                    h->type == VRX_MSG_SEMANTICS_TREE;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL || h->type == VRX_MSG_LIGHT_CAP ||
-          h->type == VRX_MSG_PROFILING || h->type == VRX_MSG_SEMANTICS) &&
+          h->type == VRX_MSG_PROFILING || h->type == VRX_MSG_SEMANTICS || h->type == VRX_MSG_SCREEN) &&
          !a->controller) ||
         (h->type == VRX_MSG_SHELL_REGION && !a->registered) ||
         (h->type == VRX_MSG_BACK && slot != c->shell) ||
@@ -1233,6 +1238,25 @@ static void client_handle(struct vrx_compositor *c, int slot,
             for (int i = 0; i < MAX_APPS; i++) {
                 if (c->apps[i].in_use && c->apps[i].registered) report_app(c, &c->apps[i], VRX_APP_REGISTERED);
             }
+            // a new controller knows nothing: the screen as it is now
+            c->reported_screen_valid = false;
+            screen_report(c);
+            break;
+        }
+        case VRX_MSG_SCREEN: {
+            struct vrx_msg_screen *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            if (m->on) {
+                display_on(c, "matter");
+            } else if (c->wake_devices > 0) {
+                display_off(c, "matter");
+            } else {
+                // the idle timeout's rule (plan 0010 D10): never dark with
+                // nothing a person can wake it with
+                fprintf(stderr, "[vrx-compositor] screen off refused (matter): nothing can wake it\n");
+            }
+            // the answer either way: what the screen is now
+            screen_report(c);
             break;
         }
         case VRX_MSG_SET_FOCUS: {
@@ -1679,6 +1703,25 @@ static void screen_light(struct vrx_compositor *c) {
     backlight_set(c, light_level(c));
 }
 
+// The brightness as a position (0-100) the way the kit's slider reads it,
+// -1 where the screen cannot dim.
+static int screen_position(const struct vrx_compositor *c) {
+    if (c->dim == DIM_BACKLIGHT) return c->bl_max > 0 ? (100 * c->bl_level + c->bl_max / 2) / c->bl_max : -1;
+    if (c->dim == DIM_ALPHA) return c->brightness < 0 ? 100 : c->brightness;
+    return -1;
+}
+
+// Tell the controller what the screen is now (vrx plan 0015 D12): its
+// facts carry it to Matter. Sent only on a change.
+static void screen_report(struct vrx_compositor *c) {
+    if (c->controller < 0) return;
+    struct vrx_msg_screen m = { .on = !c->dark, .position = screen_position(c) };
+    if (c->reported_screen_valid && m.on == c->reported_screen.on && m.position == c->reported_screen.position) return;
+    c->reported_screen = m;
+    c->reported_screen_valid = true;
+    client_send(c, c->apps[c->controller].fd, VRX_MSG_SCREEN, &m, sizeof m, -1);
+}
+
 static int on_prepare_for_sleep(sd_bus_message *m, void *userdata, sd_bus_error *ret_error);
 static void sleep_delay_take(struct vrx_compositor *c);
 static void cascade_arm(struct vrx_compositor *c);
@@ -1792,6 +1835,7 @@ static void backlight_changed(struct vrx_compositor *c) {
         backlight_set(c, backlight_floor(c));
         c->bl_level = backlight_floor(c);
     }
+    screen_report(c);
 }
 
 // Stopping (shutdown, a restart): the light goes back to its level first,
@@ -1847,6 +1891,7 @@ static void display_off(struct vrx_compositor *c, const char *why) {
     fprintf(stderr, "[vrx-compositor] screen off (%s)\n", why);
     c->refusal_logged = false;
     cascade_arm(c);
+    screen_report(c);
 }
 
 // The panel first, then the newest frame, then the light once that frame
@@ -1868,6 +1913,7 @@ static void display_on(struct vrx_compositor *c, const char *why) {
     idle_arm(c);
     cascade_disarm(c);
     fprintf(stderr, "[vrx-compositor] screen on (%s)\n", why);
+    screen_report(c);
 }
 
 // A hold that starts counting wakes the screen; one that stops counting
@@ -2008,6 +2054,7 @@ static void screen_read_conf(struct vrx_compositor *c) {
         }
         c->brightness = brightness;
         screen_light(c);
+        screen_report(c);
     }
     idle_arm(c);
 }

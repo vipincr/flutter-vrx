@@ -118,6 +118,12 @@ enum vrx_msg_type {
     // riding the message), written by the compositor to
     // /run/vrx-ui/semantics/<app id>.json for the walk driver.
     VRX_MSG_SEMANTICS_TREE = 23,
+    // vrxhost -> comp: turn the screen on (on = 1) or off (0), a home app's
+    // On/Off through Matter (vrx plan 0015 D12); the same off the idle
+    // timeout takes, refused where nothing can wake the screen again.
+    // comp -> vrxhost: the screen went on or off, or its brightness moved
+    // (position 0-100, -1 where it cannot dim); sent on CONTROL too.
+    VRX_MSG_SCREEN = 24,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -211,6 +217,11 @@ struct vrx_msg_profiling {
 
 struct vrx_msg_semantics {
     uint32_t on;  // 0/1
+};
+
+struct vrx_msg_screen {
+    uint32_t on;       // 0/1
+    int32_t position;  // comp -> vrxhost only: 0-100, -1 = cannot dim
 };
 
 struct vrx_msg_semantics_tree {
