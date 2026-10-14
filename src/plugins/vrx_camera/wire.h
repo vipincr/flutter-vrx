@@ -70,6 +70,12 @@ size_t vrx_camera_format_open_call(const char *to, const char *channel, char *bu
 /// `out`; false when the message has no "error" key.
 bool vrx_camera_varlink_error(const char *msg, size_t len, char *out, size_t cap);
 
+/// camerad decides exclusivity after vrxhost's Open succeeded, so a refused
+/// claimant's first line is a bare {"error":"busy"} (or "disabled",
+/// "no-camera", "failed"), not an offer. True, with the name in `out`, for a
+/// line that has an "error" key and no "buffers".
+bool vrx_camera_stream_error(const char *line, size_t len, char *out, size_t cap);
+
 /// Map a Varlink error name (or an offer problem) to the short code Dart
 /// sees in PlatformException.code.
 const char *vrx_camera_error_code(const char *varlink_error);

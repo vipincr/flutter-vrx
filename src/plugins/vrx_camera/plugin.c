@@ -421,6 +421,12 @@ static bool read_offer(struct session *s, struct vrx_camera_lines *lines, char *
         char rec[1024];
         size_t rec_len;
         if (vrx_camera_lines_next(lines, rec, sizeof rec, &rec_len)) {
+            char err[48];
+            if (vrx_camera_stream_error(rec, rec_len, err, sizeof err)) {
+                snprintf(code, code_cap, "%s", vrx_camera_error_code(err));
+                snprintf(message, message_cap, "camerad refused: %s", err);
+                return false;
+            }
             if (vrx_camera_parse_offer(rec, rec_len, &s->offer) != VRX_CAMERA_PARSE_OK) {
                 snprintf(code, code_cap, "bad-offer");
                 snprintf(message, message_cap, "camerad's first record is not a buffer offer");

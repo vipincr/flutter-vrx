@@ -170,6 +170,10 @@ const char *vrx_camera_error_code(const char *e) {
         { "Busy", "busy" },
         { "Disabled", "disabled" },
         { "NotAnApplet", "not-permitted" },
+        // camerad's own first line on the stream: {"error":"busy"}
+        { "busy", "busy" },
+        { "disabled", "disabled" },
+        { "no-camera", "unavailable" },
     };
     const char *dot = strrchr(e, '.');
     const char *name = dot ? dot + 1 : e;
@@ -214,4 +218,8 @@ bool vrx_camera_lines_next(struct vrx_camera_lines *l, char *out, size_t cap, si
         return true;
     }
     return false;
+}
+
+bool vrx_camera_stream_error(const char *line, size_t len, char *out, size_t cap) {
+    return find_key(line, len, "buffers") == NULL && vrx_camera_varlink_error(line, len, out, cap);
 }

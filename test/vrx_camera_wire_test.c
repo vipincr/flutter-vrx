@@ -112,6 +112,28 @@ void test_varlink_errors_map_to_short_codes() {
     TEST_ASSERT_FALSE(vrx_camera_varlink_error(STR(ok), err, sizeof err));
 }
 
+void test_camerad_refusals_on_the_stream_map_to_codes() {
+    char err[48];
+    const char *busy = "{\"error\":\"busy\"}";
+    TEST_ASSERT_TRUE(vrx_camera_stream_error(STR(busy), err, sizeof err));
+    TEST_ASSERT_EQUAL_STRING("busy", err);
+    TEST_ASSERT_EQUAL_STRING("busy", vrx_camera_error_code(err));
+    const char *disabled = "{\"error\":\"disabled\"}";
+    TEST_ASSERT_TRUE(vrx_camera_stream_error(STR(disabled), err, sizeof err));
+    TEST_ASSERT_EQUAL_STRING("disabled", vrx_camera_error_code(err));
+    const char *nocam = "{\"error\":\"no-camera\"}";
+    TEST_ASSERT_TRUE(vrx_camera_stream_error(STR(nocam), err, sizeof err));
+    TEST_ASSERT_EQUAL_STRING("unavailable", vrx_camera_error_code(err));
+    const char *failed = "{\"error\":\"failed\"}";
+    TEST_ASSERT_TRUE(vrx_camera_stream_error(STR(failed), err, sizeof err));
+    TEST_ASSERT_EQUAL_STRING("failed", vrx_camera_error_code(err));
+    // an offer is not a refusal, even if some field were named error
+    const char *offer = "{\"buffers\":4,\"size\":4096,\"error\":\"x\"}";
+    TEST_ASSERT_FALSE(vrx_camera_stream_error(STR(offer), err, sizeof err));
+    const char *filled = "{\"index\":1,\"bytes\":2,\"sequence\":3}";
+    TEST_ASSERT_FALSE(vrx_camera_stream_error(STR(filled), err, sizeof err));
+}
+
 void test_lines_split_across_reads_and_merged_in_one() {
     struct vrx_camera_lines l;
     char out[64];
@@ -157,6 +179,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_return_record_is_one_line);
     RUN_TEST(test_open_call_ends_in_a_nul);
     RUN_TEST(test_varlink_errors_map_to_short_codes);
+    RUN_TEST(test_camerad_refusals_on_the_stream_map_to_codes);
     RUN_TEST(test_lines_split_across_reads_and_merged_in_one);
     RUN_TEST(test_nul_delimited_varlink_messages);
     RUN_TEST(test_overflow_is_refused);
