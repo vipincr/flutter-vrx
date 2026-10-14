@@ -1871,6 +1871,7 @@ static struct {
     // what Flutter is told about being seen (plan 0010 D4, plan 0011 D3)
     bool unfocused;     // the compositor took focus away (FOCUS 0)
     bool screen_off;    // the compositor turned the screen off
+    bool sleeping;      // the system is about to sleep (PrepareForSleep)
     const char *lifecycle;  // the state last sent, NULL = none yet
     int etc_watch;      // inotify on /etc for locale.conf, -1 = none
 } vrx_app = { .etc_watch = -1 };
@@ -1989,10 +1990,14 @@ static void vrx_on_input(const struct vrx_msg_input *in, void *userdata) {
 // start sends the current state.
 static void vrx_lifecycle_update(void) {
     if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
-    const char *state = vrx_app.unfocused || vrx_app.screen_off ? "AppLifecycleState.hidden" : "AppLifecycleState.resumed";
+    // about to sleep: paused, so the app saves (plan 0012 D14); otherwise
+    // hidden while unfocused or dark, resumed when it is seen
+    const char *state = vrx_app.sleeping ? "AppLifecycleState.paused"
+                        : vrx_app.unfocused || vrx_app.screen_off ? "AppLifecycleState.hidden"
+                                                                  : "AppLifecycleState.resumed";
     if (state == vrx_app.lifecycle) return;
     // the first message is only needed when it is not the default
-    if (vrx_app.lifecycle == NULL && !vrx_app.unfocused && !vrx_app.screen_off) {
+    if (vrx_app.lifecycle == NULL && !vrx_app.unfocused && !vrx_app.screen_off && !vrx_app.sleeping) {
         vrx_app.lifecycle = state;
         return;
     }
@@ -2041,6 +2046,12 @@ static void vrx_on_back(void *userdata) {
 static void vrx_on_display(uint32_t on, void *userdata) {
     (void) userdata;
     vrx_app.screen_off = !on;
+    vrx_lifecycle_update();
+}
+
+static void vrx_on_sleep(uint32_t sleeping, void *userdata) {
+    (void) userdata;
+    vrx_app.sleeping = sleeping != 0;
     vrx_lifecycle_update();
 }
 
@@ -2192,6 +2203,7 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
         .on_insets = vrx_on_insets,
         .on_back = vrx_on_back,
         .on_display = vrx_on_display,
+        .on_sleep = vrx_on_sleep,
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to

@@ -89,6 +89,16 @@ enum vrx_msg_type {
     // REGISTER too while it is off. The app stops drawing while it is off
     // (Flutter: AppLifecycleState.hidden, plan 0010 D4).
     VRX_MSG_DISPLAY = 17,
+    // vrxhost -> comp: cap the screen's brightness at `permille` of the
+    // range above the floor (1000 = no cap) without touching the stored
+    // setting: the battery's WARN zone (plan 0012 D10). The compositor
+    // stays the light's one owner.
+    VRX_MSG_LIGHT_CAP = 18,
+    // comp -> app: the system is about to sleep (sleeping = 1) or woke (0),
+    // from logind's PrepareForSleep, which the compositor delays by up to
+    // a second for this (plan 0012 D14). The app saves what it must
+    // (Flutter: AppLifecycleState.paused).
+    VRX_MSG_SLEEP = 19,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -166,6 +176,14 @@ struct vrx_msg_chrome {
 
 struct vrx_msg_display {
     uint32_t on;  // 0/1
+};
+
+struct vrx_msg_light_cap {
+    uint32_t permille;  // 0-1000 of the range above the floor; 1000 = none
+};
+
+struct vrx_msg_sleep {
+    uint32_t sleeping;  // 0/1
 };
 
 struct vrx_msg_app_state {

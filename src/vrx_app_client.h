@@ -20,6 +20,8 @@ struct vrx_app_client_callbacks {
     void (*on_back)(void *userdata);
     // the screen went off (0) or came back (1)
     void (*on_display)(uint32_t on, void *userdata);
+    // the system is about to sleep (1) or woke (0)
+    void (*on_sleep)(uint32_t sleeping, void *userdata);
     void *userdata;
 };
 

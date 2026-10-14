@@ -246,6 +246,11 @@ bool vrx_app_client_dispatch(struct vrx_app_client *c,
                 cb->on_display(((struct vrx_msg_display *) p)->on, cb->userdata);
             }
             break;
+        case VRX_MSG_SLEEP:
+            if (h.length >= sizeof(struct vrx_msg_sleep) && cb && cb->on_sleep) {
+                cb->on_sleep(((struct vrx_msg_sleep *) p)->sleeping, cb->userdata);
+            }
+            break;
         case VRX_MSG_SHUTDOWN:
             alive = false;
             break;
