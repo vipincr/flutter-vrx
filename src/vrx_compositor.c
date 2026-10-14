@@ -182,7 +182,7 @@ struct vrx_compositor {
     int n_inhibitors;
     struct udev_monitor *bl_mon;  // the backlight's change events
     int bl_level;              // the backlight's level while lit, as set
-    int sig_fd;                // SIGTERM / SIGINT
+    int sig_fd;                // SIGTERM / SIGINT stop; SIGUSR1 writes the flip ring
     int wake_devices;          // touch screens, pointers, keyboards present
     // input facts for the kit (plan 0013 D6, D7): touchscreens and
     // keyboards present, by udev's classification; a device's kinds are
@@ -732,8 +732,12 @@ static void marker(struct vrx_compositor *c, const char *fmt, ...) {
     }
 }
 
+static void flip_ring_dump(const char *why);
+
 static void profiling_set(struct vrx_compositor *c, bool on) {
     if (on == c->profiling) return;
+    // what happened before the switch: the ring's last 60 s
+    if (on) flip_ring_dump("profiling switched on");
     c->profiling = on;
     if (on) {
         c->marker_fd = open("/sys/kernel/tracing/trace_marker", O_WRONLY | O_CLOEXEC);
@@ -782,6 +786,74 @@ static void send_vblank(struct vrx_compositor *c, int slot, bool now) {
     client_send(c, c->apps[slot].fd, VRX_MSG_VBLANK, &m, sizeof m, -1);
 }
 
+// The flip ring (plan 0014 D5): the last 60 s of flips, kept whether or
+// not profiling is on, so a walk or a person who saw a stutter can ask for
+// what just happened. A static array written in place per flip: no
+// allocation and a few stores per frame. SIGUSR1 (or switching profiling
+// on) writes it to /run/vrx-ui/flips, oldest first.
+#define FLIP_RING_LEN 8192        // 60 s at up to 120 Hz, with margin
+#define FLIP_RING_NS (60ull * 1000000000ull)
+#define FLIP_RING_FILE VRX_UI_SOCKET_DIR "/flips"
+enum flip_cause { FLIP_OK, FLIP_APP_LATE, FLIP_COMPOSITOR_LATE, FLIP_UNDERRUN, FLIP_UNATTRIBUTED };
+static const char *const flip_cause_name[] = { "ok", "app_late", "compositor_late", "underrun", "unattributed" };
+struct flip_entry {
+    uint64_t flip_ns, recv_ns, commit_ns;
+    uint32_t seq, delta, skipped;
+    uint8_t cause;
+    char id[23];
+};
+static struct flip_entry flip_ring[FLIP_RING_LEN];
+static uint32_t flip_ring_next, flip_ring_count;
+
+static void flip_ring_push(const struct frame *f, const char *id, uint32_t seq, uint32_t delta,
+                           uint32_t skipped, enum flip_cause cause, uint64_t flip_ns) {
+    struct flip_entry *e = &flip_ring[flip_ring_next];
+    e->flip_ns = flip_ns;
+    e->recv_ns = f->recv_ns;
+    e->commit_ns = f->commit_ns;
+    e->seq = seq;
+    e->delta = delta;
+    e->skipped = skipped;
+    e->cause = (uint8_t) cause;
+    size_t n = strnlen(id, sizeof e->id - 1);
+    memcpy(e->id, id, n);
+    e->id[n] = 0;
+    flip_ring_next = (flip_ring_next + 1) % FLIP_RING_LEN;
+    if (flip_ring_count < FLIP_RING_LEN) flip_ring_count++;
+}
+
+// The ring's last 60 s, oldest first, to /run/vrx-ui/flips (a new file
+// renamed over the old, so a reader never sees half of one).
+static void flip_ring_dump(const char *why) {
+    char tmp[] = FLIP_RING_FILE ".tmp";
+    FILE *out = fopen(tmp, "we");
+    if (!out) {
+        fprintf(stderr, "[vrx-compositor] %s: %s\n", tmp, strerror(errno));
+        return;
+    }
+    uint32_t first = (flip_ring_next + FLIP_RING_LEN - flip_ring_count) % FLIP_RING_LEN;
+    uint64_t newest = flip_ring_count ? flip_ring[(flip_ring_next + FLIP_RING_LEN - 1) % FLIP_RING_LEN].flip_ns : 0;
+    fprintf(out, "# vrx flip ring (plan 0014 D5), the last 60 s, oldest first (%s)\n", why);
+    fprintf(out, "# flip_ns\tseq\tdelta\tskipped\tapp\tarrival_to_screen_us\tcommit_to_screen_us\tcause\n");
+    unsigned written = 0;
+    for (uint32_t i = 0; i < flip_ring_count; i++) {
+        const struct flip_entry *e = &flip_ring[(first + i) % FLIP_RING_LEN];
+        if (newest > FLIP_RING_NS && e->flip_ns < newest - FLIP_RING_NS) continue;
+        fprintf(out, "%" PRIu64 "\t%u\t%u\t%u\t%s\t%" PRIu64 "\t%" PRIu64 "\t%s\n", e->flip_ns, e->seq, e->delta,
+                e->skipped, e->id, e->recv_ns && e->flip_ns > e->recv_ns ? (e->flip_ns - e->recv_ns) / 1000 : 0,
+                e->commit_ns && e->flip_ns > e->commit_ns ? (e->flip_ns - e->commit_ns) / 1000 : 0,
+                flip_cause_name[e->cause]);
+        written++;
+    }
+    fclose(out);
+    chmod(tmp, 0644);
+    if (rename(tmp, FLIP_RING_FILE) != 0) {
+        fprintf(stderr, "[vrx-compositor] %s: %s\n", FLIP_RING_FILE, strerror(errno));
+        return;
+    }
+    fprintf(stderr, "[vrx-compositor] flip ring: %u flips to %s (%s)\n", written, FLIP_RING_FILE, why);
+}
+
 // A flip completed: record it (D5). A refresh counts as dropped only when
 // the sequence skipped while the frame's applet was producing frames
 // steadily (its previous frame came within three refreshes): a still
@@ -793,8 +865,10 @@ static void send_vblank(struct vrx_compositor *c, int slot, bool now) {
 static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_t seq, uint64_t flip_ns) {
     pid_t pid = getpid();
     const char *id = f->app >= 0 && f->app < MAX_APPS ? c->apps[f->app].id : "gone";
+    uint32_t delta = 0, skipped_ring = 0;
+    enum flip_cause cause_ring = FLIP_OK;
     if (c->last_flip_ns && c->period_ns && seq > c->last_flip_seq) {
-        uint32_t delta = seq - c->last_flip_seq;
+        delta = seq - c->last_flip_seq;
         uint64_t deadline = c->last_flip_ns + c->period_ns;
         bool producing = f->prev_recv_ns && f->recv_ns - f->prev_recv_ns < 3 * c->period_ns;
         marker(c, "C|%d|vrx.flip.seq_delta|%u", (int) pid, delta);
@@ -804,17 +878,19 @@ static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_
             const char *cause;
             if (f->recv_ns >= deadline) {
                 c->drops_app += skipped;
-                cause = "app_late";
+                cause_ring = FLIP_APP_LATE;
             } else if (f->commit_ns >= deadline) {
                 c->drops_compositor += skipped;
-                cause = "compositor_late";
+                cause_ring = FLIP_COMPOSITOR_LATE;
             } else if (underruns > c->underruns_seen) {
                 c->drops_underrun += skipped;
-                cause = "underrun";
+                cause_ring = FLIP_UNDERRUN;
             } else {
                 c->drops_unattributed += skipped;
-                cause = "unattributed";
+                cause_ring = FLIP_UNATTRIBUTED;
             }
+            cause = flip_cause_name[cause_ring];
+            skipped_ring = (uint32_t) skipped;
             c->underruns_seen = underruns;
             marker(c, "C|%d|vrx.dropped.%s|%llu", (int) pid, cause,
                    (unsigned long long) (!strcmp(cause, "app_late") ? c->drops_app
@@ -836,6 +912,7 @@ static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_
                (unsigned long long) ((flip_ns - c->trace_input_ns) / 1000));
         c->trace_input_ns = 0;
     }
+    flip_ring_push(f, id, seq, delta, skipped_ring, cause_ring, flip_ns);
     c->last_flip_seq = seq;
     c->last_flip_ns = flip_ns;
 }
@@ -1719,9 +1796,14 @@ static void backlight_changed(struct vrx_compositor *c) {
 
 // Stopping (shutdown, a restart): the light goes back to its level first,
 // so systemd-backlight saves the person's brightness, not the idle 0.
+// SIGUSR1: write the flip ring (plan 0014 D5) and carry on.
 static void on_stop(struct vrx_compositor *c) {
     struct signalfd_siginfo si;
     if (read(c->sig_fd, &si, sizeof si) != sizeof si) return;
+    if (si.ssi_signo == SIGUSR1) {
+        flip_ring_dump("SIGUSR1");
+        return;
+    }
     if (c->dark) backlight_set(c, light_level(c));
     fprintf(stderr, "[vrx-compositor] stopping (signal %u)\n", si.ssi_signo);
     c->running = false;
@@ -2706,6 +2788,7 @@ int vrx_compositor_main(int argc, char **argv) {
     sigemptyset(&stop);
     sigaddset(&stop, SIGTERM);
     sigaddset(&stop, SIGINT);
+    sigaddset(&stop, SIGUSR1);
     sigprocmask(SIG_BLOCK, &stop, NULL);
     c.sig_fd = signalfd(-1, &stop, SFD_CLOEXEC | SFD_NONBLOCK);
     if (c.sig_fd >= 0) {
