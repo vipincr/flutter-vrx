@@ -36,6 +36,8 @@ option(TRY_BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN "Don't throw an error if the gstr
 option(BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN "Include the gstreamer based audio plugins in the finished binary." ON)
 option(TRY_BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN "Don't throw an error if the gstreamer libs aren't found, instead just don't build gstreamer audio plugin." ON)
 
+option(BUILD_CAMERA_PLUGIN "Include the vrx camera plugin (plan 0018): camerad's viewfinder frames as a Flutter external texture, dmabuf import with a counted copy fallback. Needs EGL and OpenGL ES2." OFF)
+
 option(BUILD_SENTRY_PLUGIN "Include the sentry plugin in the finished binary. Allows for crash reporting to sentry.io." OFF)
 
 option(BUILD_CHARSET_CONVERTER_PLUGIN "Include the charset converter plugin in the finished binary." OFF)
@@ -308,6 +310,10 @@ endif()
 if (BUILD_TEST_PLUGIN)
   target_sources(flutterpi_module PRIVATE src/plugins/testplugin.c)
 endif()
+# One EGL dmabuf import for every plugin that needs it (gstreamer video
+# player, vrx camera); added once, below, where either is built.
+set(NEED_EGL_DMABUF OFF)
+
 if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
   if (NOT HAVE_EGL_GLES2)
     message(NOTICE "EGL and OpenGL ES2 are required for gstreamer video player. Gstreamer video player plugin won't be build.")
@@ -339,6 +345,7 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
         src/plugins/gstreamer_video_player/player.c
         src/plugins/gstreamer_video_player/frame.c
       )
+      set(NEED_EGL_DMABUF ON)
       target_link_libraries(flutterpi_module PUBLIC
         PkgConfig::LIBGSTREAMER
         PkgConfig::LIBGSTREAMER_PLUGINS_BASE
@@ -350,6 +357,22 @@ if (BUILD_GSTREAMER_VIDEO_PLAYER_PLUGIN)
       message(NOTICE "Couldn't find gstreamer libraries. Gstreamer video player plugin won't be build.")
     endif()
   endif()
+endif()
+
+if (BUILD_CAMERA_PLUGIN)
+  if (NOT HAVE_EGL_GLES2)
+    message(SEND_ERROR "The camera plugin needs EGL and OpenGL ES2 (BUILD_CAMERA_PLUGIN=ON but none was found).")
+  else()
+    target_sources(flutterpi_module PRIVATE
+      src/plugins/vrx_camera/plugin.c
+      src/plugins/vrx_camera/wire.c
+    )
+    set(NEED_EGL_DMABUF ON)
+  endif()
+endif()
+
+if (NEED_EGL_DMABUF)
+  target_sources(flutterpi_module PRIVATE src/egl_dmabuf.c)
 endif()
 
 if (BUILD_GSTREAMER_AUDIO_PLAYER_PLUGIN)
@@ -401,6 +424,7 @@ if (BUILD_SENTRY_PLUGIN)
     target_link_libraries(flutter-pi PUBLIC ${handler_deps})
   endif()
 endif()
+message(STATUS "Camera plugin .......... ${BUILD_CAMERA_PLUGIN}")
 message(STATUS "Sentry plugin .......... ${BUILD_SENTRY_PLUGIN}")
 message(STATUS "Bundle crashpad_handler  ${HAVE_BUNDLED_CRASHPAD_HANDLER}")
 

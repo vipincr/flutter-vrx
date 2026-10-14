@@ -10,6 +10,7 @@
 #include <gst/allocators/allocators.h>
 #include <gst/video/video.h>
 
+#include "egl_dmabuf.h"
 #include "flutter-pi.h"
 #include "texture_registry.h"
 
@@ -19,7 +20,7 @@
 #include "util/logging.h"
 #include "util/refcounting.h"
 
-#define MAX_N_PLANES 4
+#define MAX_N_PLANES EGL_DMABUF_MAX_PLANES
 
 #define GSTREAMER_VER(major, minor, patch) ((((major) &0xFF) << 16) | (((minor) &0xFF) << 8) | ((patch) &0xFF))
 #define THIS_GSTREAMER_VER GSTREAMER_VER(LIBGSTREAMER_VERSION_MAJOR, LIBGSTREAMER_VERSION_MINOR, LIBGSTREAMER_VERSION_PATCH)
@@ -37,307 +38,11 @@ struct video_frame {
     int n_dmabuf_fds;
     int dmabuf_fds[MAX_N_PLANES];
 
-    EGLImageKHR image;
+    struct egl_dmabuf_image image;
     size_t width, height;
 
     struct gl_texture_frame gl_frame;
 };
-
-struct frame_interface {
-    struct gbm_device *gbm_device;
-    EGLDisplay display;
-
-    pthread_mutex_t context_lock;
-    EGLContext context;
-
-    PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
-    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
-
-    bool supports_external_target;
-    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
-
-    bool supports_extended_imports;
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-    PFNEGLQUERYDMABUFFORMATSEXTPROC eglQueryDmaBufFormatsEXT;
-    PFNEGLQUERYDMABUFMODIFIERSEXTPROC eglQueryDmaBufModifiersEXT;
-#endif
-
-    int n_formats;
-    struct egl_modified_format *formats;
-
-    refcount_t n_refs;
-};
-
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-static bool query_formats(
-    EGLDisplay display,
-    PFNEGLQUERYDMABUFFORMATSEXTPROC egl_query_dmabuf_formats,
-    PFNEGLQUERYDMABUFMODIFIERSEXTPROC egl_query_dmabuf_modifiers,
-    int *n_formats_out,
-    struct egl_modified_format **formats_out
-) {
-    // EGLuint64KHR is defined by EGL_KHR_stream
-    #ifndef EGL_KHR_stream
-        #error "EGL header definitions for extension EGL_KHR_stream are required."
-    #endif
-
-    struct egl_modified_format *modified_formats;
-    EGLBoolean *external_only;
-    EGLuint64KHR *modifiers;
-    EGLint *formats;
-    EGLint egl_ok, n_modifiers;
-    int n_formats, n_modified_formats, max_n_modifiers;
-
-    egl_ok = egl_query_dmabuf_formats(display, 0, NULL, &n_formats);
-    if (egl_ok != EGL_TRUE) {
-        LOG_ERROR("Could not query number of dmabuf formats supported by EGL.\n");
-        goto fail;
-    }
-
-    formats = malloc(n_formats * sizeof *formats);
-    if (formats == NULL) {
-        goto fail;
-    }
-
-    egl_ok = egl_query_dmabuf_formats(display, n_formats, formats, &n_formats);
-    if (egl_ok != EGL_TRUE) {
-        LOG_ERROR("Could not query dmabuf formats supported by EGL.\n");
-        goto fail_free_formats;
-    }
-
-    // first, count how many modifiers we have for each format.
-    n_modified_formats = 0;
-    max_n_modifiers = 0;
-    for (int i = 0; i < n_formats; i++) {
-        egl_ok = egl_query_dmabuf_modifiers(display, formats[i], 0, NULL, NULL, &n_modifiers);
-        if (egl_ok != EGL_TRUE) {
-            LOG_ERROR("Could not query dmabuf formats supported by EGL.\n");
-            goto fail_free_formats;
-        }
-
-        n_modified_formats += n_modifiers;
-
-        if (n_modifiers > max_n_modifiers) {
-            max_n_modifiers = n_modifiers;
-        }
-    }
-
-    modified_formats = malloc(n_modified_formats * sizeof *modified_formats);
-    if (modified_formats == NULL) {
-        goto fail_free_formats;
-    }
-
-    modifiers = malloc(max_n_modifiers * sizeof *modifiers);
-    if (modifiers == NULL) {
-        goto fail_free_modified_formats;
-    }
-
-    external_only = malloc(max_n_modifiers * sizeof *external_only);
-    if (external_only == NULL) {
-        goto fail_free_modifiers;
-    }
-
-    LOG_DEBUG("supported formats for EGL import: ");
-    for (int i = 0, j = 0; i < n_formats; i++) {
-        egl_ok = egl_query_dmabuf_modifiers(display, formats[i], max_n_modifiers, modifiers, external_only, &n_modifiers);
-        if (egl_ok != EGL_TRUE) {
-            LOG_ERROR("Could not query dmabuf formats supported by EGL.\n");
-            goto fail_free_formats;
-        }
-
-        LOG_DEBUG_UNPREFIXED("%" DRM_FOURCC_FORMAT ", ", DRM_FOURCC_ARGS(formats[i]));
-
-        for (int k = 0; k < n_modifiers; k++, j++) {
-            modified_formats[j].format = formats[i];
-            modified_formats[j].modifier = modifiers[k];
-            modified_formats[j].external_only = external_only[k];
-        }
-    }
-
-    LOG_DEBUG_UNPREFIXED("\n");
-
-    free(formats);
-    free(modifiers);
-    free(external_only);
-
-    *n_formats_out = n_modified_formats;
-    *formats_out = modified_formats;
-    return true;
-
-fail_free_modifiers:
-    free(modifiers);
-
-fail_free_modified_formats:
-    free(modified_formats);
-
-fail_free_formats:
-    free(formats);
-
-fail:
-    *n_formats_out = 0;
-    *formats_out = NULL;
-    return false;
-}
-#endif
-
-struct frame_interface *frame_interface_new(struct gl_renderer *renderer) {
-    struct frame_interface *interface;
-    struct gbm_device *gbm_device;
-    EGLBoolean egl_ok;
-    EGLContext context;
-    EGLDisplay display;
-    struct egl_modified_format *formats;
-    bool supports_extended_imports, supports_external_target;
-    int n_formats;
-
-    interface = malloc(sizeof *interface);
-    if (interface == NULL) {
-        return NULL;
-    }
-
-    if (!gl_renderer_supports_egl_extension(renderer, "EGL_EXT_image_dma_buf_import")) {
-        LOG_ERROR("EGL does not support EGL_EXT_image_dma_buf_import extension. Video frames cannot be uploaded.\n");
-        goto fail_free;
-    }
-
-    if (gl_renderer_supports_egl_extension(renderer, "EGL_EXT_image_dma_buf_import_modifiers")) {
-#ifndef EGL_EXT_image_dma_buf_import_modifiers
-        LOG_ERROR(
-            "EGL supports EGL_EXT_image_dma_buf_import_modifiers, "
-            "but EGL headers didn't contain definitions for EGL_EXT_image_dma_buf_import_modifiers."
-            "Extended imports and pixel format information will not be used.\n"
-        );
-        supports_extended_imports = false;
-#else
-        supports_extended_imports = true;
-#endif
-    } else {
-        supports_extended_imports = false;
-    }
-
-    if (gl_renderer_supports_gl_extension(renderer, "GL_OES_EGL_image_external")) {
-        supports_external_target = true;
-    } else {
-        supports_external_target = false;
-    }
-
-    display = gl_renderer_get_egl_display(renderer);
-    if (display == EGL_NO_DISPLAY) {
-        goto fail_free;
-    }
-
-    context = gl_renderer_create_context(renderer);
-    if (context == EGL_NO_CONTEXT) {
-        goto fail_free;
-    }
-
-    PFNEGLCREATEIMAGEKHRPROC create_image = (PFNEGLCREATEIMAGEKHRPROC) gl_renderer_get_proc_address(renderer, "eglCreateImageKHR");
-    if (create_image == NULL) {
-        LOG_ERROR("Could not resolve eglCreateImageKHR EGL procedure.\n");
-        goto fail_destroy_context;
-    }
-
-    PFNEGLDESTROYIMAGEKHRPROC destroy_image = (PFNEGLDESTROYIMAGEKHRPROC) gl_renderer_get_proc_address(renderer, "eglDestroyImageKHR");
-    if (destroy_image == NULL) {
-        LOG_ERROR("Could not resolve eglDestroyImageKHR EGL procedure.\n");
-        goto fail_destroy_context;
-    }
-
-    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC gl_egl_image_target_texture2d = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC
-    ) gl_renderer_get_proc_address(renderer, "glEGLImageTargetTexture2DOES");
-    if (gl_egl_image_target_texture2d == NULL) {
-        LOG_ERROR("Could not resolve glEGLImageTargetTexture2DOES EGL procedure.\n");
-        goto fail_destroy_context;
-    }
-
-    // These two are optional.
-    // Might be useful in the future.
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-    PFNEGLQUERYDMABUFFORMATSEXTPROC egl_query_dmabuf_formats = (PFNEGLQUERYDMABUFFORMATSEXTPROC
-    ) gl_renderer_get_proc_address(renderer, "eglQueryDmaBufFormatsEXT");
-    if (egl_query_dmabuf_formats == NULL && supports_extended_imports) {
-        LOG_ERROR("Could not resolve eglQueryDmaBufFormatsEXT egl procedure, even though it is listed as supported.\n");
-        supports_extended_imports = false;
-    }
-
-    PFNEGLQUERYDMABUFMODIFIERSEXTPROC egl_query_dmabuf_modifiers = (PFNEGLQUERYDMABUFMODIFIERSEXTPROC
-    ) gl_renderer_get_proc_address(renderer, "eglQueryDmaBufModifiersEXT");
-    if (egl_query_dmabuf_modifiers == NULL && supports_extended_imports) {
-        LOG_ERROR("Could not resolve eglQueryDmaBufModifiersEXT egl procedure, even though it is listed as supported.\n");
-        supports_extended_imports = false;
-    }
-#endif
-
-    gbm_device = gl_renderer_get_gbm_device(renderer);
-    if (gbm_device == NULL) {
-        LOG_ERROR("GL Render doesn't have a GBM device associated with it, which is necessary for importing the video frames.\n");
-        goto fail_destroy_context;
-    }
-
-    if (supports_extended_imports) {
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-        query_formats(display, egl_query_dmabuf_formats, egl_query_dmabuf_modifiers, &n_formats, &formats);
-#else
-        UNREACHABLE();
-#endif
-    } else {
-        n_formats = 0;
-        formats = NULL;
-    }
-
-    interface->gbm_device = gbm_device;
-    interface->display = display;
-    pthread_mutex_init(&interface->context_lock, NULL);
-    interface->context = context;
-    interface->eglCreateImageKHR = create_image;
-    interface->eglDestroyImageKHR = destroy_image;
-    interface->supports_external_target = supports_external_target;
-    interface->glEGLImageTargetTexture2DOES = gl_egl_image_target_texture2d;
-    interface->supports_extended_imports = supports_extended_imports;
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-    interface->eglQueryDmaBufFormatsEXT = egl_query_dmabuf_formats;
-    interface->eglQueryDmaBufModifiersEXT = egl_query_dmabuf_modifiers;
-#endif
-    interface->n_formats = n_formats;
-    interface->formats = formats;
-    interface->n_refs = REFCOUNT_INIT_1;
-    return interface;
-
-fail_destroy_context:
-    egl_ok = eglDestroyContext(display, context);
-    ASSERT_EGL_TRUE(egl_ok);
-    (void) egl_ok;
-
-fail_free:
-    free(interface);
-    return NULL;
-}
-
-void frame_interface_destroy(struct frame_interface *interface) {
-    EGLBoolean egl_ok;
-
-    pthread_mutex_destroy(&interface->context_lock);
-    egl_ok = eglDestroyContext(interface->display, interface->context);
-    ASSERT_EGL_TRUE(egl_ok);
-    (void) egl_ok;
-    if (interface->formats != NULL) {
-        free(interface->formats);
-    }
-    free(interface);
-}
-
-ATTR_PURE int frame_interface_get_n_formats(struct frame_interface *interface) {
-    return interface->n_formats;
-}
-
-ATTR_PURE const struct egl_modified_format *frame_interface_get_format(struct frame_interface *interface, int index) {
-    assert(index < interface->n_formats);
-    return interface->formats + index;
-}
-
-DEFINE_LOCK_OPS(frame_interface, context_lock)
-
-DEFINE_REF_OPS(frame_interface, n_refs)
 
 /**
  * @brief Create a dmabuf fd from the given GstBuffer.
@@ -803,27 +508,16 @@ static EGLint egl_vertical_chroma_siting_from_gst_info(const GstVideoInfo *info)
 }
 
 struct video_frame *frame_new(struct frame_interface *interface, GstSample *sample, const GstVideoInfo *info) {
-#define PUT_ATTR(_key, _value)                            \
-    do {                                                  \
-        assert(attr_index + 2 <= ARRAY_SIZE(attributes)); \
-        attributes[attr_index++] = (_key);                \
-        attributes[attr_index++] = (_value);              \
-    } while (false)
     struct video_frame *frame;
     struct plane_info planes[MAX_N_PLANES];
+    struct egl_dmabuf_desc desc;
+    struct egl_dmabuf_image image;
     GstVideoInfo _info;
-    EGLBoolean egl_ok;
     GstBuffer *buffer;
-    EGLImageKHR egl_image;
     gboolean gst_ok;
     uint32_t drm_format;
     GstCaps *caps;
-    GLuint texture;
-    GLenum gl_error;
-    EGLint egl_error;
-    EGLint attributes[2 * 7 + MAX_N_PLANES * 2 * 5 + 1];
-    EGLint egl_color_space, egl_sample_range_hint, egl_horizontal_chroma_siting, egl_vertical_chroma_siting;
-    int ok, width, height, n_planes, attr_index;
+    int ok, width, height, n_planes;
 
     buffer = gst_sample_get_buffer(sample);
     if (buffer == NULL) {
@@ -862,234 +556,51 @@ struct video_frame *frame_new(struct frame_interface *interface, GstSample *samp
     }
 
     bool external_only;
-    for_each_format_in_frame_interface(i, format, interface) {
-        if (format->format == drm_format && format->modifier == DRM_FORMAT_MOD_LINEAR) {
-            external_only = format->external_only;
-            goto format_supported;
-        }
+    if (!egl_dmabuf_find_format(interface, drm_format, DRM_FORMAT_MOD_LINEAR, &external_only)) {
+        LOG_ERROR(
+            "Video format is not supported by EGL: %" DRM_FOURCC_FORMAT " (modifier: %" PRIu64 ").\n",
+            DRM_FOURCC_ARGS(drm_format),
+            (uint64_t) DRM_FORMAT_MOD_LINEAR
+        );
+        return NULL;
     }
-
-    LOG_ERROR(
-        "Video format is not supported by EGL: %" DRM_FOURCC_FORMAT " (modifier: %" PRIu64 ").\n",
-        DRM_FOURCC_ARGS(drm_format),
-        (uint64_t) DRM_FORMAT_MOD_LINEAR
-    );
-    return NULL;
-
-format_supported:
-
-    // query the color space for this sample
-    egl_color_space = egl_color_space_from_gst_info(info);
-
-    // check the sample range
-    egl_sample_range_hint = egl_sample_range_hint_from_gst_info(info);
-
-    // check the chroma siting
-    egl_horizontal_chroma_siting = egl_horizontal_chroma_siting_from_gst_info(info);
-    egl_vertical_chroma_siting = egl_vertical_chroma_siting_from_gst_info(info);
 
     frame = malloc(sizeof *frame);
     if (frame == NULL) {
         return NULL;
     }
 
-    ok = get_plane_infos(buffer, info, interface->gbm_device, planes);
+    ok = get_plane_infos(buffer, info, frame_interface_get_gbm_device(interface), planes);
     if (ok != 0) {
         goto fail_free_frame;
     }
 
-    // Start putting together the EGL attributes.
-    attr_index = 0;
-
-#ifndef EGL_EXT_image_dma_buf_import
-    #error "EGL header definitions for extension EGL_EXT_image_dma_buf_import are required."
-#endif
-
-    // first, put some of our basic attributes like
-    // frame size and format
-    PUT_ATTR(EGL_WIDTH, width);
-    PUT_ATTR(EGL_HEIGHT, height);
-    PUT_ATTR(EGL_LINUX_DRM_FOURCC_EXT, drm_format);
-
-    // if we have a color space, put that too
-    // could be one of EGL_ITU_REC601_EXT, EGL_ITU_REC709_EXT or EGL_ITU_REC2020_EXT
-    if (egl_color_space != EGL_NONE) {
-        PUT_ATTR(EGL_YUV_COLOR_SPACE_HINT_EXT, egl_color_space);
+    desc = (struct egl_dmabuf_desc){
+        .width = width,
+        .height = height,
+        .drm_format = drm_format,
+        .n_planes = n_planes,
+        // the color space, sample range and chroma siting of this sample
+        .color_space = egl_color_space_from_gst_info(info),
+        .sample_range_hint = egl_sample_range_hint_from_gst_info(info),
+        .horizontal_chroma_siting = egl_horizontal_chroma_siting_from_gst_info(info),
+        .vertical_chroma_siting = egl_vertical_chroma_siting_from_gst_info(info),
+        .external_only = external_only,
+    };
+    for (int i = 0; i < n_planes; i++) {
+        desc.planes[i] = (struct egl_dmabuf_plane){
+            .fd = planes[i].fd,
+            .offset = planes[i].offset,
+            .pitch = planes[i].pitch,
+            .has_modifier = planes[i].has_modifier,
+            .modifier = planes[i].modifier,
+        };
     }
 
-    // if we have information about the sample range, put that into the attributes too
-    if (egl_sample_range_hint != EGL_NONE) {
-        PUT_ATTR(EGL_SAMPLE_RANGE_HINT_EXT, egl_sample_range_hint);
-    }
-
-    // chroma siting
-    if (egl_horizontal_chroma_siting != EGL_NONE) {
-        PUT_ATTR(EGL_YUV_CHROMA_HORIZONTAL_SITING_HINT_EXT, egl_horizontal_chroma_siting);
-    }
-
-    if (egl_vertical_chroma_siting != EGL_NONE) {
-        PUT_ATTR(EGL_YUV_CHROMA_VERTICAL_SITING_HINT_EXT, egl_vertical_chroma_siting);
-    }
-
-    // add plane 1
-    PUT_ATTR(EGL_DMA_BUF_PLANE0_FD_EXT, planes[0].fd);
-    PUT_ATTR(EGL_DMA_BUF_PLANE0_OFFSET_EXT, planes[0].offset);
-    PUT_ATTR(EGL_DMA_BUF_PLANE0_PITCH_EXT, planes[0].pitch);
-    if (planes[0].has_modifier) {
-        if (interface->supports_extended_imports) {
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-            PUT_ATTR(EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, uint32_to_int32(planes[0].modifier & 0xFFFFFFFFlu));
-            PUT_ATTR(EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, uint32_to_int32(planes[0].modifier >> 32));
-#else
-            UNREACHABLE();
-#endif
-        } else {
-            LOG_ERROR(
-                "video frame buffer uses modified format but EGL doesn't support the EGL_EXT_image_dma_buf_import_modifiers extension.\n"
-            );
-            goto fail_release_planes;
-        }
-    }
-
-    // add plane 2 (if present)
-    if (n_planes >= 2) {
-        PUT_ATTR(EGL_DMA_BUF_PLANE1_FD_EXT, planes[1].fd);
-        PUT_ATTR(EGL_DMA_BUF_PLANE1_OFFSET_EXT, planes[1].offset);
-        PUT_ATTR(EGL_DMA_BUF_PLANE1_PITCH_EXT, planes[1].pitch);
-        if (planes[1].has_modifier) {
-            if (interface->supports_extended_imports) {
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-                PUT_ATTR(EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT, uint32_to_int32(planes[1].modifier & 0xFFFFFFFFlu));
-                PUT_ATTR(EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT, uint32_to_int32(planes[1].modifier >> 32));
-#else
-                UNREACHABLE();
-#endif
-            } else {
-                LOG_ERROR(
-                    "video frame buffer uses modified format but EGL doesn't support the EGL_EXT_image_dma_buf_import_modifiers "
-                    "extension.\n"
-                );
-                goto fail_release_planes;
-            }
-        }
-    }
-
-    // add plane 3 (if present)
-    if (n_planes >= 3) {
-        PUT_ATTR(EGL_DMA_BUF_PLANE2_FD_EXT, planes[2].fd);
-        PUT_ATTR(EGL_DMA_BUF_PLANE2_OFFSET_EXT, planes[2].offset);
-        PUT_ATTR(EGL_DMA_BUF_PLANE2_PITCH_EXT, planes[2].pitch);
-        if (planes[2].has_modifier) {
-            if (interface->supports_extended_imports) {
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-                PUT_ATTR(EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, uint32_to_int32(planes[2].modifier & 0xFFFFFFFFlu));
-                PUT_ATTR(EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT, uint32_to_int32(planes[2].modifier >> 32));
-#else
-                UNREACHABLE();
-#endif
-            } else {
-                LOG_ERROR(
-                    "video frame buffer uses modified format but EGL doesn't support the EGL_EXT_image_dma_buf_import_modifiers "
-                    "extension.\n"
-                );
-                goto fail_release_planes;
-            }
-        }
-    }
-
-    // add plane 4 (if present)
-    if (n_planes >= 4) {
-        if (!interface->supports_extended_imports) {
-            LOG_ERROR(
-                "The video frame has more than 3 planes but that can't be imported as a GL texture if EGL doesn't support the "
-                "EGL_EXT_image_dma_buf_import_modifiers extension.\n"
-            );
-            goto fail_release_planes;
-        }
-
-#ifdef EGL_EXT_image_dma_buf_import_modifiers
-        PUT_ATTR(EGL_DMA_BUF_PLANE3_FD_EXT, planes[3].fd);
-        PUT_ATTR(EGL_DMA_BUF_PLANE3_OFFSET_EXT, planes[3].offset);
-        PUT_ATTR(EGL_DMA_BUF_PLANE3_PITCH_EXT, planes[3].pitch);
-        if (planes[3].has_modifier) {
-            PUT_ATTR(EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT, uint32_to_int32(planes[3].modifier & 0xFFFFFFFFlu));
-            PUT_ATTR(EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT, uint32_to_int32(planes[3].modifier >> 32));
-        }
-#else
-        UNREACHABLE();
-#endif
-    }
-
-    assert(attr_index < ARRAY_SIZE(attributes));
-    attributes[attr_index++] = EGL_NONE;
-
-    egl_image = interface->eglCreateImageKHR(interface->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
-    if (egl_image == EGL_NO_IMAGE_KHR) {
-        LOG_ERROR("Couldn't create EGL image from video sample.\n");
+    ok = egl_dmabuf_import(interface, &desc, &image);
+    if (ok != 0) {
         goto fail_release_planes;
     }
-
-    frame_interface_lock(interface);
-
-    /// TODO: Make a single EGL context current for the whole lifetime of a
-    /// gstreamer thread, instead of making one current and clearing it after
-    /// for the duration of this procedure, to save some cycles.
-    ///
-    /// Make context current in GST_STREAM_STATUS_TYPE_ENTER message, clear it
-    /// in GST_STREAM_STATUS_TYPE_LEAVE message.
-    ///
-    /// See https://gstreamer.freedesktop.org/documentation/additional/design/stream-status.html
-    ///
-    /// Alternatively, don't unconditionally create & make current an EGL
-    /// context in the ENTER message, but create one lazily as soon as we need
-    /// one, but keep track of it an destroy it in the LEAVE message.
-    ///
-    /// The STREAM_STATUS messages need to be handled synchronously of course,
-    /// on the streaming thread, using either:
-    ///   - gst_bus_set_sync_handler
-    ///     https://gstreamer.freedesktop.org/documentation/gstreamer/gstbus.html#gst_bus_set_sync_handler
-    ///   - or GstBus sync-message signal
-    ///     https://gstreamer.freedesktop.org/documentation/gstreamer/gstbus.html#GstBus::sync-message
-    egl_ok = eglMakeCurrent(interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, interface->context);
-    if (egl_ok == EGL_FALSE) {
-        egl_error = eglGetError();
-        LOG_ERROR("Could not make EGL context current. eglMakeCurrent: %" PRId32 "\n", egl_error);
-        goto fail_unlock_interface;
-    }
-
-    glGenTextures(1, &texture);
-    if (texture == 0) {
-        gl_error = glGetError();
-        LOG_ERROR("Could not create GL texture. glGenTextures: %" PRIu32 "\n", gl_error);
-        goto fail_clear_context;
-    }
-
-    GLenum target;
-    if (external_only) {
-        target = GL_TEXTURE_EXTERNAL_OES;
-    } else {
-        target = GL_TEXTURE_2D;
-    }
-
-    glBindTexture(target, texture);
-
-    interface->glEGLImageTargetTexture2DOES(target, egl_image);
-    gl_error = glGetError();
-    if (gl_error != GL_NO_ERROR) {
-        LOG_ERROR("Couldn't attach EGL Image to OpenGL texture. glEGLImageTargetTexture2DOES: %" PRIu32 "\n", gl_error);
-        goto fail_unbind_texture;
-    }
-
-    glBindTexture(target, 0);
-
-    egl_ok = eglMakeCurrent(interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (egl_ok == EGL_FALSE) {
-        egl_error = eglGetError();
-        LOG_ERROR("Could not clear EGL context. eglMakeCurrent: %" PRId32 "\n", egl_error);
-        goto fail_delete_texture;
-    }
-
-    frame_interface_unlock(interface);
 
     frame->sample = gst_sample_ref(sample);
     frame->interface = frame_interface_ref(interface);
@@ -1099,26 +610,13 @@ format_supported:
     frame->dmabuf_fds[1] = planes[1].fd;
     frame->dmabuf_fds[2] = planes[2].fd;
     frame->dmabuf_fds[3] = planes[3].fd;
-    frame->image = egl_image;
-    frame->gl_frame.target = target;
-    frame->gl_frame.name = texture;
+    frame->image = image;
+    frame->gl_frame.target = image.target;
+    frame->gl_frame.name = image.texture;
     frame->gl_frame.format = GL_RGBA8_OES;
     frame->gl_frame.width = 0;
     frame->gl_frame.height = 0;
     return frame;
-
-fail_unbind_texture:
-    glBindTexture(texture, 0);
-
-fail_delete_texture:
-    glDeleteTextures(1, &texture);
-
-fail_clear_context:
-    eglMakeCurrent(interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-
-fail_unlock_interface:
-    frame_interface_unlock(interface);
-    interface->eglDestroyImageKHR(interface->display, egl_image);
 
 fail_release_planes:
     for (int i = 0; i < n_planes; i++)
@@ -1130,21 +628,9 @@ fail_free_frame:
 }
 
 void frame_destroy(struct video_frame *frame) {
-    EGLBoolean egl_ok;
     int ok;
 
-    frame_interface_lock(frame->interface);
-    egl_ok = eglMakeCurrent(frame->interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, frame->interface->context);
-    ASSERT_EGL_TRUE(egl_ok);
-    (void) egl_ok;
-    glDeleteTextures(1, &frame->gl_frame.name);
-    assert(GL_NO_ERROR == glGetError());
-    egl_ok = eglMakeCurrent(frame->interface->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    ASSERT_EGL_TRUE(egl_ok);
-    frame_interface_unlock(frame->interface);
-
-    egl_ok = frame->interface->eglDestroyImageKHR(frame->interface->display, frame->image);
-    ASSERT_EGL_TRUE(egl_ok);
+    egl_dmabuf_release(frame->interface, &frame->image);
     frame_interface_unref(frame->interface);
     for (int i = 0; i < frame->n_dmabuf_fds; i++) {
         ok = close(frame->dmabuf_fds[i]);

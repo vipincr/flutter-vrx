@@ -1,6 +1,7 @@
 #ifndef _FLUTTERPI_INCLUDE_PLUGINS_OMXPLAYER_VIDEO_PLUGIN_H
 #define _FLUTTERPI_INCLUDE_PLUGINS_OMXPLAYER_VIDEO_PLUGIN_H
 
+#include "egl_dmabuf.h"
 #include "util/collection.h"
 #include "util/lock_ops.h"
 #include "util/refcounting.h"
@@ -184,30 +185,6 @@ struct notifier *gstplayer_get_error_notifier(struct gstplayer *player);
 
 struct video_frame;
 struct gl_renderer;
-
-struct egl_modified_format {
-    uint32_t format;
-    uint64_t modifier;
-    bool external_only;
-};
-
-struct frame_interface;
-
-struct frame_interface *frame_interface_new(struct gl_renderer *renderer);
-
-ATTR_PURE int frame_interface_get_n_formats(struct frame_interface *interface);
-
-ATTR_PURE const struct egl_modified_format *frame_interface_get_format(struct frame_interface *interface, int index);
-
-#define for_each_format_in_frame_interface(index, format, interface)                                                          \
-    for (const struct egl_modified_format *format = frame_interface_get_format((interface), 0), *guard = NULL; guard == NULL; \
-         guard = (void *) 1)                                                                                                  \
-        for (size_t index = 0; index < frame_interface_get_n_formats(interface); index++,                                     \
-                    format = (index) < frame_interface_get_n_formats(interface) ? frame_interface_get_format((interface), (index)) : NULL)
-
-DECLARE_LOCK_OPS(frame_interface)
-
-DECLARE_REF_OPS(frame_interface)
 
 typedef struct _GstVideoInfo GstVideoInfo;
 typedef struct _GstVideoMeta GstVideoMeta;
