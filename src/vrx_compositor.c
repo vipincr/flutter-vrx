@@ -85,6 +85,7 @@ struct app_client {
     uint32_t region_top;  // its last SHELL_REGION: kept, since the shell
     bool region_full;     // reports on its first frame and vrxhost may
                           // name it after that
+    bool shown;         // as the shell, its frame has been on the panel
     char id[sizeof(struct vrx_msg_register)];
 };
 
@@ -1238,6 +1239,16 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
         memset(&c->shell_pending, 0, sizeof c->shell_pending);
         c->shell_pending.dmabuf_fd = -1;
         c->shell_pending.app = -1;
+    }
+    // the shell's first frame on its plane is the UI coming up, which
+    // vrxhost's update health waits on (vrx plan 0016 D6). The switch above
+    // reports only the primary plane's app, so on 0.1.0122 the shell was
+    // never reported and no slot could be kept (bench, 2026-10-16).
+    if (c->shell >= 0 && !c->apps[c->shell].shown && c->kp_shell.id && chrome_shown(c) &&
+        c->shell_frame.valid && c->shell_frame.app == c->shell) {
+        c->apps[c->shell].shown = true;
+        fprintf(stderr, "[vrx-compositor] the shell's first frame is on plane %u\n", c->shell_plane);
+        report_app(c, &c->apps[c->shell], VRX_APP_SHOWN);
     }
     c->commit_planes = 0;
     send_vblank(c, c->on_screen.app, false);
