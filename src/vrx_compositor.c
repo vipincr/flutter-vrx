@@ -239,9 +239,6 @@ struct vrx_compositor {
     bool sleeping;             // between PrepareForSleep(true) and (false)
     uint32_t light_cap;        // permille above the floor; 1000 = none (D10)
     int touches;               // contacts down now
-    bool swallow_touch;        // the waking touch, until every contact is up
-    bool swallow_pointer;      // the waking click, until its buttons are up
-    uint32_t swallow_key;      // the waking key, until it is released
 
     struct app_client apps[MAX_APPS];
     int focused;               // slot, -1 = none
@@ -2522,34 +2519,15 @@ static void idle_fire(struct vrx_compositor *c) {
 // or key turns it on and is not delivered, nor is the rest of it (a touch
 // until every contact is up, a click until its buttons are, a key until
 // its release); motion wakes and goes through.
+// The wake contact IS delivered (the owner, 2026-10-18: "the drawer still
+// takes 2 swipes" — the first swipe woke a dark screen and plan 0010 D1's
+// swallow ate it; a swipe that wakes the screen must open the drawer in
+// the same motion, like every phone). Waking changes no layout and no
+// input mapping, so there is nothing the contact could land wrong on.
 static bool idle_swallows(struct vrx_compositor *c, const struct vrx_msg_input *m) {
-    if (m->kind == VRX_INPUT_TOUCH) {
-        if (m->u.touch.kind == 0) c->touches++;
-        if (m->u.touch.kind == 2 && c->touches > 0) c->touches--;
-    }
-    if (c->dark) {
-        display_on(c, "input");
-        if (m->kind == VRX_INPUT_TOUCH) c->swallow_touch = true;
-        if (m->kind == VRX_INPUT_POINTER && m->u.pointer.buttons) c->swallow_pointer = true;
-        if (m->kind == VRX_INPUT_KEY && m->u.key.state == 1) c->swallow_key = m->u.key.keycode;
-    }
+    if (c->dark) display_on(c, "input");
     idle_arm(c);
-    switch (m->kind) {
-    case VRX_INPUT_TOUCH:
-        if (!c->swallow_touch) return false;
-        if (c->touches == 0) c->swallow_touch = false;
-        return true;
-    case VRX_INPUT_POINTER:
-        if (!c->swallow_pointer) return false;
-        if (m->u.pointer.buttons == 0) c->swallow_pointer = false;
-        return true;
-    case VRX_INPUT_KEY:
-        if (!c->swallow_key || m->u.key.keycode != c->swallow_key) return false;
-        if (m->u.key.state == 0) c->swallow_key = 0;
-        return true;
-    default:
-        return false;
-    }
+    return false;
 }
 
 
