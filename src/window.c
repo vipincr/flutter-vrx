@@ -349,7 +349,14 @@ static int window_init(
         );
         pixel_ratio = 1.0;
     } else {
-        pixel_ratio = (10.0 * width) / (width_mm * 38.0);
+        // vrx's density contract (vrx_kit metrics, ui-standard): one
+        // logical pixel is 1/6.299 mm - 160 logical pixels per inch, not
+        // flutter-pi's stock 96. At 96 every mm-based control renders at
+        // 1.66x its promised size (bench 2026-10-22, disp28a: the 9mm
+        // touch minimum landed at ~15mm, the camera's controls and toasts
+        // dwarfed the panel); vrx_check models exactly this ratio and
+        // every layout suite is judged by it.
+        pixel_ratio = (25.4 * width) / (width_mm * 160.0);
 
         int horizontal_dpi = (int) (width / (width_mm / 25.4));
         int vertical_dpi = (int) (height / (height_mm / 25.4));
