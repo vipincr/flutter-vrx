@@ -1,0 +1,6 @@
+# What is UI code in this repository (G086, plan 0025 D14): a commit that changes any of it carries a `Design-system:` trailer
+# (`promoted <standard key | floor.<name> | component.<name>>`, or `local: <why it is not general>`). Patterns are relative to
+# this folder: a trailing / is a folder, * stays inside a path segment, ** crosses them, a leading ! exempts. evrx-rt's
+# scripts/check/design_trailer.py reads this file; docs/brand/DESIGN_SYSTEM.md says how to decide.
+# the compositor's own drawing (the strip, the splash, anything it paints over the applets)
+src/vrx_compositor.c

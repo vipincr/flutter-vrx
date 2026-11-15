@@ -1,0 +1,9 @@
+# sourced by this repository's hooks: sets EVRX_RT to the evrx-rt that holds G086's checker, or fails saying so (never passes).
+# EVRX_RT in the environment wins.
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$HOOK_DIR/../.." && pwd)"
+EVRX_RT="${EVRX_RT:-$REPO_ROOT/../lvgl-vrx/evrx-rt}"
+[ -x "$EVRX_RT/scripts/githooks/design-trailer" ] || {
+    echo "design-trailer: no evrx-rt at $EVRX_RT (G086, plan 0025 D14, cannot be checked without it): set EVRX_RT, or check out lvgl-vrx/evrx-rt beside this repository" >&2
+    exit 1
+}

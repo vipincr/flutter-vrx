@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# G086 (plan 0025 D14) over everything being pushed: every commit that changes UI code (.design-ui-paths) carries a valid
+# `Design-system:` trailer. The check is evrx-rt's; a missing evrx-rt fails the push. `git push --no-verify` skips it.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/design-trailer-locate"
+exec "$EVRX_RT/scripts/githooks/design-trailer" push

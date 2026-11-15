@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# G086 (plan 0025 D14): a commit that changes UI code (.design-ui-paths) carries a `Design-system:` trailer; the check is evrx-rt's.
+# Installed by scripts/install-hooks.sh; a commit needing none passes, and a missing evrx-rt fails.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/design-trailer-locate"
+exec "$EVRX_RT/scripts/githooks/design-trailer" message "$1"
