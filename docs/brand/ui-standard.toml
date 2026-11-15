@@ -1,0 +1,941 @@
+# The vrx UI standard: every number a second implementation has to match, and the words it has to honour.
+#
+# This file is the single source (plan 0061 D4). scripts/lib/make_ui_standard.py turns it into ui_metrics' token block
+# (components/helpers/ui_metrics/include/ui_metrics/ui_standard.h) and into the expectations the host tests hold the
+# hand-written tables to (tests/ui_standard_expect.h); the gate's ui-standard-generated refuses a stale copy. A
+# second implementation (the Flutter kit in vrx-linux) pins this file by commit and generates its own tables from it.
+#
+# UNITS ARE NORMATIVE. A length is in millimetres, a type size in points, a time in milliseconds, a stiffness in the
+# units of a spring of mass 1. Pixels are derived: here from the panel's density (CONFIG_VRX_PANEL_PPI, UI_MM), on a
+# host that has no density from a scale over a 480 px short side. Both are sanctioned; a length that is written in
+# pixels anywhere is a defect in whichever implementation wrote it.
+
+[standard]
+version = 1
+
+# --- spacing and shape -----------------------------------------------------------------------------------------------
+# The vocabulary of every pad, margin and gap. A layout that reaches outside it has not been thought about
+# (UI_SPACE_EXACT names the rare exception and its reason).
+
+[spacing_mm]
+xs = 1
+sm = 2
+md = 3
+lg = 4
+xl = 6
+edge_inset = 2        # between the glass edge and the client area
+
+[radius_mm]
+sm = 1
+md = 2
+
+# Window size classes (plan 0062 D20), Material's (compact below 600 dp wide and 480 dp high, medium to 840 and 900, expanded from
+# there) at 160 dp to the inch, in tenths of a millimetre: the two edges between compact and medium and between medium and expanded. An
+# applet reads a class and never a pixel count, so a layout is chosen by how much room there is.
+[window]
+width_x10mm = [952, 1334]
+height_x10mm = [762, 1429]
+# The splits a wide window's panes take (plan 0072 D2), the figure's share against its support's: even, the figure leading (a
+# dial with a rail of choices beside it), and the support leading (a small figure beside readings that need the width).
+panes_even = [1, 1]
+panes_figure_leads = [5, 3]
+panes_support_leads = [1, 2]
+
+# Sizes that are physical whatever the panel's density.
+[size_mm]
+touch_min = 9         # the smallest a finger is asked to hit (UI_TARGET_MIN where the board has touch)
+# Along the axis a target shares with its siblings in one control (a segmented row's width, a rail's height), in tenths: WCAG
+# 2.2's target minimum, 24 CSS px (6.35 mm). A cell is still a finger across; a row of seven at 9 mm both ways needed 546 px of a
+# 410 px row on a 219 PPI panel and went to two lines (2026-10-19).
+touch_along_x10mm = 64
+icon_button = 5       # a glyph that is itself a control
+status_button = 4     # a glyph in the status strip, an indicator and not a target
+qr_min = 18           # the smallest a QR code can be for a phone's camera to read
+drawer_pull_min = 27  # how far the quick drawer is pulled before it opens
+
+# Lengths in device pixels, and the only ones. A line is drawn on whole pixels, so its width is a count of them and not a
+# fraction of a millimetre: a second implementation has to draw the same line, and scaling it would give a hairline of 1.3
+# pixels that anti-aliases to grey on a panel with four greys. Both are what the 219 PPI reference panel draws well, and the
+# focus frame's smallest size (UI_FOCUS_MIN) is derived from them.
+
+[device_px]
+hairline = 2          # a rule, a thin frame, the seam between two controls
+border = 3            # a control's frame, the focus frame
+
+# --- gestures --------------------------------------------------------------------------------------------------------
+# A swipe is a distance AND a speed: the distance separates it from a tap (Android's boundary is 8 dp, about 1.3 mm), the
+# speed keeps a long press safe, whose finger drifts some 24 px/s on a 219 PPI panel against the 60 px/s floor.
+
+[gesture]
+swipe_min_mm = 2.5
+swipe_min_px_per_s = 60    # the one speed written in pixels: about 7 mm/s at the reference 219 PPI (plan 0061 A rechecked it on traces)
+touch_slop_mm = 2          # travel past which a contact is no longer a tap
+wheel_step_mm = 4.5        # one step of a mouse wheel
+
+# --- motion timing ---------------------------------------------------------------------------------------------------
+
+[motion]
+ms = 200                   # a scroll, a page turn and the focus ring's move on a scanned panel
+
+# --- type ------------------------------------------------------------------------------------------------------------
+# A role is chosen by what the text IS; its size follows from the density (make_type_scale.py snaps it to a face).
+
+[type_pt]
+display = 14.5
+title = 12.5
+subtitle = 11.2
+body = 9.9
+subtext = 8.5
+micro = 6.6
+clock = 42.1
+code = 8.5
+
+# The panel densities the type scale has a rung for (scripts/lib/make_type_scale.py): a font set per density, chosen by the
+# preprocessor, so a board whose panel is not listed here does not compile. The list is the standard's, never read off board
+# folders, so a board lives in one project's tree and the runtime still draws for it. 179 is the Sharp Brain PW-SH7 (lvgl-vrx),
+# 187 the N6570-DK, 219 the reference e-paper panel (qemu_s3), 294 the 1280 x 720 colour panels (emu_p4, qemu_lcd).
+[type_scale]
+densities_ppi = [179, 187, 219, 294]
+
+# --- colour slots (plan 0062) ------------------------------------------------------------------------------------------
+# The 32 functional slots a screen is drawn from. A component names what a colour is FOR; the scheme gives the slot a
+# colour on a colour panel, and the class's map gives it a grey on a grey one. Tones are CIE L* (0 black, 100 white), the
+# same for every scheme, so a grey panel's table does not depend on the scheme. Order is the enum's and the index of every
+# table. A slot from `inverse` on whose class is fill or container is followed by its on-colour.
+#
+#   class: what the slot is, which picks its grey in a grey class and its place in the pair rules
+#   palette: which tonal palette the colour comes from (primary, secondary and tertiary follow the scheme's harmony rule)
+#   chroma: a fraction of that palette's chroma (an on-colour at tone 100 has none; a container is tinted, not saturated)
+
+[colour]
+slot = [
+  { name = "page",                    class = "surface",        light = 98,  dark = 6,   palette = "neutral",         chroma = 1.0 },
+  { name = "surface",                 class = "surface",        light = 95,  dark = 11,  palette = "neutral",         chroma = 1.0 },
+  { name = "surface_high",            class = "surface",        light = 90,  dark = 20,  palette = "neutral",         chroma = 1.0 },
+  { name = "text",                    class = "text",           light = 10,  dark = 90,  palette = "neutral",         chroma = 1.0 },
+  { name = "text_secondary",          class = "text_secondary", light = 30,  dark = 80,  palette = "neutral_variant", chroma = 1.0 },
+  { name = "outline",                 class = "outline",        light = 50,  dark = 60,  palette = "neutral_variant", chroma = 1.0 },
+  { name = "outline_faint",           class = "outline_faint",  light = 80,  dark = 30,  palette = "neutral_variant", chroma = 1.0 },
+  { name = "focus",                   class = "focus",          light = 40,  dark = 80,  palette = "primary",         chroma = 1.0 },
+  { name = "shadow",                  class = "shadow",         light = 0,   dark = 0,   palette = "neutral",         chroma = 0.0 },
+  { name = "highlight",               class = "highlight",      light = 100, dark = 100, palette = "neutral",         chroma = 0.0 },
+  { name = "inverse",                 class = "fill",           light = 20,  dark = 90,  palette = "neutral",         chroma = 1.0 },
+  { name = "on_inverse",              class = "on_fill",        light = 95,  dark = 20,  palette = "neutral",         chroma = 1.0 },
+  { name = "primary",                 class = "fill",           light = 40,  dark = 80,  palette = "primary",         chroma = 1.0 },
+  { name = "on_primary",              class = "on_fill",        light = 100, dark = 20,  palette = "primary",         chroma = 0.3 },
+  { name = "primary_container",       class = "container",      light = 90,  dark = 30,  palette = "primary",         chroma = 0.5 },
+  { name = "on_primary_container",    class = "on_container",   light = 30,  dark = 90,  palette = "primary",         chroma = 0.8 },
+  { name = "secondary",               class = "fill",           light = 40,  dark = 80,  palette = "secondary",       chroma = 1.0 },
+  { name = "on_secondary",            class = "on_fill",        light = 100, dark = 20,  palette = "secondary",       chroma = 0.3 },
+  { name = "secondary_container",     class = "container",      light = 90,  dark = 30,  palette = "secondary",       chroma = 0.6 },
+  { name = "on_secondary_container",  class = "on_container",   light = 30,  dark = 90,  palette = "secondary",       chroma = 0.8 },
+  { name = "tertiary",                class = "fill",           light = 40,  dark = 80,  palette = "tertiary",        chroma = 1.0 },
+  { name = "on_tertiary",             class = "on_fill",        light = 100, dark = 20,  palette = "tertiary",        chroma = 0.3 },
+  { name = "tertiary_container",      class = "container",      light = 90,  dark = 30,  palette = "tertiary",        chroma = 0.5 },
+  { name = "on_tertiary_container",   class = "on_container",   light = 30,  dark = 90,  palette = "tertiary",        chroma = 0.8 },
+  { name = "error",                   class = "fill",           light = 40,  dark = 80,  palette = "error",           chroma = 1.0 },
+  { name = "on_error",                class = "on_fill",        light = 100, dark = 20,  palette = "error",           chroma = 0.3 },
+  { name = "success",                 class = "fill",           light = 40,  dark = 80,  palette = "success",         chroma = 1.0 },
+  { name = "on_success",              class = "on_fill",        light = 100, dark = 20,  palette = "success",         chroma = 0.3 },
+  { name = "warning",                 class = "fill",           light = 40,  dark = 80,  palette = "warning",         chroma = 1.0 },
+  { name = "on_warning",              class = "on_fill",        light = 100, dark = 20,  palette = "warning",         chroma = 0.3 },
+  { name = "info",                    class = "fill",           light = 40,  dark = 80,  palette = "info",            chroma = 1.0 },
+  { name = "on_info",                 class = "on_fill",        light = 100, dark = 20,  palette = "info",            chroma = 0.3 },
+]
+
+# Contrast floors, WCAG 2 ratio times 100, and the pairs they hold. first_pass: where a grey class has a one-bit first pass
+# (an e-paper refresh paints black and white before the greys), the two sides must land either side of 128 in it, so the
+# text is legible before the greys arrive. Decoration (outline_faint) is allowed to arrive late.
+pair = [
+  { bg = "page",              fg = "text",                   min = 700, first_pass = true },
+  { bg = "surface",           fg = "text",                   min = 700, first_pass = true },
+  { bg = "surface_high",      fg = "text",                   min = 450, first_pass = true },
+  { bg = "page",              fg = "text_secondary",         min = 450, first_pass = true },
+  { bg = "page",              fg = "outline",                min = 300, first_pass = true },
+  { bg = "page",              fg = "focus",                  min = 300, first_pass = true },
+  { bg = "page",              fg = "outline_faint",          min = 150, first_pass = false },
+  { bg = "inverse",           fg = "on_inverse",             min = 450, first_pass = true },
+  { bg = "primary",           fg = "on_primary",             min = 450, first_pass = true },
+  { bg = "primary_container", fg = "on_primary_container",   min = 450, first_pass = true },
+  { bg = "secondary",         fg = "on_secondary",           min = 450, first_pass = true },
+  { bg = "secondary_container", fg = "on_secondary_container", min = 450, first_pass = true },
+  { bg = "tertiary",          fg = "on_tertiary",            min = 450, first_pass = true },
+  { bg = "tertiary_container", fg = "on_tertiary_container", min = 450, first_pass = true },
+  { bg = "error",             fg = "on_error",               min = 450, first_pass = true },
+  { bg = "success",           fg = "on_success",             min = 450, first_pass = true },
+  { bg = "warning",           fg = "on_warning",             min = 450, first_pass = true },
+  { bg = "info",              fg = "on_info",                min = 450, first_pass = true },
+  { bg = "page",              fg = "primary",                min = 300, first_pass = false },
+  { bg = "page",              fg = "error",                  min = 300, first_pass = false },
+  { bg = "page",              fg = "success",                min = 300, first_pass = false },
+  { bg = "page",              fg = "warning",                min = 300, first_pass = false },
+  { bg = "page",              fg = "info",                   min = 300, first_pass = false },
+]
+
+# While a fill moves from the page to the primary and its text swaps ink where the two cross (ui_motion.c), the text is held to
+# this ratio (times 100) on every frame of the way: the most two tonal inks can give at the crossing is about 3.4:1 against
+# 4.58:1 for pure black and white, so in flight it is the WCAG floor for a user-interface component, 3:1, and at rest it is the
+# pairs' 4.5:1. make_ui_schemes.py checks the path of every scheme.
+[colour.transit]
+floor_x100 = 300
+
+# Colour generation (scripts/make/make_ui_schemes.py), OKLCh. A scheme is a seed hue and a harmony rule: the rule gives the
+# secondary and tertiary hue as offsets in degrees from the seed (Itten's wheel). 4 seeds x 5 rules = 20 schemes, numbered
+# seed-major (1 to 5 the first seed, in the rules' order below).
+[generate]
+seeds = ["blue", "green", "amber", "magenta"]
+rules = ["analogous", "complementary", "split", "triadic", "tetradic"]
+min_scheme_distance_x100 = 4.0   # two schemes differ by at least this in OKLab (times 100) in some brand slot, or the 20 are not twenty
+harmonise_max_deg = 5       # a signal hue turns toward the seed by half the gap, at most this: red has to stay red (Material turns up to 15)
+
+[generate.seed_hue]
+blue = 255
+green = 150
+amber = 65
+magenta = 330
+
+[generate.rule_offsets]
+analogous = [30, -30]
+complementary = [0, 180]
+split = [150, 210]
+triadic = [120, 240]
+tetradic = [60, 180]
+
+[generate.signal_hue]
+error = 27
+warning = 78
+success = 146
+info = 250
+
+[generate.chroma]            # OKLCh chroma at full strength; a slot takes its `chroma` fraction of it, and the gamut takes the rest
+primary = 0.15
+secondary = 0.07
+tertiary = 0.12
+neutral = 0.012
+neutral_variant = 0.022
+error = 0.15
+warning = 0.12
+success = 0.14
+info = 0.14
+
+# Pinned values: a generated table that moves one of these is a bug in the generator, so it refuses.
+[pin_dark]
+page = "#121212"            # the dark page the colour boards already draw on
+
+# Grey classes. A grey panel draws a slot in the grey its class gives it, as 0xVV (r = g = b). grey4 and grey2 are authored
+# by slot class and then repaired against the pairs; grey32 follows the slot's tone and is repaired the same way. Levels of
+# grey4 are the band midpoints and ends of the quantiser (gray_quant_level: luminance >> 6); a first pass paints black below 128.
+[grey4]
+surface = 0xFF
+text = 0x20
+text_secondary = 0x60
+outline_faint = 0xA0
+outline = 0x00
+focus = 0x00
+shadow = 0x00
+highlight = 0xFF
+fill = 0x00
+on_fill = 0xFF
+container = 0xFF
+on_container = 0x20
+
+[grey2]
+surface = 0xFF
+text = 0x00
+text_secondary = 0x00
+outline_faint = 0x00
+outline = 0x00
+focus = 0x00
+shadow = 0x00
+highlight = 0xFF
+fill = 0x00
+on_fill = 0xFF
+container = 0xFF
+on_container = 0x00
+
+# The ten roles the e-paper UI drew with before slots (the paper palette, #202020 #606060 #A0A0A0 on #FFFFFF and black), by
+# their slot: grey4 must keep them, so the e-paper board's glass does not change.
+[pin_grey4]
+text = 0x20
+text_secondary = 0x60
+outline_faint = 0xA0
+page = 0xFF
+primary = 0x00
+on_primary = 0xFF
+outline = 0x00
+focus = 0x00
+shadow = 0x00
+highlight = 0xFF
+
+# --- display classes (plan 0062 D14) ---------------------------------------------------------------------------------
+# Every number or choice that differs between kinds of panel, read through ui_class.h (private to ui_kit) by name. The build
+# picks the row from facts it already has: a colour panel is lcd_colour; a scanned panel without colour is lcd_grey; an
+# e-paper panel is epaper_grey, or epaper_mono at one bit. The motion tier stays Kconfig's (main/Kconfig), and with it the choice
+# between a shadow and a heavier frame for elevation (a shadow exists only in the full tier, so the code for it does too).
+
+[class.lcd_colour]
+pressed_layer_permille = 200   # a state layer in `primary` over the control; 0 is the inversion
+live_min_ms = 0                # a live readout (a meter, a bubble, a viewfinder) repaints at most this often
+ambient_min_ms = 0             # an ambient change (a clock minute, a charging percentage) waits at most this long for a paint
+dither = "none"                # how a pixel surface reaches the greys: none, by quality, or threshold
+
+[class.lcd_grey]
+pressed_layer_permille = 200   # a scanned panel has no waveform to save: the state layer of 1bbb2bd4 is kept
+live_min_ms = 0
+ambient_min_ms = 0
+dither = "by_quality"
+
+[class.epaper_grey]
+pressed_layer_permille = 0
+live_min_ms = 1000
+ambient_min_ms = 60000
+dither = "by_quality"
+
+[class.epaper_mono]
+pressed_layer_permille = 0
+live_min_ms = 1000
+ambient_min_ms = 60000
+dither = "threshold"
+
+# BEGIN GENERATED by scripts/make/make_ui_schemes.py. Do not edit: change the definitions above and run it.
+
+[schemes.1]
+seed = "blue"
+rule = "analogous"
+light = [
+  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
+  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
+  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
+  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
+  "#5B5A86", "#FFFFFF", "#E0E0FF", "#444365",
+  "#006783", "#FFFFFF", "#B8EAFF", "#004D63",
+  "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+]
+dark = [
+  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
+  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
+  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
+  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
+  "#C2C2F4", "#2F2F3B", "#45445D", "#E0E0FF",
+  "#5FD4FE", "#1A343D", "#1B4C5E", "#B8EAFF",
+  "#FFB3B0", "#462827", "#77DB92", "#1F3524",
+  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+]
+
+[schemes.2]
+seed = "blue"
+rule = "complementary"
+light = [
+  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
+  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
+  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
+  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
+  "#436085", "#FFFFFF", "#D0E4FF", "#324864",
+  "#815600", "#FFFFFF", "#FBDEB7", "#624000",
+  "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+]
+dark = [
+  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
+  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
+  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
+  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
+  "#A8C9F4", "#29313B", "#37485D", "#D0E4FF",
+  "#F6BC6A", "#3B2E1C", "#5A4220", "#FFDDB0",
+  "#FFB3B0", "#462827", "#77DB92", "#1F3524",
+  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+]
+
+[schemes.3]
+seed = "blue"
+rule = "split"
+light = [
+  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
+  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
+  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
+  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
+  "#81533E", "#FFFFFF", "#FDDCCD", "#613E2E",
+  "#676000", "#FFFFFF", "#E7E5B7", "#4D4800",
+  "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+]
+dark = [
+  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
+  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
+  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
+  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
+  "#F0BBA3", "#3A2E28", "#5B4135", "#FFDBCB",
+  "#D1CA69", "#33311B", "#4B481F", "#EBE69A",
+  "#FFB3B0", "#462827", "#77DB92", "#1F3524",
+  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+]
+
+[schemes.4]
+seed = "blue"
+rule = "triadic"
+light = [
+  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
+  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
+  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
+  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
+  "#845054", "#FFFFFF", "#FFDADB", "#633C3F",
+  "#3C6A1A", "#FFFFFF", "#D0EAC2", "#2C4F14",
+  "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+]
+dark = [
+  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
+  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
+  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
+  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
+  "#F3B7BB", "#3B2D2E", "#5D3F41", "#FFDADB",
+  "#A1D585", "#283421", "#374D2B", "#C4EFAE",
+  "#FFB3B0", "#462827", "#77DB92", "#1F3524",
+  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+]
+
+[schemes.5]
+seed = "blue"
+rule = "tetradic"
+light = [
+  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
+  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
+  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
+  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
+  "#70547C", "#FFFFFF", "#EFDCF8", "#543F5D",
+  "#815600", "#FFFFFF", "#FBDEB7", "#624000",
+  "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+]
+dark = [
+  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
+  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
+  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
+  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
+  "#DABCE9", "#352E38", "#514158", "#F3DAFF",
+  "#F6BC6A", "#3B2E1C", "#5A4220", "#FFDDB0",
+  "#FFB3B0", "#462827", "#77DB92", "#1F3524",
+  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+]
+
+[schemes.6]
+seed = "green"
+rule = "analogous"
+light = [
+  "#F4FBF5", "#EBF3EC", "#DDE4DE", "#171D18",
+  "#3E4A40", "#6E7A70", "#BCCABE", "#006D30",
+  "#000000", "#FFFFFF", "#2C322D", "#EBF3EC",
+  "#006D30", "#FFFFFF", "#BDEEC6", "#005322",
+  "#25695D", "#FFFFFF", "#C4EAE2", "#1C4F46",
+  "#556500", "#FFFFFF", "#DCE8BB", "#3F4C00",
+  "#A83825", "#FFFFFF", "#006E29", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#00629D", "#FFFFFF",
+]
+dark = [
+  "#121212", "#191F1A", "#2C322D", "#DDE4DE",
+  "#BCCABE", "#879489", "#3E4A40", "#72DC8C",
+  "#000000", "#FFFFFF", "#DDE4DE", "#2C322D",
+  "#72DC8C", "#1E3623", "#23502E", "#A3F5B4",
+  "#91D3C5", "#243330", "#2A4D46", "#B8EDE1",
+  "#BAD074", "#2D331E", "#424B24", "#D8EAA2",
+  "#FFB4A5", "#462923", "#7EDA8D", "#203523",
+  "#EDC066", "#392F1B", "#91CCFF", "#1D3244",
+]
+
+[schemes.7]
+seed = "green"
+rule = "complementary"
+light = [
+  "#F4FBF5", "#EBF3EC", "#DDE4DE", "#171D18",
+  "#3E4A40", "#6E7A70", "#BCCABE", "#006D30",
+  "#000000", "#FFFFFF", "#2C322D", "#EBF3EC",
+  "#006D30", "#FFFFFF", "#BDEEC6", "#005322",
+  "#3E6747", "#FFFFFF", "#CEE9D3", "#2E4E35",
+  "#884683", "#FFFFFF", "#FDD7F8", "#663562",
+  "#A83825", "#FFFFFF", "#006E29", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#00629D", "#FFFFFF",
+]
+dark = [
+  "#121212", "#191F1A", "#2C322D", "#DDE4DE",
+  "#BCCABE", "#879489", "#3E4A40", "#72DC8C",
+  "#000000", "#FFFFFF", "#DDE4DE", "#2C322D",
+  "#72DC8C", "#1E3623", "#23502E", "#A3F5B4",
+  "#A4D1AC", "#28332A", "#354C3A", "#C7ECCD",
+  "#F8AEF1", "#3C2B3A", "#5B3D58", "#FFD6FA",
+  "#FFB4A5", "#462923", "#7EDA8D", "#203523",
+  "#EDC066", "#392F1B", "#91CCFF", "#1D3244",
+]
+
+[schemes.8]
+seed = "green"
+rule = "split"
+light = [
+  "#F4FBF5", "#EBF3EC", "#DDE4DE", "#171D18",
+  "#3E4A40", "#6E7A70", "#BCCABE", "#006D30",
+  "#000000", "#FFFFFF", "#2C322D", "#EBF3EC",
+  "#006D30", "#FFFFFF", "#BDEEC6", "#005322",
+  "#665782", "#FFFFFF", "#E7DEFC", "#4D4162",
+  "#974160", "#FFFFFF", "#FFD9E3", "#723148",
+  "#A83825", "#FFFFFF", "#006E29", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#00629D", "#FFFFFF",
+]
+dark = [
+  "#121212", "#191F1A", "#2C322D", "#DDE4DE",
+  "#BCCABE", "#879489", "#3E4A40", "#72DC8C",
+  "#000000", "#FFFFFF", "#DDE4DE", "#2C322D",
+  "#72DC8C", "#1E3623", "#23502E", "#A3F5B4",
+  "#CFBFF0", "#322F3A", "#4B435B", "#E8DDFF",
+  "#FFB1C8", "#412A31", "#633B47", "#FFD9E3",
+  "#FFB4A5", "#462923", "#7EDA8D", "#203523",
+  "#EDC066", "#392F1B", "#91CCFF", "#1D3244",
+]
+
+[schemes.9]
+seed = "green"
+rule = "triadic"
+light = [
+  "#F4FBF5", "#EBF3EC", "#DDE4DE", "#171D18",
+  "#3E4A40", "#6E7A70", "#BCCABE", "#006D30",
+  "#000000", "#FFFFFF", "#2C322D", "#EBF3EC",
+  "#006D30", "#FFFFFF", "#BDEEC6", "#005322",
+  "#4F5D87", "#FFFFFF", "#D8E2FF", "#3B4666",
+  "#9B4337", "#FFFFFF", "#FFDAD4", "#753229",
+  "#A83825", "#FFFFFF", "#006E29", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#00629D", "#FFFFFF",
+]
+dark = [
+  "#121212", "#191F1A", "#2C322D", "#DDE4DE",
+  "#BCCABE", "#879489", "#3E4A40", "#72DC8C",
+  "#000000", "#FFFFFF", "#DDE4DE", "#2C322D",
+  "#72DC8C", "#1E3623", "#23502E", "#A3F5B4",
+  "#B5C6F6", "#2C303B", "#3E465E", "#D8E2FF",
+  "#FFB4A7", "#422A26", "#653C35", "#FFDAD4",
+  "#FFB4A5", "#462923", "#7EDA8D", "#203523",
+  "#EDC066", "#392F1B", "#91CCFF", "#1D3244",
+]
+
+[schemes.10]
+seed = "green"
+rule = "tetradic"
+light = [
+  "#F4FBF5", "#EBF3EC", "#DDE4DE", "#171D18",
+  "#3E4A40", "#6E7A70", "#BCCABE", "#006D30",
+  "#000000", "#FFFFFF", "#2C322D", "#EBF3EC",
+  "#006D30", "#FFFFFF", "#BDEEC6", "#005322",
+  "#216772", "#FFFFFF", "#C2E9F1", "#194D56",
+  "#884683", "#FFFFFF", "#FDD7F8", "#663562",
+  "#A83825", "#FFFFFF", "#006E29", "#FFFFFF",
+  "#7A5900", "#FFFFFF", "#00629D", "#FFFFFF",
+]
+dark = [
+  "#121212", "#191F1A", "#2C322D", "#DDE4DE",
+  "#BCCABE", "#879489", "#3E4A40", "#72DC8C",
+  "#000000", "#FFFFFF", "#DDE4DE", "#2C322D",
+  "#72DC8C", "#1E3623", "#23502E", "#A3F5B4",
+  "#8ED1DD", "#233336", "#294C52", "#B6ECF5",
+  "#F8AEF1", "#3C2B3A", "#5B3D58", "#FFD6FA",
+  "#FFB4A5", "#462923", "#7EDA8D", "#203523",
+  "#EDC066", "#392F1B", "#91CCFF", "#1D3244",
+]
+
+[schemes.11]
+seed = "amber"
+rule = "analogous"
+light = [
+  "#FFF8F2", "#F7EFE9", "#E9E1DB", "#201B16",
+  "#50453B", "#81756A", "#D1C4B8", "#8A5100",
+  "#000000", "#FFFFFF", "#352F2A", "#F7EFE9",
+  "#8A5100", "#FFFFFF", "#FFDCBC", "#693C00",
+  "#6B5E2D", "#FFFFFF", "#EBE3C4", "#504621",
+  "#9A442F", "#FFFFFF", "#FFDBD1", "#743323",
+  "#A83825", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#221D18", "#352F2A", "#E9E1DB",
+  "#D1C4B8", "#9B8F83", "#50453B", "#FFB870",
+  "#000000", "#FFFFFF", "#E9E1DB", "#352F2A",
+  "#FFB870", "#412C17", "#633F16", "#FFDCBC",
+  "#D4C692", "#343024", "#4E472C", "#EEE3B9",
+  "#FFB4A1", "#422B25", "#653C32", "#FFDBD1",
+  "#FFB4A5", "#462923", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.12]
+seed = "amber"
+rule = "complementary"
+light = [
+  "#FFF8F2", "#F7EFE9", "#E9E1DB", "#201B16",
+  "#50453B", "#81756A", "#D1C4B8", "#8A5100",
+  "#000000", "#FFFFFF", "#352F2A", "#F7EFE9",
+  "#8A5100", "#FFFFFF", "#FFDCBC", "#693C00",
+  "#7B5733", "#FFFFFF", "#F8DEC7", "#5D4126",
+  "#03629C", "#FFFFFF", "#CAE6FF", "#064A76",
+  "#A83825", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#221D18", "#352F2A", "#E9E1DB",
+  "#D1C4B8", "#9B8F83", "#50453B", "#FFB870",
+  "#000000", "#FFFFFF", "#E9E1DB", "#352F2A",
+  "#FFB870", "#412C17", "#633F16", "#FFDCBC",
+  "#E8BF98", "#382F26", "#57432F", "#FEDDBD",
+  "#91CCFF", "#203241", "#294A65", "#CAE6FF",
+  "#FFB4A5", "#462923", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.13]
+seed = "amber"
+rule = "split"
+light = [
+  "#FFF8F2", "#F7EFE9", "#E9E1DB", "#201B16",
+  "#50453B", "#81756A", "#D1C4B8", "#8A5100",
+  "#000000", "#FFFFFF", "#352F2A", "#F7EFE9",
+  "#8A5100", "#FFFFFF", "#FFDCBC", "#693C00",
+  "#236775", "#FFFFFF", "#C3E9F3", "#1B4D58",
+  "#4D58A3", "#FFFFFF", "#DAE1FF", "#3A427B",
+  "#A83825", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#221D18", "#352F2A", "#E9E1DB",
+  "#D1C4B8", "#9B8F83", "#50453B", "#FFB870",
+  "#000000", "#FFFFFF", "#E9E1DB", "#352F2A",
+  "#FFB870", "#412C17", "#633F16", "#FFDCBC",
+  "#8FD1E1", "#243337", "#2A4C54", "#B7EBF8",
+  "#B7C4FF", "#2B2F43", "#3E4568", "#DAE1FF",
+  "#FFB4A5", "#462923", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.14]
+seed = "amber"
+rule = "triadic"
+light = [
+  "#FFF8F2", "#F7EFE9", "#E9E1DB", "#201B16",
+  "#50453B", "#81756A", "#D1C4B8", "#8A5100",
+  "#000000", "#FFFFFF", "#352F2A", "#F7EFE9",
+  "#8A5100", "#FFFFFF", "#FFDCBC", "#693C00",
+  "#236961", "#FFFFFF", "#C3EAE4", "#1A4F49",
+  "#724E98", "#FFFFFF", "#EBDCFF", "#563A73",
+  "#A83825", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#221D18", "#352F2A", "#E9E1DB",
+  "#D1C4B8", "#9B8F83", "#50453B", "#FFB870",
+  "#000000", "#FFFFFF", "#E9E1DB", "#352F2A",
+  "#FFB870", "#412C17", "#633F16", "#FFDCBC",
+  "#8FD3CA", "#243331", "#294D48", "#B7EDE5",
+  "#D9B9FF", "#352D40", "#504062", "#EBDCFF",
+  "#FFB4A5", "#462923", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.15]
+seed = "amber"
+rule = "tetradic"
+light = [
+  "#FFF8F2", "#F7EFE9", "#E9E1DB", "#201B16",
+  "#50453B", "#81756A", "#D1C4B8", "#8A5100",
+  "#000000", "#FFFFFF", "#352F2A", "#F7EFE9",
+  "#8A5100", "#FFFFFF", "#FFDCBC", "#693C00",
+  "#546437", "#FFFFFF", "#DBE7C9", "#3F4B29",
+  "#03629C", "#FFFFFF", "#CAE6FF", "#064A76",
+  "#A83825", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#221D18", "#352F2A", "#E9E1DB",
+  "#D1C4B8", "#9B8F83", "#50453B", "#FFB870",
+  "#000000", "#FFFFFF", "#E9E1DB", "#352F2A",
+  "#FFB870", "#412C17", "#633F16", "#FFDCBC",
+  "#BACD9C", "#2D3226", "#414A31", "#D8E8C0",
+  "#91CCFF", "#203241", "#294A65", "#CAE6FF",
+  "#FFB4A5", "#462923", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.16]
+seed = "magenta"
+rule = "analogous"
+light = [
+  "#FFF7FE", "#F6EEF5", "#E8E0E7", "#1F1A1F",
+  "#4F434D", "#80737E", "#D0C2CE", "#913D8C",
+  "#000000", "#FFFFFF", "#342F34", "#F6EEF5",
+  "#913D8C", "#FFFFFF", "#FFD6FA", "#6D2E69",
+  "#82505F", "#FFFFFF", "#FDD9E3", "#623C47",
+  "#6D4F9B", "#FFFFFF", "#E8DDFF", "#523B75",
+  "#A8363B", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#211C21", "#342F34", "#E8E0E7",
+  "#D0C2CE", "#9A8D98", "#4F434D", "#FFAAF7",
+  "#000000", "#FFFFFF", "#E8E0E7", "#342F34",
+  "#FFAAF7", "#3F293D", "#603A5C", "#FFD6FA",
+  "#F1B7C7", "#3A2D31", "#5C3F47", "#FFD9E3",
+  "#D2BBFF", "#342D41", "#4D4164", "#E8DDFF",
+  "#FFB3B0", "#462827", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.17]
+seed = "magenta"
+rule = "complementary"
+light = [
+  "#FFF7FE", "#F6EEF5", "#E8E0E7", "#1F1A1F",
+  "#4F434D", "#80737E", "#D0C2CE", "#913D8C",
+  "#000000", "#FFFFFF", "#342F34", "#F6EEF5",
+  "#913D8C", "#FFFFFF", "#FFD6FA", "#6D2E69",
+  "#775274", "#FFFFFF", "#F5DBF2", "#5A3D57",
+  "#146D34", "#FFFFFF", "#C5ECCC", "#105226",
+  "#A8363B", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#211C21", "#342F34", "#E8E0E7",
+  "#D0C2CE", "#9A8D98", "#4F434D", "#FFAAF7",
+  "#000000", "#FFFFFF", "#E8E0E7", "#342F34",
+  "#FFAAF7", "#3F293D", "#603A5C", "#FFD6FA",
+  "#E4B9DF", "#372D36", "#554053", "#FBD8F7",
+  "#87D899", "#223526", "#2C4E34", "#B1F2BE",
+  "#FFB3B0", "#462827", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.18]
+seed = "magenta"
+rule = "split"
+light = [
+  "#FFF7FE", "#F6EEF5", "#E8E0E7", "#1F1A1F",
+  "#4F434D", "#80737E", "#D0C2CE", "#913D8C",
+  "#000000", "#FFFFFF", "#342F34", "#F6EEF5",
+  "#913D8C", "#FFFFFF", "#FFD6FA", "#6D2E69",
+  "#586334", "#FFFFFF", "#DEE6C7", "#424A27",
+  "#006B5D", "#FFFFFF", "#B5EEE1", "#005046",
+  "#A8363B", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#211C21", "#342F34", "#E8E0E7",
+  "#D0C2CE", "#9A8D98", "#4F434D", "#FFAAF7",
+  "#000000", "#FFFFFF", "#E8E0E7", "#342F34",
+  "#FFAAF7", "#3F293D", "#603A5C", "#FFD6FA",
+  "#BFCC99", "#2E3226", "#434A30", "#DCE7BE",
+  "#57DBC5", "#193530", "#174F46", "#93F4E1",
+  "#FFB3B0", "#462827", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.19]
+seed = "magenta"
+rule = "triadic"
+light = [
+  "#FFF7FE", "#F6EEF5", "#E8E0E7", "#1F1A1F",
+  "#4F434D", "#80737E", "#D0C2CE", "#913D8C",
+  "#000000", "#FFFFFF", "#342F34", "#F6EEF5",
+  "#913D8C", "#FFFFFF", "#FFD6FA", "#6D2E69",
+  "#6E5D2D", "#FFFFFF", "#EDE2C3", "#524521",
+  "#006876", "#FFFFFF", "#B3ECF7", "#004E59",
+  "#A8363B", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#211C21", "#342F34", "#E8E0E7",
+  "#D0C2CE", "#9A8D98", "#4F434D", "#FFAAF7",
+  "#000000", "#FFFFFF", "#E8E0E7", "#342F34",
+  "#FFAAF7", "#3F293D", "#603A5C", "#FFD6FA",
+  "#D8C592", "#343024", "#4F462C", "#F1E2B9",
+  "#4ED8ED", "#17353A", "#124E57", "#9AF0FF",
+  "#FFB3B0", "#462827", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[schemes.20]
+seed = "magenta"
+rule = "tetradic"
+light = [
+  "#FFF7FE", "#F6EEF5", "#E8E0E7", "#1F1A1F",
+  "#4F434D", "#80737E", "#D0C2CE", "#913D8C",
+  "#000000", "#FFFFFF", "#342F34", "#F6EEF5",
+  "#913D8C", "#FFFFFF", "#FFD6FA", "#6D2E69",
+  "#845149", "#FFFFFF", "#FFDAD4", "#633D36",
+  "#146D34", "#FFFFFF", "#C5ECCC", "#105226",
+  "#A8363B", "#FFFFFF", "#226D15", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
+]
+dark = [
+  "#121212", "#211C21", "#342F34", "#E8E0E7",
+  "#D0C2CE", "#9A8D98", "#4F434D", "#FFAAF7",
+  "#000000", "#FFFFFF", "#E8E0E7", "#342F34",
+  "#FFAAF7", "#3F293D", "#603A5C", "#FFD6FA",
+  "#F3B9AE", "#3B2D2B", "#5D403B", "#FFDAD4",
+  "#87D899", "#223526", "#2C4E34", "#B1F2BE",
+  "#FFB3B0", "#462827", "#8ED981", "#233521",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
+]
+
+[map.grey32]
+light = [
+  0xF7, 0xEF, 0xDE, 0x19, 0x4A, 0x73, 0xC5, 0x5A,
+  0x00, 0xFF, 0x31, 0xEF, 0x5A, 0xFF, 0xDE, 0x4A,
+  0x5A, 0xFF, 0xDE, 0x4A, 0x5A, 0xFF, 0xDE, 0x4A,
+  0x5A, 0xFF, 0x5A, 0xFF, 0x5A, 0xFF, 0x5A, 0xFF,
+]
+
+[map.grey4]
+light = [
+  0xFF, 0xFF, 0xFF, 0x20, 0x60, 0x00, 0xA0, 0x00,
+  0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x20,
+  0x00, 0xFF, 0xFF, 0x20, 0x00, 0xFF, 0xFF, 0x20,
+  0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+]
+
+[map.grey2]
+light = [
+  0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00,
+  0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00,
+  0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+]
+
+# END GENERATED
+
+
+# --- springs ---------------------------------------------------------------------------------------------------------
+# Material 3's motion scheme (androidx StandardMotionTokens and ExpressiveMotionTokens). Stiffness and damping ratio,
+# at MASS 1: a spring that moves a mass other than 1 must scale its stiffness by it. A component names a token and never
+# a duration or a stiffness. Effects springs (colour, opacity) are critically damped, so they never overshoot.
+
+[springs]
+mass = 1
+
+[springs.standard]
+spatial_fast = { stiffness = 1400, damping = 0.9 }
+spatial = { stiffness = 700, damping = 0.9 }
+spatial_slow = { stiffness = 300, damping = 0.9 }
+effects_fast = { stiffness = 3800, damping = 1.0 }
+effects = { stiffness = 1600, damping = 1.0 }
+effects_slow = { stiffness = 800, damping = 1.0 }
+
+[springs.expressive]
+spatial_fast = { stiffness = 800, damping = 0.6 }
+spatial = { stiffness = 380, damping = 0.8 }
+spatial_slow = { stiffness = 200, damping = 0.8 }
+effects_fast = { stiffness = 3800, damping = 1.0 }
+effects = { stiffness = 1600, damping = 1.0 }
+effects_slow = { stiffness = 800, damping = 1.0 }
+
+# --- microinteractions -----------------------------------------------------------------------------------------------
+# One row for each thing a person acts on: what it does where things move, in tokens, and what it does where they do not.
+# scale is permille of the element's own size (a press sinks to 970, a key's preview pops to 1300, a modal starts from
+# 800); shift_px is how far below rest an arrival starts, or shift_mm where the distance is physical; stagger_ms is the
+# gap between siblings. follow is the token of what follows the first (a track's fill, a scrim).
+
+[micro.none]
+token = "effects"
+follow = "effects"
+moves = "draws nothing, so nothing moves"
+still = "the same"
+
+[micro.press]
+token = "spatial_fast"
+follow = "spatial_fast"
+scale = 970
+moves = "the fill inverts at once, never faded, and the control sinks to 0.97 scale and back on spatial fast; inside something that scrolls the sink waits 100 ms (Android's tap timeout), and a scroll or swipe that takes the press puts it back in one frame; a control whose longer side is over three touch targets inverts only"
+still = "the inversion, as before"
+
+[micro.select]
+token = "spatial"
+follow = "effects"
+moves = "the selection indicator slides to the new cell on spatial default"
+still = "the cell inverts"
+
+[micro.handle]
+token = "effects"
+follow = "effects"
+moves = "the handle follows the finger (LVGL's own drag), and a step by key glides it to the new value, a slider's over LVGL's animation time and a knob's arc on the value row's token"
+still = "the new value"
+
+[micro.key]
+token = "spatial_fast"
+follow = "effects_fast"
+scale = 1300
+moves = "a pressed key pops a magnified preview above it on spatial fast, gone on lift; layer changes cross-fade on effects fast"
+still = "the key inverts"
+
+[micro.list]
+token = "effects"
+follow = "effects"
+shift_px = 8
+stagger_ms = 16
+moves = "rows enter staggered, 16 ms apart, on effects default with a short rise"
+still = "rows appear"
+
+[micro.drawer]
+token = "spatial"
+follow = "effects"
+moves = "follows a drag, flings open or shut on spatial default, rubber-bands past its stops"
+still = "opens or shuts in one paint"
+
+[micro.modal]
+token = "spatial"
+follow = "effects"
+scale = 800
+moves = "grows from its source on spatial default, the scrim on effects default; leaves the same way"
+still = "appears, one paint"
+
+[micro.banner]
+token = "spatial"
+follow = "spatial_fast"
+moves = "slides in from its edge on spatial default, leaves on spatial fast"
+still = "appears"
+
+[micro.wheel]
+token = "spatial"
+follow = "spatial"
+moves = "a body: drag, fling, detents, spring"
+still = "steps a key per swipe"
+
+[micro.value]
+token = "effects"
+follow = "effects"
+moves = "a changed value of a knob or a progress ring eases on effects default; a live meter is not eased, since a level that trails the sound is wrong"
+still = "the new value"
+
+[micro.focus]
+token = "spatial_fast"
+follow = "spatial_fast"
+moves = "the focus ring moves between controls on spatial fast"
+still = "moves"
+
+[micro.screen]
+token = "spatial"
+follow = "effects"
+shift_mm = 10
+moves = "a shared-axis slide: the new screen in from the side, the old one out as a picture, on spatial default; a light image slides without fading"
+still = "replaces, one paint"
+
+[micro.press_row]
+token = "spatial_fast"
+follow = "spatial_fast"
+moves = "the fill inverts at once, never faded, and the row does not sink: a row is the width of its list, and scaling it rendered it whole into a layer on every frame of the spring"
+still = "the inversion, as before"
+
+# --- the tier contract -----------------------------------------------------------------------------------------------
+# What each tier promises, in words a second implementation can meet. The tier is a constant of a build, never decided
+# at run time; there is no frame watchdog and no reduce-motion setting, since either would be the device deciding what
+# its build already knows.
+
+[tier.still]
+promise = "Nothing moves. Every state change is one paint of the final state, and a pressed control shows its inversion and nothing else. A transform other than the identity is refused, and none of the motion engine is built."
+
+[tier.light]
+promise = "Springs move position, opacity and colour. A rotation or scale of an element larger than the board's limit lands at once, a fade is left out where its layer cannot be had, nothing is staggered, and a screen slides without fading."
+
+[tier.full]
+promise = "Everything in the micro table: layers are rotated and scaled whole, shadows are drawn, lists enter in turn, a screen change and the keyboard's page change cross-fade through a picture of the old contents."

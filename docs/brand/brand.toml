@@ -1,0 +1,68 @@
+# The identity this tree builds (plan 0024). One package per branch: vrx's own
+# here on vrx's branches; a client's on its brand/<client> branch, written by
+# scripts/brand-apply.sh. Every surface reads this directory; nothing else names
+# an identity. Validated by `vrx-brand check` (the one schema).
+#
+# Names and identifiers are the brand as much as the pixels: they become
+# os-release, /etc/issue, the hostname, file names, the USB gadget, Matter,
+# the Bluetooth alias, the hotspot, the kernel release (uname) and the UIs'
+# text. "powered by vrx" is not a field: the product always carries it.
+
+id = "vrx"                      # lowercase [a-z][a-z0-9-]*: the distro ID, file prefix, uname tag
+name = "vrx"                    # the OS name people read
+vendor = "vrx"                  # who makes it (os-release VENDOR_NAME)
+cpe_vendor = "vrx"              # os-release CPE_NAME's vendor part
+# home_url, support_url, bug_url, vendor_url: none published yet (optional)
+hostname_prefix = "vrx"         # the device's default hostname is <prefix>-<board>
+bluetooth_prefix = "vrx"
+hotspot_prefix = "vrx"
+
+[usb]                           # the USB gadget a host computer sees
+manufacturer = "vrx"
+vid = "0x1d6b"                  # Linux Foundation's multifunction gadget pair:
+pid = "0x0104"                  # a client ships its own (the audit reports these as unclaimed)
+
+[matter]
+vendor = "vrx"
+vid = "test"                    # the Matter test vendor and product (rs-matter's TEST_VID/PID);
+pid = "test"                    # a certified product sets its own numbers
+
+[legacy]
+launcher_label = "Launch vrx"   # the Sharp Brain's WinCE menu entry
+
+[palette]                       # vrx_brand.py's palette (brand/IDENTITY.md)
+ink = "#0B0D10"
+shade = "#9AA3B2"
+paper = "#EEF1F4"
+slate = "#545C6A"
+signal = "#5B8DEF"
+core = "#385794"
+track = "#1C2129"
+mist = "#8B93A1"
+
+[ui]
+# seed = "#RRGGBB"              # the default UI scheme's seed; absent: the UI standard's default scheme
+
+[logo]                          # logo/<shape>-<ground>.svg: paths only, no <text>, no external references
+mark = "mark"
+wordmark = "wordmark"
+
+[fonts]
+ui = "FiraSans-Regular.ttf"
+ui_light = "FiraSans-Light.ttf"
+ui_medium = "FiraSans-Medium.ttf"
+mono = "FiraCode-Regular.ttf"
+fallback = ["NotoSansMath-Regular.ttf", "NotoMusic-Regular.ttf"]
+
+[fonts.families]                # fontconfig family names, for the system defaults
+ui = "Fira Sans"
+mono = "Fira Code"
+fallback = ["Noto Sans Math", "Noto Music"]
+
+[fonts.licences]                # each face: its licence file and SPDX id
+"FiraSans-Regular.ttf" = ["firasans-OFL.txt", "OFL-1.1"]
+"FiraSans-Light.ttf" = ["firasans-OFL.txt", "OFL-1.1"]
+"FiraSans-Medium.ttf" = ["firasans-OFL.txt", "OFL-1.1"]
+"FiraCode-Regular.ttf" = ["firacode-OFL.txt", "OFL-1.1"]
+"NotoSansMath-Regular.ttf" = ["notosansmath-OFL.txt", "OFL-1.1"]
+"NotoMusic-Regular.ttf" = ["notomusic-OFL.txt", "OFL-1.1"]

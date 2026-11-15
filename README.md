@@ -456,3 +456,7 @@ This is why I created my own (userspace) touchscreen driver, for improved latenc
 
 ## 💬 Discord
 There a `#custom-embedders` channel on the [flutter discord](https://github.com/flutter/flutter/wiki/Chat) which you can use if you have any questions regarding flutter-pi or generally, anything related to embedding the engine for which you don't want to open issue about or write an email.
+
+## vrx identity
+
+**The vrx identity is `docs/brand/`**, generated from the vrx repo (its `scripts/brand-sync.sh`; the source is vrx's `docs/brand/IDENTITY.md` and `vrx_brand.py`): the wordmark and mark, the palette, the system fonts, the UI standard. Never edit it here, never draw the logo by hand or spell a brand colour or face; the name is **vrx**, always lowercase.

@@ -59,7 +59,6 @@
 
 #include "vrx_ipc.h"
 #include "vrx_kms.h"
-#include "vrx_power_profile.h"
 
 // ─── app client ───────────────────────────────────────────────────────────
 
@@ -162,11 +161,10 @@ struct vrx_compositor {
     int repeat_fd;
     uint32_t repeat_key;       // 0 = none held
 
-    // screen power (plan 0010): no input for light_off seconds turns the
-    // light and the panel off; the input that wakes them only wakes them
-    int idle_fd;               // timerfd
+    // screen power (plan 0010, plan 0023 D1): vrxhost decides when the
+    // screen goes dark or lights (MSG_SCREEN) and how far it dims
+    // (MSG_LIGHT_CAP); this executes it and keeps no timer of its own
     int conf_fd;               // inotify on the screen settings directory
-    uint32_t light_off;        // seconds, 0 = never
     int brightness;            // the setting, 0-100, mapped above a floor
     char backlight[96];        // /sys/class/backlight/<name>, "" = none
     int bl_max;                // its max_brightness, 0 = no backlight
@@ -205,16 +203,11 @@ struct vrx_compositor {
     struct vrx_msg_screen reported_screen;  // the last VRX_MSG_SCREEN sent
     bool reported_screen_valid;
     bool light_after_flip;     // waking: light once the newest frame is up
-    bool was_held;             // an app held the screen on, last we looked
-    // holds are logind's idle inhibitors (plan 0010 D3): the pids holding
-    // one, honoured for the focused app and the shell only
+    // the system bus: PrepareForSleep, so apps hear the system sleep
     sd_bus *bus;
-    pid_t inhibitors[32];
-    int n_inhibitors;
     struct udev_monitor *bl_mon;  // the backlight's change events
     int bl_level;              // the backlight's level while lit, as set
     int sig_fd;                // SIGTERM / SIGINT stop; SIGUSR1 writes the flip ring
-    int wake_devices;          // touch screens, pointers, keyboards present
     // input facts for the kit (plan 0013 D6, D7): touchscreens and
     // keyboards present, by udev's classification; a device's kinds are
     // kept so its removal undoes exactly what its arrival did
@@ -223,17 +216,6 @@ struct vrx_compositor {
     // one finger drives the UI (plan 0013 D8): the touch slot whose
     // contact is delivered, -1 when no contact is down
     int primary_touch;
-    // the cascade after the screen (plan 0012 D13): sleep, then deep sleep,
-    // counted from the same last input; what this board offers comes from
-    // its power profile (sleep, deep, charger-sleep lines)
-    int cascade_fd;            // timerfd on CLOCK_BOOTTIME: the next step
-    enum { STEP_NONE, STEP_SLEEP, STEP_DEEP } cascade_next;
-    uint32_t sleep_after;      // seconds from the last input, 0 = never
-    uint32_t deep_after;       // seconds from the last input, 0 = never
-    struct vrx_power_profile profile; // what this board offers (sleep, deep, off)
-    bool has_wakealarm;        // an RTC that can wake the board on a timer
-    bool sleep_blocked;        // a logind `sleep` block inhibitor is held
-    bool refusal_logged;       // this dark period's refusal was said once
     int sleep_inhibit_fd;      // our logind `sleep` delay inhibitor, -1
     int sleep_ack_fd;          // timerfd: release the delay after 1 s
     bool sleeping;             // between PrepareForSleep(true) and (false)
@@ -632,7 +614,6 @@ static void screen_facts(const struct vrx_compositor *c);
 static void display_on(struct vrx_compositor *c, const char *why);
 static void display_off(struct vrx_compositor *c, const char *why);
 static void display_tell(struct vrx_compositor *c, int only);
-static void hold_changed(struct vrx_compositor *c, const char *why);
 static bool chrome_shown(const struct vrx_compositor *c);
 static uint64_t dim_alpha(const struct vrx_compositor *c);
 
@@ -1384,7 +1365,6 @@ static void apply_want_shell(struct vrx_compositor *c) {
                 (int) c->apps[slot].pid, c->shell_plane);
     }
     send_insets(c, -1);
-    hold_changed(c, "shell changed");
 }
 
 static void focus_slot(struct vrx_compositor *c, int slot) {
@@ -1401,8 +1381,6 @@ static void focus_slot(struct vrx_compositor *c, int slot) {
         client_send(c, c->apps[old].fd, VRX_MSG_FOCUS,
                     &(struct vrx_msg_focus){ .focused = 0 }, sizeof(struct vrx_msg_focus), -1);
     }
-    // a hold counts only while its app is in front
-    hold_changed(c, "focus changed");
     if (slot < 0) {
         fprintf(stderr, "[vrx-compositor] focus -> none\n");
         return;
@@ -1471,9 +1449,6 @@ static void drop_client(struct vrx_compositor *c, int slot) {
         if (c->touch_owner[i] == slot) c->touch_owner[i] = -1;
     }
     if (c->pointer_owner == slot) c->pointer_owner = -1;
-    // its inhibitor dies with the process (logind's fd); until logind says
-    // so, a gone app's pid matches nothing focused
-    hold_changed(c, "app gone");
 }
 
 // Handle one message. `fd` is the descriptor that rode it, or -1; this
@@ -1539,14 +1514,12 @@ static void client_handle(struct vrx_compositor *c, int slot,
         case VRX_MSG_SCREEN: {
             struct vrx_msg_screen *m = payload;
             if (h->length < sizeof *m) goto bad;
+            // vrxhost's word (plan 0023 D1): its idle chain, the lid, the
+            // power key, a resume, a home app's On/Off
             if (m->on) {
-                display_on(c, "matter");
-            } else if (c->wake_devices > 0) {
-                display_off(c, "matter");
+                display_on(c, "vrxhost");
             } else {
-                // the idle timeout's rule (plan 0010 D10): never dark with
-                // nothing a person can wake it with
-                fprintf(stderr, "[vrx-compositor] screen off refused (matter): nothing can wake it\n");
+                display_off(c, "vrxhost");
             }
             // the answer either way: what the screen is now
             screen_report(c);
@@ -1590,7 +1563,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
             uint32_t cap = m->permille > 1000 ? 1000 : m->permille;
             if (cap != c->light_cap) {
                 fprintf(stderr, "[vrx-compositor] brightness cap %u/1000 above the floor%s\n", cap,
-                        cap == 1000 ? " (none)" : " (the battery is low)");
+                        cap == 1000 ? " (none)" : cap == 0 ? " (dimmed)" : " (low power)");
                 c->light_cap = cap;
                 screen_light(c);
             }
@@ -1893,21 +1866,21 @@ static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m)
     }
 }
 
-// ── screen power (plan 0010) ────────────────────────────────────────────
-// The compositor alone turns the screen off and on (D1): after light_off
-// seconds without input the light goes to 0 and the connector to DPMS off;
-// the next touch, click or key brings both back and is not delivered. No
-// setting means "off": brightness is a position 0-100 that maps into a
-// floor-to-full range, so a stored 0 is still a screen a person can read
-// (the owner, 2026-10-14). Linux first (the owner, same day): a hold is a
-// logind idle inhibitor, a dimmable backlight's level is its own sysfs
-// value (persisted by systemd-backlight, written by applets holding the
-// display grant), and this file holds only what Linux has no home for:
-// the timeout, and the brightness of a screen dimmed by plane alpha.
+// ── screen power (plan 0010, plan 0023 D1) ──────────────────────────────
+// vrxhost decides; the compositor executes. vrxhost's idle chain (dim,
+// screen off, sleep, deep sleep, from the last input it reads on evdev)
+// sends MSG_SCREEN to turn the light to 0 and the connector to DPMS off,
+// or both back on, and MSG_LIGHT_CAP to dim (0: the floor) or to cap the
+// light under low power. No setting means "off": brightness is a position
+// 0-100 that maps into a floor-to-full range, so a stored 0 is still a
+// screen a person can read (the owner, 2026-10-14). Linux first (the
+// owner, same day): a dimmable backlight's level is its own sysfs value
+// (persisted by systemd-backlight, written by applets holding the display
+// grant), and this file holds only what Linux has no home for: the
+// brightness of a screen dimmed by plane alpha, and the output.
 #define SCREEN_DIR "/etc/vrx/display"
 #define SCREEN_FILE SCREEN_DIR "/screen.conf"
 #define SCREEN_FACTS VRX_UI_SOCKET_DIR "/screen"
-#define LIGHT_OFF_DEFAULT 120
 // the floors (D8): a tenth of a dimmable backlight; with a dim plane, the
 // screen at 0.4 of its full level (the black plane at alpha 0.6), about
 // 13 % of full luminance, since alpha scales encoded values
@@ -2005,87 +1978,15 @@ static void screen_report(struct vrx_compositor *c) {
 
 static int on_prepare_for_sleep(sd_bus_message *m, void *userdata, sd_bus_error *ret_error);
 static void sleep_delay_take(struct vrx_compositor *c);
-static void cascade_arm(struct vrx_compositor *c);
-static void cascade_disarm(struct vrx_compositor *c);
-static bool sleep_wake_source(void);
-static void profile_read(struct vrx_compositor *c);
-
-// An idle inhibitor is held by the focused app or the shell. One held by
-// an app in the background counts for nothing, the open-book lesson
-// (evrx-rt docs/20): the screen is held for what is being watched.
-static bool held(const struct vrx_compositor *c) {
-    for (int k = 0; k < c->n_inhibitors; k++) {
-        if (c->focused >= 0 && c->apps[c->focused].pid == c->inhibitors[k]) return true;
-        if (c->shell >= 0 && c->apps[c->shell].pid == c->inhibitors[k]) return true;
-    }
-    return false;
-}
-
-// logind's idle inhibitors, as pids. Read at start and whenever logind
-// says BlockInhibited changed (it does, on every take and release).
-static void inhibitors_read(struct vrx_compositor *c) {
-    sd_bus_message *reply = NULL;
-    sd_bus_error err = SD_BUS_ERROR_NULL;
-    c->n_inhibitors = 0;
-    c->sleep_blocked = false;
-    int r = sd_bus_call_method(c->bus, "org.freedesktop.login1", "/org/freedesktop/login1",
-                               "org.freedesktop.login1.Manager", "ListInhibitors", &err, &reply, "");
-    if (r < 0) {
-        fprintf(stderr, "[vrx-compositor] ListInhibitors: %s\n", err.message ? err.message : strerror(-r));
-        sd_bus_error_free(&err);
-        return;
-    }
-    if (sd_bus_message_enter_container(reply, 'a', "(ssssuu)") >= 0) {
-        const char *what, *who, *why, *mode;
-        uint32_t uid, pid;
-        while (sd_bus_message_read(reply, "(ssssuu)", &what, &who, &why, &mode, &uid, &pid) > 0) {
-            if (strstr(what, "idle") && strcmp(mode, "block") == 0 && c->n_inhibitors < 32) {
-                c->inhibitors[c->n_inhibitors++] = (pid_t) pid;
-                fprintf(stderr, "[vrx-compositor] idle inhibitor: %s (pid %u): %s\n", who, pid, why);
-            }
-            // a recording, a transfer, a model answering: sleep waits
-            // (logind lets root ignore a block, so the cascade checks it)
-            if (strstr(what, "sleep") && strcmp(mode, "block") == 0) {
-                c->sleep_blocked = true;
-                fprintf(stderr, "[vrx-compositor] sleep inhibitor: %s (pid %u): %s\n", who, pid, why);
-            }
-        }
-    }
-    sd_bus_message_unref(reply);
-}
-
-static int on_logind_changed(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
-    (void) ret_error;
-    struct vrx_compositor *c = userdata;
-    const char *iface;
-    if (sd_bus_message_read(m, "s", &iface) < 0) return 0;
-    if (sd_bus_message_enter_container(m, 'a', "{sv}") < 0) return 0;
-    bool changed = false;
-    while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
-        const char *name;
-        if (sd_bus_message_read(m, "s", &name) < 0) break;
-        if (strcmp(name, "BlockInhibited") == 0) changed = true;
-        sd_bus_message_skip(m, "v");
-        sd_bus_message_exit_container(m);
-    }
-    if (changed) {
-        inhibitors_read(c);
-        hold_changed(c, "logind inhibitors changed");
-    }
-    return 0;
-}
 
 static void logind_init(struct vrx_compositor *c) {
     if (sd_bus_open_system(&c->bus) < 0) {
-        fprintf(stderr, "[vrx-compositor] no system bus: nothing can hold the screen on\n");
+        fprintf(stderr, "[vrx-compositor] no system bus: apps are not told when the system sleeps\n");
         c->bus = NULL;
         return;
     }
     sd_bus_match_signal(c->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
-                        "org.freedesktop.DBus.Properties", "PropertiesChanged", on_logind_changed, c);
-    sd_bus_match_signal(c->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
                         "org.freedesktop.login1.Manager", "PrepareForSleep", on_prepare_for_sleep, c);
-    inhibitors_read(c);
     sleep_delay_take(c);
 }
 
@@ -2134,15 +2035,6 @@ static void on_stop(struct vrx_compositor *c) {
     c->running = false;
 }
 
-// The timer runs only while the screen is on, nothing holds it, the
-// setting allows it, and something can wake the screen again (D10).
-static void idle_arm(struct vrx_compositor *c) {
-    if (c->idle_fd < 0) return;
-    bool armed = c->light_off && !c->dark && !held(c) && c->wake_devices > 0;
-    struct itimerspec t = { .it_value = { .tv_sec = armed ? c->light_off : 0 } };
-    timerfd_settime(c->idle_fd, 0, &t, NULL);
-}
-
 // Tell every app whether there is a screen to draw on.
 static void display_tell(struct vrx_compositor *c, int only) {
     struct vrx_msg_display m = { .on = !c->dark };
@@ -2177,10 +2069,7 @@ static void display_off(struct vrx_compositor *c, const char *why) {
         }
     }
     display_tell(c, -1);
-    idle_arm(c);
     fprintf(stderr, "[vrx-compositor] screen off (%s)\n", why);
-    c->refusal_logged = false;
-    cascade_arm(c);
     screen_report(c);
 }
 
@@ -2200,38 +2089,8 @@ static void display_on(struct vrx_compositor *c, const char *why) {
         c->light_after_flip = false;
         screen_light(c);
     }
-    idle_arm(c);
-    cascade_disarm(c);
     fprintf(stderr, "[vrx-compositor] screen on (%s)\n", why);
     screen_report(c);
-}
-
-// A hold that starts counting wakes the screen; one that stops counting
-// restarts the full timeout rather than ending the screen at once.
-static void hold_changed(struct vrx_compositor *c, const char *why) {
-    bool h = held(c);
-    if (h == c->was_held) return;
-    c->was_held = h;
-    fprintf(stderr, "[vrx-compositor] screen %s (%s)\n", h ? "held on" : "no longer held", why);
-    if (h) display_on(c, why);
-    idle_arm(c);
-}
-
-// A device a person wakes the screen with, as udev classifies it: a
-// touchscreen, keyboard, mouse, touchpad or tablet. vc4's HDMI CEC inputs
-// are present with or without a TV and udev tags them only as keys and a
-// pointing stick, so they do not count (bench, CM4, 2026-10-14).
-static bool can_wake(struct libinput_device *d) {
-    static const char *kinds[] = { "ID_INPUT_TOUCHSCREEN", "ID_INPUT_KEYBOARD", "ID_INPUT_MOUSE",
-                                   "ID_INPUT_TOUCHPAD", "ID_INPUT_TABLET" };
-    struct udev_device *u = libinput_device_get_udev_device(d);
-    bool yes = false;
-    for (size_t i = 0; u && i < sizeof kinds / sizeof kinds[0] && !yes; i++) {
-        const char *v = udev_device_get_property_value(u, kinds[i]);
-        yes = v && strcmp(v, "1") == 0;
-    }
-    if (u) udev_device_unref(u);
-    return yes;
 }
 
 enum { INPUT_TOUCH = 1, INPUT_KEYBOARD = 2 };
@@ -2277,15 +2136,6 @@ static void input_facts_changed(struct vrx_compositor *c, struct libinput_device
     screen_facts(c);
 }
 
-static void wake_devices_changed(struct vrx_compositor *c, int delta, const char *name) {
-    c->wake_devices += delta;
-    fprintf(stderr, "[vrx-compositor] %s %s: %d device%s can wake the screen%s\n", name,
-            delta > 0 ? "added" : "removed", c->wake_devices, c->wake_devices == 1 ? "" : "s",
-            c->wake_devices ? "" : "; it stays on");
-    if (!c->wake_devices) display_on(c, "nothing left to wake it");
-    idle_arm(c);
-}
-
 // The value of `key` in a key=value file; false when absent.
 static bool conf_value(const char *path, const char *key, char *out, size_t cap) {
     FILE *f = fopen(path, "re");
@@ -2324,20 +2174,10 @@ static int conf_int(const char *key, int fallback) {
 }
 
 static void screen_read_conf(struct vrx_compositor *c) {
-    int light_off = conf_int("light_off", LIGHT_OFF_DEFAULT);
-    // the cascade's later steps (plan 0012 D13); 0 or absent: never. The
-    // Settings rows keep light_off <= sleep_after <= deep_after; a step
-    // set earlier than the one before it is taken as never.
-    c->sleep_after = (uint32_t) conf_int("sleep_after", 0);
-    c->deep_after = (uint32_t) conf_int("deep_after", 0);
     // a dimmable backlight keeps its own level (sysfs, systemd-backlight);
     // the file's brightness is only for a screen dimmed by plane alpha
     int brightness = c->dim == DIM_BACKLIGHT ? 100 : conf_int("brightness", 100);
     if (brightness > 100) brightness = 100;
-    if ((uint32_t) light_off != c->light_off) {
-        fprintf(stderr, "[vrx-compositor] screen off after %ds idle%s\n", light_off, light_off ? "" : " (never)");
-        c->light_off = (uint32_t) light_off;
-    }
     if (brightness != c->brightness) {
         if (c->dim != DIM_BACKLIGHT) {
             fprintf(stderr, "[vrx-compositor] brightness %d%s\n", brightness, c->dim == DIM_NONE ? " (this screen cannot dim)" : "");
@@ -2346,11 +2186,11 @@ static void screen_read_conf(struct vrx_compositor *c) {
         screen_light(c);
         screen_report(c);
     }
-    idle_arm(c);
 }
 
 // What this screen can do, for the kit: whether a brightness slider means
-// anything here, which cascade steps exist, and what input is present.
+// anything here, and what input is present. What the board's power offers
+// (sleep, deep sleep, Power off) is vrxhost's (io.vrx.Host.PowerSettings).
 // Written at start and whenever an input device comes or goes.
 static void screen_facts(const struct vrx_compositor *c) {
     static const char *names[] = { "none", "backlight", "alpha" };
@@ -2361,13 +2201,6 @@ static void screen_facts(const struct vrx_compositor *c) {
         return;
     }
     fprintf(f, "dim=%s\n", names[c->dim]);
-    // the cascade's offered steps (plan 0012 D13), for Settings' rows
-    fprintf(f, "sleep=%s\n", vrx_profile_sleep_offered(&c->profile, c->profile.sleep[0] && sleep_wake_source()));
-    fprintf(f, "deep=%s\n", vrx_profile_deep_offered(&c->profile));
-    // what a person's Power off does (plan 0020 D4), for Settings' sentence
-    fprintf(f, "off=%s\n", c->profile.off);
-    fprintf(f, "off_wake=%s\n", c->profile.off_wake);
-    fprintf(f, "wakealarm=%s\n", c->has_wakealarm ? "yes" : "no");
     // input facts (plan 0013 D6, D7): the kit floors touch targets only
     // where a finger can touch, and the on-screen keyboard steps aside
     // where a physical one is plugged in
@@ -2457,12 +2290,9 @@ static void dim_init(struct vrx_compositor *c) {
 }
 
 static void screen_init(struct vrx_compositor *c) {
-    c->idle_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-    c->cascade_fd = timerfd_create(CLOCK_BOOTTIME, TFD_CLOEXEC | TFD_NONBLOCK);
     c->sleep_ack_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     c->sleep_inhibit_fd = -1;
     c->light_cap = 1000;
-    profile_read(c);
     DIR *d = opendir("/sys/class/backlight");
     if (d) {
         struct dirent *e;
@@ -2508,232 +2338,6 @@ static void screen_conf_changed(struct vrx_compositor *c) {
     screen_read_conf(c);
 }
 
-static void idle_fire(struct vrx_compositor *c) {
-    uint64_t expirations;
-    if (read(c->idle_fd, &expirations, sizeof expirations) != sizeof expirations) return;
-    if (c->dark || !c->light_off || held(c) || !c->wake_devices) return;
-    display_off(c, "idle");
-}
-
-// Every input re-arms the timer. On a dark screen the first touch, click
-// or key turns it on and is not delivered, nor is the rest of it (a touch
-// until every contact is up, a click until its buttons are, a key until
-// its release); motion wakes and goes through.
-// The wake contact IS delivered (the owner, 2026-10-18: "the drawer still
-// takes 2 swipes" — the first swipe woke a dark screen and plan 0010 D1's
-// swallow ate it; a swipe that wakes the screen must open the drawer in
-// the same motion, like every phone). Waking changes no layout and no
-// input mapping, so there is nothing the contact could land wrong on.
-static bool idle_swallows(struct vrx_compositor *c, const struct vrx_msg_input *m) {
-    if (c->dark) display_on(c, "input");
-    idle_arm(c);
-    return false;
-}
-
-
-// ── the cascade: sleep and deep sleep (plan 0012 D13, D14) ──────────────
-// After the screen goes off the compositor takes the next steps from the
-// same last input: sleep (logind Suspend) after sleep_after, deep sleep
-// (logind Halt into the SoC's standby) after deep_after, where the board
-// offers them. What a board offers is a fact of its power profile, one
-// file with the measured numbers (vrx-power-tuning installs it):
-//   sleep <state> saving=<pct> measured=<date> meter=<name>
-//   deep halt
-//   charger-sleep yes
-// The build refuses a sleep line saving less than the owner's threshold
-// (10 % of the idle floor) or without its measurement; here a missing
-// line means the step is not offered. Linux does the rest: systemd-sleep
-// writes the state, logind tells everyone through PrepareForSleep.
-#define PROFILE_FILE "/usr/share/vrx/power-profile"
-#define PROFILE_DIR "/usr/share/vrx/power-profile.d"
-// read last, withdraw-only: what the device found at boot that the build
-// could not know (plan 0020 D3: a Pi bootloader without POWER_OFF_ON_HALT)
-#define PROFILE_RUN_DIR "/run/vrx/power-profile.d"
-
-static void profile_raised(const char *line, void *ctx) {
-    fprintf(stderr, "[vrx-compositor] %s: \"%s\" would raise a step: ignored (runtime lines only withdraw)\n",
-            (const char *) ctx, line);
-}
-
-static void profile_file(struct vrx_compositor *c, const char *path, bool runtime) {
-    FILE *f = fopen(path, "re");
-    if (!f) return;
-    char text[8192];
-    size_t n = fread(text, 1, sizeof text - 1, f);
-    fclose(f);
-    text[n] = 0;
-    vrx_profile_text(&c->profile, text, runtime, profile_raised, (void *) path);
-}
-
-static void profile_dir(struct vrx_compositor *c, const char *dir, bool runtime) {
-    struct dirent **names;
-    int n = scandir(dir, &names, NULL, alphasort);
-    for (int i = 0; i < n; i++) {
-        if (names[i]->d_name[0] != '.') {
-            char path[320];
-            snprintf(path, sizeof path, "%s/%s", dir, names[i]->d_name);
-            profile_file(c, path, runtime);
-        }
-        free(names[i]);
-    }
-    if (n >= 0) free(names);
-}
-
-// The family's profile, then each carrier's in power-profile.d (sorted),
-// then the device's withdrawals in /run.
-static void profile_read(struct vrx_compositor *c) {
-    vrx_profile_init(&c->profile);
-    profile_file(c, PROFILE_FILE, false);
-    profile_dir(c, PROFILE_DIR, false);
-    profile_dir(c, PROFILE_RUN_DIR, true);
-    c->has_wakealarm = access("/sys/class/rtc/rtc0/wakealarm", W_OK) == 0;
-    // deep sleep is a halt the board cannot leave on its own: offered only
-    // with a timed wake (the owner, 2026-10-14: no "Power off when idle"
-    // on a board without one, it would lose alarms)
-    if (vrx_profile_finish(&c->profile, c->has_wakealarm))
-        fprintf(stderr, "[vrx-compositor] the profile offers deep sleep but no RTC can wake the board: not offered\n");
-    fprintf(stderr, "[vrx-compositor] cascade: sleep %s, deep sleep %s, timed wake %s, power off %s%s%s\n",
-            c->profile.sleep[0] ? c->profile.sleep : "not offered", c->profile.deep[0] ? c->profile.deep : "not offered",
-            c->has_wakealarm ? "yes" : "no", c->profile.off, c->profile.off_wake[0] ? ", wake by " : "",
-            c->profile.off_wake);
-}
-
-// A person can wake the board from sleep: an input device a person uses
-// (udev's classification, as can_wake) whose device, or a parent, the
-// kernel will let wake the system (power/wakeup = enabled). A touch
-// controller whose driver frees its interrupt in suspend (goodix) has no
-// such parent, and then sleep would be a dark board nobody can wake.
-static bool sleep_wake_source(void) {
-    static const char *kinds[] = { "ID_INPUT_TOUCHSCREEN", "ID_INPUT_KEYBOARD", "ID_INPUT_MOUSE",
-                                   "ID_INPUT_TOUCHPAD", "ID_INPUT_TABLET" };
-    struct udev *udev = udev_new();
-    if (!udev) return false;
-    struct udev_enumerate *e = udev_enumerate_new(udev);
-    udev_enumerate_add_match_subsystem(e, "input");
-    udev_enumerate_scan_devices(e);
-    bool found = false;
-    struct udev_list_entry *it;
-    udev_list_entry_foreach(it, udev_enumerate_get_list_entry(e)) {
-        if (found) break;
-        struct udev_device *d = udev_device_new_from_syspath(udev, udev_list_entry_get_name(it));
-        if (!d) continue;
-        bool person = false;
-        for (size_t i = 0; i < sizeof kinds / sizeof kinds[0] && !person; i++) {
-            const char *v = udev_device_get_property_value(d, kinds[i]);
-            person = v && strcmp(v, "1") == 0;
-        }
-        for (struct udev_device *p = d; person && p && !found; p = udev_device_get_parent(p)) {
-            const char *w = udev_device_get_sysattr_value(p, "power/wakeup");
-            found = w && strcmp(w, "enabled") == 0;
-        }
-        udev_device_unref(d);
-    }
-    udev_enumerate_unref(e);
-    udev_unref(udev);
-    return found;
-}
-
-// On a charger: a mains or USB supply reports itself online.
-static bool on_charger(void) {
-    DIR *d = opendir("/sys/class/power_supply");
-    if (!d) return false;
-    bool online = false;
-    struct dirent *e;
-    while (!online && (e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char dir[288], type[32] = "";
-        snprintf(dir, sizeof dir, "/sys/class/power_supply/%s", e->d_name);
-        char path[320];
-        snprintf(path, sizeof path, "%s/type", dir);
-        FILE *f = fopen(path, "re");
-        if (f) {
-            if (!fgets(type, sizeof type, f)) type[0] = 0;
-            fclose(f);
-        }
-        if (strncmp(type, "Battery", 7) != 0 && sysfs_int(dir, "online") == 1) online = true;
-    }
-    closedir(d);
-    return online;
-}
-
-static void cascade_set(struct vrx_compositor *c, int seconds) {
-    if (c->cascade_fd < 0) return;
-    struct itimerspec t = { .it_value = { .tv_sec = seconds > 0 ? seconds : 0 } };
-    timerfd_settime(c->cascade_fd, 0, &t, NULL);
-}
-
-// After the screen went off (light_off after the last input): arm the next
-// step the board offers, counted from the same last input. CLOCK_BOOTTIME,
-// so a step after a sleep still counts the time asleep.
-static void cascade_arm(struct vrx_compositor *c) {
-    c->cascade_next = STEP_NONE;
-    if (c->profile.sleep[0] && c->sleep_after > c->light_off) {
-        c->cascade_next = STEP_SLEEP;
-        cascade_set(c, (int) (c->sleep_after - c->light_off));
-    } else if (c->profile.deep[0] && c->deep_after > c->light_off) {
-        c->cascade_next = STEP_DEEP;
-        cascade_set(c, (int) (c->deep_after - c->light_off));
-    } else {
-        cascade_set(c, 0);
-    }
-}
-
-static void cascade_disarm(struct vrx_compositor *c) {
-    c->cascade_next = STEP_NONE;
-    cascade_set(c, 0);
-}
-
-// Why this step must not happen now, or NULL (the rule is the pure
-// vrx_cascade_refusal; this gathers what the board says right now).
-static const char *cascade_refusal(struct vrx_compositor *c, int step) {
-    struct vrx_cascade_inputs in = {
-        .dark = c->dark,
-        .held = held(c),
-        .sleep_blocked = c->sleep_blocked,
-        .bus = c->bus != NULL,
-        .wake_source = step == STEP_SLEEP && sleep_wake_source(),
-        .has_wakealarm = c->has_wakealarm,
-        .on_charger = !c->profile.charger_sleep && on_charger(),
-    };
-    return vrx_cascade_refusal(&c->profile, step == STEP_SLEEP ? VRX_STEP_SLEEP : VRX_STEP_DEEP, &in);
-}
-
-static void cascade_fire(struct vrx_compositor *c) {
-    uint64_t expirations;
-    if (read(c->cascade_fd, &expirations, sizeof expirations) != sizeof expirations) return;
-    int step = c->cascade_next;
-    if (step == STEP_NONE) return;
-    const char *why = cascade_refusal(c, step);
-    if (why) {
-        if (!c->refusal_logged) {
-            fprintf(stderr, "[vrx-compositor] %s refused: %s\n", step == STEP_SLEEP ? "sleep" : "deep sleep", why);
-            c->refusal_logged = true;
-        }
-        // a step that cannot happen now is tried again in a minute (a
-        // hold may end, a charger may come off)
-        cascade_set(c, 60);
-        return;
-    }
-    const char *method = step == STEP_SLEEP ? "Suspend" : "Halt";
-    fprintf(stderr, "[vrx-compositor] idle: %s (%s)\n", step == STEP_SLEEP ? "sleep" : "deep sleep",
-            step == STEP_SLEEP ? c->profile.sleep : c->profile.deep);
-    sd_bus_error err = SD_BUS_ERROR_NULL;
-    int r = sd_bus_call_method(c->bus, "org.freedesktop.login1", "/org/freedesktop/login1",
-                               "org.freedesktop.login1.Manager", method, &err, NULL, "b", 0);
-    if (r < 0) {
-        fprintf(stderr, "[vrx-compositor] logind %s: %s\n", method, err.message ? err.message : strerror(-r));
-        sd_bus_error_free(&err);
-        cascade_set(c, 60);
-        return;
-    }
-    c->cascade_next = STEP_NONE;
-    // after a sleep, deep sleep follows from the same last input
-    if (step == STEP_SLEEP && c->profile.deep[0] && c->deep_after > c->sleep_after) {
-        c->cascade_next = STEP_DEEP;
-        cascade_set(c, (int) (c->deep_after - c->sleep_after));
-    }
-}
-
 // Before sleep: a logind delay inhibitor, so applets get PrepareForSleep
 // as lifecycle (paused) and up to a second to save; released then.
 static void sleep_delay_take(struct vrx_compositor *c) {
@@ -2776,10 +2380,6 @@ static int on_prepare_for_sleep(sd_bus_message *m, void *userdata, sd_bus_error 
     } else {
         fprintf(stderr, "[vrx-compositor] the system woke\n");
         sleep_delay_take(c);
-        // the screen stays dark until a person wakes it (an alarm holds it
-        // on); the next step counts again from now
-        c->refusal_logged = false;
-        if (c->dark) cascade_arm(c);
     }
     return 0;
 }
@@ -2795,7 +2395,6 @@ static void sleep_ack_fire(struct vrx_compositor *c) {
 }
 
 static void send_input(struct vrx_compositor *c, const struct vrx_msg_input *m) {
-    if (idle_swallows(c, m)) return;
     int target = input_target(c, m);
     if (target < 0 || !c->apps[target].in_use) return;
     client_send(c, c->apps[target].fd, VRX_MSG_INPUT, m, sizeof *m, -1);
@@ -2857,16 +2456,11 @@ static void li_dispatch(struct vrx_compositor *c) {
             if (libinput_device_config_tap_get_finger_count(d) > 0) {
                 libinput_device_config_tap_set_enabled(d, LIBINPUT_CONFIG_TAP_ENABLED);
             }
-            if (can_wake(d)) {
-                libinput_device_set_user_data(d, c);
-                wake_devices_changed(c, +1, libinput_device_get_name(d));
-            }
             input_facts_changed(c, d, true);
             break;
         }
         case LIBINPUT_EVENT_DEVICE_REMOVED: {
             struct libinput_device *d = libinput_event_get_device(ev);
-            if (libinput_device_get_user_data(d) == c) wake_devices_changed(c, -1, libinput_device_get_name(d));
             input_facts_changed(c, d, false);
             break;
         }
@@ -2992,12 +2586,10 @@ static void li_dispatch(struct vrx_compositor *c) {
 #define TAG_LIBINPUT  0xFFFFFFFFFFFFFFFDull
 #define TAG_DRM       0xFFFFFFFFFFFFFFFCull
 #define TAG_REPEAT    0xFFFFFFFFFFFFFFFBull
-#define TAG_IDLE      0xFFFFFFFFFFFFFFFAull
 #define TAG_CONF      0xFFFFFFFFFFFFFFF9ull
 #define TAG_BUS       0xFFFFFFFFFFFFFFF8ull
 #define TAG_BACKLIGHT 0xFFFFFFFFFFFFFFF7ull
 #define TAG_SIGNAL    0xFFFFFFFFFFFFFFF6ull
-#define TAG_CASCADE   0xFFFFFFFFFFFFFFF5ull
 #define TAG_SLEEPACK  0xFFFFFFFFFFFFFFF4ull
 #define CLIENT_TAG(slot, fd) (((uint64_t) (uint32_t) (fd) << 32) | (uint32_t) (slot))
 
@@ -3074,17 +2666,9 @@ int vrx_compositor_main(int argc, char **argv) {
     c.active_prop = prop_id(c.drm_fd, c.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
     screen_init(&c);
     scene_init(&c);
-    if (c.idle_fd >= 0) {
-        ev.data.u64 = TAG_IDLE;
-        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.idle_fd, &ev);
-    }
     if (c.conf_fd >= 0) {
         ev.data.u64 = TAG_CONF;
         epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.conf_fd, &ev);
-    }
-    if (c.cascade_fd >= 0) {
-        ev.data.u64 = TAG_CASCADE;
-        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.cascade_fd, &ev);
     }
     if (c.sleep_ack_fd >= 0) {
         ev.data.u64 = TAG_SLEEPACK;
@@ -3141,8 +2725,6 @@ int vrx_compositor_main(int argc, char **argv) {
                 drm_readable(&c);
             } else if (tag == TAG_REPEAT) {
                 repeat_fire(&c);
-            } else if (tag == TAG_IDLE) {
-                idle_fire(&c);
             } else if (tag == TAG_CONF) {
                 screen_conf_changed(&c);
             } else if (tag == TAG_BUS) {
@@ -3151,8 +2733,6 @@ int vrx_compositor_main(int argc, char **argv) {
                 backlight_changed(&c);
             } else if (tag == TAG_SIGNAL) {
                 on_stop(&c);
-            } else if (tag == TAG_CASCADE) {
-                cascade_fire(&c);
             } else if (tag == TAG_SLEEPACK) {
                 sleep_ack_fire(&c);
             } else {

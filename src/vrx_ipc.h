@@ -91,8 +91,9 @@ enum vrx_msg_type {
     VRX_MSG_DISPLAY = 17,
     // vrxhost -> comp: cap the screen's brightness at `permille` of the
     // range above the floor (1000 = no cap) without touching the stored
-    // setting: the battery's WARN zone (plan 0012 D10). The compositor
-    // stays the light's one owner.
+    // setting: vrxhost's dim step (0, the floor) and its low-power mode
+    // (the profile's `lowpower light`), plan 0023 D1, D6. The decision is
+    // vrxhost's; the compositor executes it.
     VRX_MSG_LIGHT_CAP = 18,
     // comp -> app: the system is about to sleep (sleeping = 1) or woke (0),
     // from logind's PrepareForSleep, which the compositor delays by up to
@@ -118,9 +119,10 @@ enum vrx_msg_type {
     // riding the message), written by the compositor to
     // /run/vrx-ui/semantics/<app id>.json for the walk driver.
     VRX_MSG_SEMANTICS_TREE = 23,
-    // vrxhost -> comp: turn the screen on (on = 1) or off (0), a home app's
-    // On/Off through Matter (vrx plan 0015 D12); the same off the idle
-    // timeout takes, refused where nothing can wake the screen again.
+    // vrxhost -> comp: turn the screen on (on = 1) or off (0): vrxhost's
+    // idle chain, the lid, the power key, a resume, a home app's On/Off
+    // through Matter (vrx plans 0015 D12, 0023 D1). The compositor keeps
+    // no idle timer of its own; it executes.
     // comp -> vrxhost: the screen went on or off, or its brightness moved
     // (position 0-100, -1 where it cannot dim); sent on CONTROL too.
     VRX_MSG_SCREEN = 24,

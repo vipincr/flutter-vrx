@@ -2357,7 +2357,7 @@ static void vrx_send_settings(void) {
 
 // Reduce motion (plan 0017 D5): the screen settings file's `reduce_motion=0|1`
 // (the kit's ScreenSettings writes it, the compositor reads the same file
-// for light_off and brightness) goes to Flutter as the accessibility feature
+// for the output and the brightness) goes to Flutter as the accessibility feature
 // disableAnimations, so it reaches every applet as MediaQuery.disableAnimations
 // and the kit's motion engine reads that one flag. Only a change is sent.
 #define VRX_SCREEN_DIR "/etc/vrx/display"
