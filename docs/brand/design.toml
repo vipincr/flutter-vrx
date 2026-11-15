@@ -1,0 +1,10 @@
+# vrx's design system overrides (plan 0025): none. vrx's look is the design
+# system's defaults, held in evrx-rt's standard/vrx-ui-standard.toml; this file
+# stays empty on vrx's branches.
+#
+# A client's package sets here any subset of the standard's value keys (colour
+# slots or a [colour] seed, type roles, radii, borders, elevation, gradients,
+# motion, component properties) and nothing else. evrx-rt's
+# scripts/lib/design_build.py resolves it over vrx's values, adapts anything
+# that breaks a usability floor (logged with the floor it met) and refuses a
+# structural change. The faces come from brand.toml [fonts], never from here.

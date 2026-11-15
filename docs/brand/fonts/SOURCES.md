@@ -11,6 +11,7 @@ source; these are the pins they were verified against (retrieved 2026-11-15).
 | `FiraSans-Medium.ttf` | google/fonts @701bd391b1a4b3238de193a8523009ecef1be42c ofl/firasans/FiraSans-Medium.ttf | `cbc1842cbed8c1d1146ba7c9db97d8f28c9bedfd25f41c5b0e1259ca48622328` |
 | `firasans-OFL.txt` | google/fonts @701bd391b1a4b3238de193a8523009ecef1be42c ofl/firasans/OFL.txt | `8f24842e9174beda18a556c2ae7d54f5dc444340c19a3a9ef77e23bca366adbd` |
 | `FiraCode-Regular.ttf` | tonsky/FiraCode release 6.2, Fira_Code_v6.2.zip (sha256 of the zip), ttf/FiraCode-Regular.ttf | `0949915ba8eb24d89fd93d10a7ff623f42830d7c5ffc3ecbf960e4ecad3e3e79` |
+| `FiraCode-Bold.ttf` | tonsky/FiraCode release 6.2, Fira_Code_v6.2.zip (sha256 of the zip), ttf/FiraCode-Bold.ttf (file sha256 `41f6554e845e2f5b70adad3950122334b866aac436793b7742ade600067701be`, retrieved 2026-11-15) | `0949915ba8eb24d89fd93d10a7ff623f42830d7c5ffc3ecbf960e4ecad3e3e79` |
 | `firacode-OFL.txt` | google/fonts @701bd391b1a4b3238de193a8523009ecef1be42c ofl/firacode/OFL.txt | `926041dac670e6922505e35ac1661a4e8d20f1ffeabbbcb5edb5544370702369` |
 | `NotoSansMath-Regular.ttf` | google/fonts @701bd391b1a4b3238de193a8523009ecef1be42c ofl/notosansmath/NotoSansMath-Regular.ttf | `8242bd1e55368b27e32455260754cf9aa58f3ad7ea80664b66c21f1b09910d6c` |
 | `notosansmath-OFL.txt` | google/fonts @701bd391b1a4b3238de193a8523009ecef1be42c ofl/notosansmath/OFL.txt | `5e0da210fb04058a8c0087985d2d456b931c2579811a49655721d3cf0c36b6d6` |

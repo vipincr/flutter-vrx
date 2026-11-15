@@ -1,14 +1,38 @@
 # The vrx UI standard: every number a second implementation has to match, and the words it has to honour.
 #
-# This file is the single source (plan 0061 D4). scripts/lib/make_ui_standard.py turns it into ui_metrics' token block
-# (components/helpers/ui_metrics/include/ui_metrics/ui_standard.h) and into the expectations the host tests hold the
-# hand-written tables to (tests/ui_standard_expect.h); the gate's ui-standard-generated refuses a stale copy. A
-# second implementation (the Flutter kit in vrx-linux) pins this file by commit and generates its own tables from it.
+# This file is the single source (plan 0061 D4) and vrx's design system (plan 0025 D1): its values are vrx's defaults, and a
+# brand's design.toml overrides any value key and nothing else (D2). scripts/lib/design_resolve.py is the one merger: it lays a
+# brand's values over this file, holds the result to the usability floors ([floor], the contrast pairs, the touch minimum, the
+# tiers' durations; D11) and writes the resolved standard, which is what every generator reads. With no design.toml the
+# resolved standard is this file, byte for byte. scripts/lib/make_ui_standard.py turns it into ui_metrics' headers (the
+# facts no design overrides in ui_standard.h; the tokens a design may set by identity in ui_tokens.h, the SDK's view, and by
+# value in private/ui_brand.h, the runtime's), the display class (ui_class.h), the design system's tables (ui_kit/ui_design.h)
+# and the expectations the host tests hold the hand-written tables to (tests/ui_standard_expect.h); the gate's
+# ui-standard-generated refuses a stale copy. A second implementation (the Flutter kit in vrx-linux) vendors the resolved file, pinned by hash,
+# and generates its own tables from it.
 #
 # UNITS ARE NORMATIVE. A length is in millimetres, a type size in points, a time in milliseconds, a stiffness in the
 # units of a spring of mass 1. Pixels are derived: here from the panel's density (CONFIG_VRX_PANEL_PPI, UI_MM), on a
 # host that has no density from a scale over a 480 px short side. Both are sanctioned; a length that is written in
 # pixels anywhere is a defect in whichever implementation wrote it.
+#
+# A component names tokens and never values: "colour.primary" is a slot, "type.label" a type role, "radius_mm.sm",
+# "border_px.hairline", "spacing_mm.md", "control_mm.sm", "icon_mm.md", "size_mm.icon_button" and "opacity_permille.hover" a
+# row of those tables, "elevation.2" and "gradient.signal" a level and a gradient below, "micro.press" a microinteraction,
+# "duration_ms.fast" a duration of [motion.duration_ms], and "class.pressed_layer_permille" the display class's field.
+#
+# A DESIGN FINDING (a flaw a test, a walk or a bench session shows in a drawn UI) is fixed in exactly one of three places here,
+# never in widget code (G085 refuses a literal there, so a local patch cannot hold):
+#   1. a token's value, when vrx's default is wrong (the hairline is too faint on one panel class: [border_px]);
+#   2. a component spec, when a state or a part is missing or names the wrong token ([component.*]);
+#   3. a floor row ([floor.<name>]), when the flaw is a kind of mistake any brand could make. A row names its kind, what it
+#      catches and where it came from (a standard, an owner's statement, or the test, board and date of the finding); the
+#      resolver checks every row of a kind with one function, so a new row is data and a fixture, never a resolver edit.
+# Then `scripts/lib/design_build.py` regenerates what the change reaches, and `--brands` resolves every brand package again,
+# so the floor a finding added on one device adapts (or refuses) every brand's design on the next run, each adaptation
+# logged with the row's catches and source. Worked example (tests/test_design_build.py): "focus ring invisible on a
+# teal chip": the ring was drawn flush on the chip's own teal fill; a focus row with gap_below_mm checks a ring that touches
+# its control against the control's fills, and the resolver gives a flush ring its gap back.
 
 [standard]
 version = 1
@@ -24,10 +48,19 @@ md = 3
 lg = 4
 xl = 6
 edge_inset = 2        # between the glass edge and the client area
+flush = 0             # a part drawn against another, with no gap
 
+# vrx's corners are the strata's: straight edges, rounded only as far as a finished edge needs. sm and md are the two the
+# kits have always drawn; xs is a check box's corner, lg a sheet's, xl the most anything is rounded. pill is longer than any
+# control is tall, and both kits clamp a radius to half the short side (LVGL clamps it, Flutter scales an RRect), so it
+# draws a capsule.
 [radius_mm]
 sm = 1
 md = 2
+xs = 0.5
+lg = 3
+xl = 4
+pill = 100
 
 # Window size classes (plan 0062 D20), Material's (compact below 600 dp wide and 480 dp high, medium to 840 and 900, expanded from
 # there) at 160 dp to the inch, in tenths of a millimetre: the two edges between compact and medium and between medium and expanded. An
@@ -43,24 +76,118 @@ panes_support_leads = [1, 2]
 
 # Sizes that are physical whatever the panel's density.
 [size_mm]
-touch_min = 9         # the smallest a finger is asked to hit (UI_TARGET_MIN where the board has touch)
-# Along the axis a target shares with its siblings in one control (a segmented row's width, a rail's height), in tenths: WCAG
-# 2.2's target minimum, 24 CSS px (6.35 mm). A cell is still a finger across; a row of seven at 9 mm both ways needed 546 px of a
-# 410 px row on a 219 PPI panel and went to two lines (2026-10-19).
-touch_along_x10mm = 64
+# Along the axis a target shares with its siblings in one control (a segmented row's width, a rail's height): WCAG 2.2's target
+# minimum, 24 CSS px (6.35 mm), on whole tenths. A cell is still a finger across; a row of seven at 9 mm both ways needed 546 px
+# of a 410 px row on a 219 PPI panel and went to two lines (2026-10-19). A component's along-axis width names it
+# (segmented's segment), [floor.touch_along] holds it, and like the touch minimum no viewing class scales it.
+touch_along = 6.4
 icon_button = 5       # a glyph that is itself a control
 status_button = 4     # a glyph in the status strip, an indicator and not a target
 qr_min = 18           # the smallest a QR code can be for a phone's camera to read
 drawer_pull_min = 27  # how far the quick drawer is pulled before it opens
 
+# How tall a control is (a button, a field, a list row), and so how tall its target is. Each is at least the touch floor
+# ([floor.touch_target]): the resolver raises one that is not, so no brand can make a control a finger misses.
+[control_mm]
+sm = 9
+md = 10
+lg = 12
+
+# A glyph's square: md beside body text (about 1.3 of its em), xs beside a caption, lg alone in an empty state.
+[icon_mm]
+xs = 3
+sm = 3.5
+md = 4.5
+lg = 6
+
+# The opacities a state or a layer draws at, in permille. A pressed control's layer is the display class's
+# (class.*.pressed_layer_permille), since a panel without greys inverts instead.
+[opacity_permille]
+disabled = 380        # a control that cannot be used (Material's 38 %)
+hover = 80            # the layer over a control a pointer rests on
+opaque = 1000         # no transparency: what a tier realisation sets where a panel cannot draw a fade (e-paper's disabled look)
+scrim = 600           # the shade behind a dialog
+
 # Lengths in device pixels, and the only ones. A line is drawn on whole pixels, so its width is a count of them and not a
 # fraction of a millimetre: a second implementation has to draw the same line, and scaling it would give a hairline of 1.3
-# pixels that anti-aliases to grey on a panel with four greys. Both are what the 219 PPI reference panel draws well, and the
-# focus frame's smallest size (UI_FOCUS_MIN) is derived from them.
+# pixels that anti-aliases to grey on a panel with four greys. hairline and regular are what the 219 PPI reference panel
+# draws well, and the focus frame's smallest size (UI_FOCUS_MIN) is derived from them.
 
-[device_px]
+[border_px]
 hairline = 2          # a rule, a thin frame, the seam between two controls
-border = 3            # a control's frame, the focus frame
+regular = 3           # a control's frame, the focus frame
+thick = 4             # a selected frame; the outline of the highest surfaces on e-paper
+none = 0              # no frame: a control that takes no tap (a disabled key) shows none
+
+# --- elevation (plan 0025 D4) ----------------------------------------------------------------------------------------
+# How far a surface stands off the one below it, and what each display can draw of that. full: a shadow in the shadow slot
+# (offset down dy_mm, blurred blur_mm, grown spread_mm, at opacity), for a GPU or a software path fast enough for it.
+# light: the surface lifted tone_step steps of CIE L* toward the text, and a border, where a shadow costs too much. grey: a
+# border alone, since a shadow on four greys is a smudge. epaper: an outline. A border names a border_px row, or "none".
+# vrx's elevation is the kit's (plan 0058 D12): one light above and a little before the screen, so every shadow falls
+# straight down, darker and softer a level at a time; below the full tier a frame a step heavier for each level. The kit
+# caps a shadow's blur at 48 px whatever the panel, since blur is the costliest thing LVGL draws in software (ui_ds.c).
+
+[elevation.0]
+full = { dy_mm = 0, blur_mm = 0, spread_mm = 0, opacity = 0.0 }
+light = { tone_step = 0, border = "none" }
+grey = { border = "none" }
+epaper = { outline = "none" }
+
+[elevation.1]
+full = { dy_mm = 0.3, blur_mm = 0.8, spread_mm = 0, opacity = 0.20 }
+light = { tone_step = 2, border = "border_px.hairline" }
+grey = { border = "border_px.hairline" }
+epaper = { outline = "border_px.hairline" }
+
+[elevation.2]
+full = { dy_mm = 0.6, blur_mm = 1.4, spread_mm = 0, opacity = 0.25 }
+light = { tone_step = 4, border = "border_px.hairline" }
+grey = { border = "border_px.regular" }
+epaper = { outline = "border_px.regular" }
+
+[elevation.3]
+full = { dy_mm = 1.0, blur_mm = 2.2, spread_mm = 0, opacity = 0.30 }
+light = { tone_step = 6, border = "border_px.regular" }
+grey = { border = "border_px.thick" }
+epaper = { outline = "border_px.thick" }
+
+[elevation.4]
+full = { dy_mm = 1.5, blur_mm = 3.2, spread_mm = 0, opacity = 0.35 }
+light = { tone_step = 8, border = "border_px.regular" }
+grey = { border = "border_px.thick" }
+epaper = { outline = "border_px.thick" }
+
+[elevation.5]
+full = { dy_mm = 2.2, blur_mm = 4.6, spread_mm = 0, opacity = 0.40 }
+light = { tone_step = 10, border = "border_px.thick" }
+grey = { border = "border_px.thick" }
+epaper = { outline = "border_px.thick" }
+
+# --- gradients (plan 0025 D4) ----------------------------------------------------------------------------------------
+# A named gradient: its angle in degrees (0 runs left to right, 90 top to bottom), its stops (a slot, where it sits in
+# permille of the length, and optionally an opacity row), and what draws in its place below the full tier: one slot per
+# tier. vrx has few, and none is decoration for its own sake: one accent per surface.
+
+[gradient.strata]           # a hero surface's wash: the strata's light falling from above
+angle = 90
+stops = [{ colour = "colour.surface_high", at = 0 }, { colour = "colour.surface", at = 1000 }]
+fallback = { light = "colour.surface_high", grey = "colour.surface", epaper = "colour.surface" }
+
+[gradient.signal]           # the accent in motion: progress, a level, the lit face of the mark
+angle = 0
+stops = [{ colour = "colour.primary", at = 0 }, { colour = "colour.secondary", at = 1000 }]
+fallback = { light = "colour.primary", grey = "colour.primary", epaper = "colour.primary" }
+
+[gradient.scrim]            # text over a picture: the shadow slot fading out across it
+angle = 0
+stops = [{ colour = "colour.shadow", at = 0, opacity = "opacity_permille.scrim" }, { colour = "colour.shadow", at = 1000, opacity = "opacity_permille.hover" }]
+fallback = { light = "colour.inverse", grey = "colour.inverse", epaper = "colour.inverse" }
+
+[gradient.skeleton]         # a place holding content still loading
+angle = 0
+stops = [{ colour = "colour.surface", at = 0 }, { colour = "colour.surface_high", at = 370 }, { colour = "colour.surface", at = 630 }]
+fallback = { light = "colour.surface_high", grey = "colour.surface", epaper = "colour.surface" }
 
 # --- gestures --------------------------------------------------------------------------------------------------------
 # A swipe is a distance AND a speed: the distance separates it from a tap (Android's boundary is 8 dp, about 1.3 mm), the
@@ -73,22 +200,220 @@ touch_slop_mm = 2          # travel past which a contact is no longer a tap
 wheel_step_mm = 4.5        # one step of a mouse wheel
 
 # --- motion timing ---------------------------------------------------------------------------------------------------
+# Things that move do so on the springs below ([springs], [micro]); a spring has no duration, it has a stiffness. What is
+# timed instead (a scroll, a page turn, the focus ring's move on a scanned panel, a progress bar's fill, a skeleton's sweep)
+# takes one of these durations, and each tier caps them ([floor.motion]). An easing names the spring a timed
+# animation's curve follows, so a curve is never spelled twice.
 
-[motion]
-ms = 200                   # a scroll, a page turn and the focus ring's move on a scanned panel
+[motion.duration_ms]
+fast = 200                 # a scroll, a page turn and the focus ring's move on a scanned panel; a press, a tab
+normal = 300               # a sheet or a dialog opening
+slow = 600                 # a progress bar's fill, a celebration
+
+[motion.easing]
+standard = "springs.standard.spatial"         # content moving from one place to another
+out = "springs.standard.effects"              # something arriving: fast, settling, never past its stop
+spring = "springs.expressive.spatial"         # a floating thing, which may overshoot
 
 # --- type ------------------------------------------------------------------------------------------------------------
-# A role is chosen by what the text IS; its size follows from the density (make_type_scale.py snaps it to a face).
+# A role is chosen by what the text IS and set by its SIZE_PT: its size in points on a device whose median body size is the
+# reference, [type_band] reference_median_pt (9.9 pt, the handheld). On any other device it moves with the median, by the
+# same points, onto that device's band of 0.5 pt sizes and inside it ([type_band]; scripts/lib/type_band.py resolves it per
+# density and per viewing class). Owner, 2026-11-15: "why shouldn't size_pt exist, it can just be a number relative to the per
+# density". A role's step (its place in the 13 sizes) is computed, never written. Each role also has its weight (vrx ships Fira Sans at
+# 300, 400 and 500), its leading (line height over the size), its tracking in em, the family it is set in ([family]) and its
+# case. The first seven are the roles the kits have always drawn; the rest are the reference's scale (display, headline,
+# title, body and label at three sizes, caption, overline), where the unsuffixed role is the middle size, and `terminal` is
+# the console's: the smallest step, in the fixed-width family, so a console fits its columns. vrx sets its large type light
+# and its labels medium. A figure larger than the band (the clock's numerals, a hero reading) is not a role: it is the
+# applet's own glyph set (scripts/make/make_applet_glyphs.py), counted in that applet's memory.
+#
+# The sizes are the band's at the reference median, from the sizes before it: display 14.5 -> 12.9 (the top), title 12.5 ->
+# 12.4, subtitle 11.2 -> 11.4, subtext and code 8.5 -> 8.4, micro 6.6 -> 7.0 (the least its capitals allow at 362 mm), and the
+# reference's roles to the nearest size, the larger ones held to the top (display_lg 18.6, display_sm 13.5, headline_lg 14.5,
+# headline 13.5, title_lg 13.5). The old clock role (42.1 pt) is gone: its users carry glyph sets.
 
-[type_pt]
-display = 14.5
-title = 12.5
-subtitle = 11.2
-body = 9.9
-subtext = 8.5
-micro = 6.6
-clock = 42.1
-code = 8.5
+[type.display]
+size_pt = 12.9
+weight = 300
+leading = 1.15
+tracking_em = -0.01
+family_role = "display"
+transform = "none"
+
+[type.title]
+size_pt = 12.4
+weight = 500
+leading = 1.25
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.subtitle]
+size_pt = 11.4
+weight = 500
+leading = 1.3
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.body]
+size_pt = 9.9
+weight = 400
+leading = 1.45
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.subtext]
+size_pt = 8.4
+weight = 400
+leading = 1.4
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.micro]
+size_pt = 7.0
+weight = 400
+leading = 1.25
+tracking_em = 0.02
+family_role = "ui"
+transform = "none"
+
+[type.code]
+size_pt = 8.4
+weight = 400
+leading = 1.4
+tracking_em = 0.0
+family_role = "mono"
+transform = "none"
+
+[type.terminal]
+size_pt = 6.9
+weight = 400
+leading = 1.3
+tracking_em = 0.0
+family_role = "mono"
+transform = "none"
+
+[type.display_lg]
+size_pt = 12.9
+weight = 300
+leading = 1.15
+tracking_em = -0.02
+family_role = "display"
+transform = "none"
+
+[type.display_sm]
+size_pt = 12.9
+weight = 300
+leading = 1.15
+tracking_em = -0.01
+family_role = "display"
+transform = "none"
+
+[type.headline_lg]
+size_pt = 12.9
+weight = 500
+leading = 1.2
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.headline]
+size_pt = 12.9
+weight = 500
+leading = 1.2
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.headline_sm]
+size_pt = 12.4
+weight = 500
+leading = 1.25
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.title_lg]
+size_pt = 12.9
+weight = 500
+leading = 1.25
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.title_sm]
+size_pt = 11.4
+weight = 500
+leading = 1.3
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.body_lg]
+size_pt = 11.4
+weight = 400
+leading = 1.45
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.body_sm]
+size_pt = 8.4
+weight = 400
+leading = 1.4
+tracking_em = 0.0
+family_role = "ui"
+transform = "none"
+
+[type.label_lg]
+size_pt = 9.9
+weight = 500
+leading = 1.3
+tracking_em = 0.01
+family_role = "ui"
+transform = "none"
+
+[type.label]
+size_pt = 8.4
+weight = 500
+leading = 1.3
+tracking_em = 0.01
+family_role = "ui"
+transform = "none"
+
+[type.label_sm]
+size_pt = 7.4
+weight = 500
+leading = 1.3
+tracking_em = 0.02
+family_role = "ui"
+transform = "none"
+
+[type.caption]
+size_pt = 7.4
+weight = 400
+leading = 1.3
+tracking_em = 0.01
+family_role = "ui"
+transform = "none"
+
+[type.overline]
+size_pt = 7.4
+weight = 400
+leading = 1.3
+tracking_em = 0.08
+family_role = "mono"
+transform = "upper"
+
+# The family each role is set in, by fontconfig name (Flutter names it; LVGL's faces are generated from its files, D6).
+[family]
+ui = "Fira Sans"
+display = "Fira Sans"
+mono = "Fira Code"
 
 # The panel densities the type scale has a rung for (scripts/lib/make_type_scale.py): a font set per density, chosen by the
 # preprocessor, so a board whose panel is not listed here does not compile. The list is the standard's, never read off board
@@ -96,6 +421,401 @@ code = 8.5
 # 187 the N6570-DK, 219 the reference e-paper panel (qemu_s3), 294 the 1280 x 720 colour panels (emu_p4, qemu_lcd).
 [type_scale]
 densities_ppi = [179, 187, 219, 294]
+
+# --- the type band (plan 0025 D15) ------------------------------------------------------------------------------------
+# Owner, 2026-11-15: "there has to be a built in upper and lower bounds for fonts, taking the median size as the one we have
+# calculated based on screen size and pixel density ... a +/- 3 point change with 0.5 point steps should be the bounding
+# limits (these can be set as configurable too) ... anything beyond should be built in the by the applet as a glyph or within
+# its own memory budget". scripts/lib/type_band.py is the one implementation.
+#
+#   median      the body size whose x-height (the face's OS/2 sxHeight over its em) subtends arcmin_x at the device's viewing
+#               distance; the distance is its class's (distance_mm), the class is chosen by the panel's diagonal
+#               (class_max_diagonal_mm; a density's reference panel is diagonal_mm), and the median is a whole tenth of a point.
+#   band        median - below_pt .. median + above_pt in step_pt steps (13 sizes). A role's size there is its size_pt moved by
+#               the median's distance from reference_median_pt, onto the nearest of the 13 (half a step rounds up), and held
+#               to the band: role_pt = median + step x step_pt, step = round((size_pt - reference_median_pt) / step_pt).
+#               The bottom of the band is never under min_arcmin of CAP height (OS/2 sCapHeight) at that distance: for a face
+#               whose capitals need more than median - below_pt, the bottom step is that minimum rounded up to a tenth.
+#   arcmin_x    calibrated once so that a handheld body in vrx's ui face (Fira Sans, x-height 527/1000) is the 9.9 pt vrx has
+#               always set: 2 atan(9.9 pt x 0.527 / 2 / 362 mm) = 17.479 arcmin. It sits inside the 16 to 22 arcmin character
+#               height that ISO 9241-303 and the usability guides built on it recommend (16 minimum, 20 to 22 preferred), though
+#               that figure is a capital's: the same body's capitals subtend 22.85 arcmin. `type_band.py --calibrate` re-derives it.
+#   rung        a board's difference: [type_band.rung.<ppi>] sets any of distance_mm, below_pt, above_pt for the boards at that
+#               density. The generated headers are compiled per density (D10, no run-time choice), so a rung is the board's
+#               one place to move or narrow its band; a Kconfig would need the build to compute a scale at configure time.
+#   classes     a kit that is not compiled per density (Flutter) picks the viewing class from its panel's real diagonal and
+#               reads that class's median, band and role sizes (`design_resolve.py --type-table --json`, "classes"), so the
+#               formula lives here once.
+# Viewing class scales what is SEEN (type, and the visual geometry a role sets), never what is TOUCHED: the touch minimum
+# ([floor.touch_target] min_mm, UI_TOUCH_MM) and every component's hit are a finger's size, the same in every class and at
+# every distance, so a wall panel's target is 9 mm like a phone's. A control's target is the larger of the touch minimum and its
+# drawn size, and [floor.touch_target] holds the unscaled millimetres (a kit that scales geometry by class leaves these out).
+# A brand sets none of this ([type_band] is a contract); it sets its roles' size_pt.
+[type_band]
+reference_median_pt = 9.9   # the median a role's size_pt is written at: the handheld body, and what arcmin_x is calibrated to
+below_pt = 3
+above_pt = 3
+step_pt = 0.5
+arcmin_x = 17.479
+min_arcmin = 16
+
+# Viewing distance by class, mm. handheld: the mean smartphone reading distance, 362 mm (Bababekova et al., Optometry and Vision
+# Science 88(7), 2011: 36.2 cm). desk: 600 mm, inside the 500 to 700 mm that ISO 9241-5 and ANSI/HFES 100-2007 give for a desk
+# display (their 500 mm minimum is the lower end). wall: 2000 mm, a chosen figure for a panel read across a room; no standard
+# retrieved, so it is the one distance to close with a source before a wall-class board ships.
+[type_band.distance_mm]
+handheld = 362
+desk = 600
+wall = 2000
+
+# The class a panel belongs to, by its diagonal: handheld to 230 mm (9 in), desk to 700 mm (27.5 in), wall above.
+[type_band.class_max_diagonal_mm]
+handheld = 230
+desk = 700
+
+# A density's reference panel, its diagonal in mm (width x height pixels over the density): 179 the PW-SH7 (854 x 480), 187 the
+# N6570-DK (800 x 480), 219 the reference e-paper (800 x 480), 294 the 720 x 1280 panels. make_type_scale.py --check holds every
+# board's own diagonal to its rung's class.
+[type_band.diagonal_mm]
+179 = 139
+187 = 127
+219 = 108
+294 = 127
+
+# --- the applets' glyph sets (plan 0025 D15) --------------------------------------------------------------------------
+# What is larger than the band is the applet's own: a glyphs.toml beside its sources lists sets (name, the characters, size, family
+# role, weight), scripts/make/make_applet_glyphs.py makes them, and an applet's sets together stay within budget_bytes of .rodata
+# (bitmaps and glyph table) at every density, so the memory nobody budgeted for cannot grow in an applet's image unseen. The
+# clock's numerals at its old 42.1 pt, 12 characters, are the largest set today (41 KB at the densest panel, 294 PPI; 23 KB at 219).
+[applet_glyphs]
+budget_bytes = 65536
+
+# --- usability floors (plan 0025 D11) --------------------------------------------------------------------------------
+# What no design may go below, one row per rule. design_resolve.py holds the merged design to every row, vrx's own values
+# included, with one function per kind; a value that breaks a row moves to the nearest that meets it (a tone, a size, a
+# reference put back), logged with the row's catches and source, and a structural break is refused. A brand sets none of
+# this ([floor] is a contract). Kinds:
+#   contrast    bg, fg (slots), min_x100 (WCAG ratio x 100), first_pass (legible in an e-paper refresh's one-bit pass).
+#               In this order they are also UI_PAIRS, the grey maps' repair order and the Flutter kit's vrxPairFloors.
+#   transit     min_x100: a fill animating from the page to the primary keeps its text above this on every frame.
+#   min_size    paths (token paths; * matches any key; component.*.hit is each interactive component's target), and
+#               min_mm, in physical millimetres that no viewing class scales (type sizes are the type_band row's).
+#   focus       against (slots, or "own_fills": the fills of the component's root part in every variant and state),
+#               min_x100, min_width_px, and gap_below_mm (optional: the row holds only rings set closer than this).
+#   motion      paths, max_ms per tier: a timed animation is capped at its tier's.
+#   paired_text a component part that sets text (type and colour) sits on a ground that is one of the contrast rows.
+#   state_distinct  states, min_x100, realise (optional: state -> invert or outline): each of those states of an interactive
+#               component differs from rest in every render tier after its colour map (a fill, frame or ink moved by
+#               min_x100, a frame or outline added, taken or reweighted, an inversion; an opacity counts on a colour panel
+#               only). A brand's reference that hides one is put back; else the row's realisation is written for that tier.
+#   resolution  paths, step_mm: a length is held to the step the kits store it in (tenths of a millimetre), the nearest.
+#   type_band   paths (the roles' size_pt): a size whose step (round((size_pt - reference_median_pt) / step_pt)) is outside
+#               the band every density allows is moved to the band's edge at the reference median, and a role whose size at
+#               some density is under min_arcmin of cap height is refused (type_band.py puts the band's bottom at that minimum,
+#               so only a table the resolver and the type scale disagree on can fail it).
+
+[floor.length_tenths]
+kind = "resolution"
+paths = ["spacing_mm.*", "radius_mm.*", "control_mm.*", "icon_mm.*", "size_mm.*", "elevation.*.full.dy_mm", "elevation.*.full.blur_mm", "elevation.*.full.spread_mm"]
+step_mm = 0.1
+catches = "a length finer than the kits hold it, which the resolver passed and the C tables then refused"
+source = "test finding: EverOS's design (radius_mm.sm 1.25, elevation 0.16 mm) resolved, and make_ui_standard stopped on '1.25 mm is not a whole number of tenths' (plan 0025 Part B final pass, 2026-11-15); ui_design.h holds lengths in tenths of a millimetre"
+
+[floor.contrast_page_text]
+kind = "contrast"
+bg = "page"
+fg = "text"
+min_x100 = 700
+first_pass = true
+catches = "body text on the page a reader strains to read"
+source = "WCAG 2.2 SC 1.4.6 (7:1, enhanced); plan 0062 D3"
+
+[floor.contrast_surface_text]
+kind = "contrast"
+bg = "surface"
+fg = "text"
+min_x100 = 700
+first_pass = true
+catches = "text on a card or a sheet that fades into it"
+source = "WCAG 2.2 SC 1.4.6 (7:1, enhanced); plan 0062 D3"
+
+[floor.contrast_surface_high_text]
+kind = "contrast"
+bg = "surface_high"
+fg = "text"
+min_x100 = 450
+first_pass = true
+catches = "text on a raised surface (a dialog, a filled field) below the AA floor"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_page_text_secondary]
+kind = "contrast"
+bg = "page"
+fg = "text_secondary"
+min_x100 = 450
+first_pass = true
+catches = "a subtitle or a helper line too faint to read"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_page_outline]
+kind = "contrast"
+bg = "page"
+fg = "outline"
+min_x100 = 300
+first_pass = true
+catches = "a control's frame lost against the page"
+source = "WCAG 2.2 SC 1.4.11 (3:1)"
+
+[floor.contrast_page_focus]
+kind = "contrast"
+bg = "page"
+fg = "focus"
+min_x100 = 300
+first_pass = true
+catches = "the focus colour lost against the page"
+source = "WCAG 2.2 SC 1.4.11 and 2.4.13 (3:1)"
+
+[floor.contrast_page_outline_faint]
+kind = "contrast"
+bg = "page"
+fg = "outline_faint"
+min_x100 = 150
+first_pass = false
+catches = "a divider that vanishes outright (it is decoration, and may be faint)"
+source = "plan 0062 D3"
+
+[floor.contrast_inverse_on_inverse]
+kind = "contrast"
+bg = "inverse"
+fg = "on_inverse"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the inverse fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_primary_on_primary]
+kind = "contrast"
+bg = "primary"
+fg = "on_primary"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the primary fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_primary_container_on_primary_container]
+kind = "contrast"
+bg = "primary_container"
+fg = "on_primary_container"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the primary container fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_secondary_on_secondary]
+kind = "contrast"
+bg = "secondary"
+fg = "on_secondary"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the secondary fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_secondary_container_on_secondary_container]
+kind = "contrast"
+bg = "secondary_container"
+fg = "on_secondary_container"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the secondary container fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_tertiary_on_tertiary]
+kind = "contrast"
+bg = "tertiary"
+fg = "on_tertiary"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the tertiary fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_tertiary_container_on_tertiary_container]
+kind = "contrast"
+bg = "tertiary_container"
+fg = "on_tertiary_container"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the tertiary container fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_error_on_error]
+kind = "contrast"
+bg = "error"
+fg = "on_error"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the error fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_success_on_success]
+kind = "contrast"
+bg = "success"
+fg = "on_success"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the success fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_warning_on_warning]
+kind = "contrast"
+bg = "warning"
+fg = "on_warning"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the warning fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_info_on_info]
+kind = "contrast"
+bg = "info"
+fg = "on_info"
+min_x100 = 450
+first_pass = true
+catches = "text or a glyph on the info fill below AA"
+source = "WCAG 2.2 SC 1.4.3 (4.5:1)"
+
+[floor.contrast_page_primary]
+kind = "contrast"
+bg = "page"
+fg = "primary"
+min_x100 = 300
+first_pass = false
+catches = "a primary glyph, link or indicator lost on the page"
+source = "WCAG 2.2 SC 1.4.11 (3:1)"
+
+[floor.contrast_page_error]
+kind = "contrast"
+bg = "page"
+fg = "error"
+min_x100 = 300
+first_pass = false
+catches = "a error glyph, link or indicator lost on the page"
+source = "WCAG 2.2 SC 1.4.11 (3:1)"
+
+[floor.contrast_page_success]
+kind = "contrast"
+bg = "page"
+fg = "success"
+min_x100 = 300
+first_pass = false
+catches = "a success glyph, link or indicator lost on the page"
+source = "WCAG 2.2 SC 1.4.11 (3:1)"
+
+[floor.contrast_page_warning]
+kind = "contrast"
+bg = "page"
+fg = "warning"
+min_x100 = 300
+first_pass = false
+catches = "a warning glyph, link or indicator lost on the page"
+source = "WCAG 2.2 SC 1.4.11 (3:1)"
+
+[floor.contrast_page_info]
+kind = "contrast"
+bg = "page"
+fg = "info"
+min_x100 = 300
+first_pass = false
+catches = "a info glyph, link or indicator lost on the page"
+source = "WCAG 2.2 SC 1.4.11 (3:1)"
+
+[floor.contrast_surface_focus]
+kind = "contrast"
+bg = "surface"
+fg = "focus"
+min_x100 = 300
+first_pass = true
+catches = "the focus colour lost on a card or a raised surface"
+source = "WCAG 2.2 SC 1.4.11 and 2.4.13 (3:1); test finding: the EverOS fixture's teal focus on its own surface was 2.96:1 and the scheme repair had no row to move it by (plan 0025 Part B, a hand-made EverOS fixture since replaced by the identity package, 2026-11-15)"
+
+[floor.contrast_surface_high_focus]
+kind = "contrast"
+bg = "surface_high"
+fg = "focus"
+min_x100 = 300
+first_pass = true
+catches = "the focus colour lost on a card or a raised surface"
+source = "WCAG 2.2 SC 1.4.11 and 2.4.13 (3:1); test finding: the EverOS fixture's teal focus on its own surface was 2.96:1 and the scheme repair had no row to move it by (plan 0025 Part B, a hand-made EverOS fixture since replaced by the identity package, 2026-11-15)"
+
+[floor.transit]
+kind = "transit"
+min_x100 = 300
+catches = "a label that vanishes while its fill animates from the page to the primary"
+source = "plan 0058 D11: two tonal inks give about 3.4:1 at the crossing, so in flight it is WCAG 1.4.11's 3:1, at rest the pairs' 4.5:1"
+
+[floor.touch_along]
+kind = "min_size"
+paths = ["size_mm.touch_along", "component.segmented.base.segment.min_width"]
+min_mm = 6.35
+catches = "a cell in a row of choices too narrow to aim at along the row"
+source = "WCAG 2.2 SC 2.5.8 (24 CSS px, 6.35 mm); test finding: seven degrees at a finger both ways needed 546 px of a 410 px row on a 219 PPI panel and went to two lines, so a cell is a finger across and this along the row (2026-10-19)"
+
+[floor.touch_target]
+kind = "min_size"
+paths = ["control_mm.*", "component.*.hit"]
+min_mm = 9
+catches = "a control a finger misses"
+source = "plan 0061 (UI_TARGET_MIN, 9 mm where the board has touch); WCAG 2.2 SC 2.5.5; Material's 48 dp at arm's length"
+
+[floor.type_band]
+kind = "type_band"
+paths = ["type.*.size_pt"]
+catches = "a type role the device cannot set legibly, or larger than a system face should be"
+source = "owner D15 statement 2026-11-15 (a built-in band of median +/- 3 pt in 0.5 pt steps, anything beyond is the applet's glyph); character height 16 arcmin minimum, 20 to 22 preferred (ISO 9241-303, DIN 1450); handheld distance 362 mm (Bababekova et al. 2011)"
+
+[floor.focus_ring]
+kind = "focus"
+against = ["page", "surface", "surface_high"]
+min_x100 = 300
+min_width_px = 2
+catches = "a focus ring nobody can see"
+source = "WCAG 2.2 SC 2.4.11 and 2.4.13 (3:1, 2 CSS px); plan 0025 D11"
+
+[floor.motion]
+kind = "motion"
+paths = ["motion.duration_ms.*"]
+max_ms = { still = 0, light = 300, full = 600 }
+catches = "a UI that waits on its own animation, or animates on a panel whose tier cannot"
+source = "the tier contract (plan 0062); WCAG 2.2 SC 2.3.3; plan 0025 D11"
+
+[floor.focus_on_fill]
+kind = "focus"
+against = "own_fills"
+gap_below_mm = 0.5
+min_x100 = 300
+min_width_px = 2
+catches = "a focus ring drawn on its control's own fill in the fill's colour, so a filled, selected or checked control shows no focus"
+source = "test finding: vrx's filled button, selected chip and row, checked switch and checkbox, and the slider's track on a one-bit panel, drew their inset focus ring black on black on e-paper (design_gallery frames, plan 0025 Part B, 2026-11-15)"
+
+[floor.component_text]
+kind = "paired_text"
+catches = "a component's text on a fill no contrast row holds to a floor"
+source = "plan 0025 D11"
+
+[floor.state_visible]
+kind = "state_distinct"
+states = ["selected", "checked"]
+min_x100 = 300
+realise = { selected = "invert", checked = "invert" }
+catches = "a selected or checked control that looks like the others on some panel"
+source = "WCAG 2.2 SC 1.4.11 (3:1 for a state); test finding: selection drawn in secondary_container is white on every grey map, so a selected chip, row or tab looked unselected on e-paper (plan 0025 Part B, reconciling the specs with ui_kit, 2026-11-15)"
+
+[floor.state_distinct]
+kind = "state_distinct"
+states = ["pressed", "focus", "disabled"]
+min_x100 = 100                  # any move a panel's map keeps: a press, a ring or a disabled look only has to be seen, not read
+realise = { pressed = "invert", disabled = "outline" }
+catches = "a state that looks like rest on a panel that cannot show the difference"
+source = "plan 0025 Part D design-site renders, epaper tier, 2026-11-15: a selected segment, nav item or list tile drawn as at rest on the 2-level map, a pressed filled button a white box on white, nav_bar's selection unseen on grey, disabled as a grey opacity on e-paper"
 
 # --- colour slots (plan 0062) ------------------------------------------------------------------------------------------
 # The 32 functional slots a screen is drawn from. A component names what a colour is FOR; the scheme gives the slot a
@@ -143,42 +863,6 @@ slot = [
   { name = "on_info",                 class = "on_fill",        light = 100, dark = 20,  palette = "info",            chroma = 0.3 },
 ]
 
-# Contrast floors, WCAG 2 ratio times 100, and the pairs they hold. first_pass: where a grey class has a one-bit first pass
-# (an e-paper refresh paints black and white before the greys), the two sides must land either side of 128 in it, so the
-# text is legible before the greys arrive. Decoration (outline_faint) is allowed to arrive late.
-pair = [
-  { bg = "page",              fg = "text",                   min = 700, first_pass = true },
-  { bg = "surface",           fg = "text",                   min = 700, first_pass = true },
-  { bg = "surface_high",      fg = "text",                   min = 450, first_pass = true },
-  { bg = "page",              fg = "text_secondary",         min = 450, first_pass = true },
-  { bg = "page",              fg = "outline",                min = 300, first_pass = true },
-  { bg = "page",              fg = "focus",                  min = 300, first_pass = true },
-  { bg = "page",              fg = "outline_faint",          min = 150, first_pass = false },
-  { bg = "inverse",           fg = "on_inverse",             min = 450, first_pass = true },
-  { bg = "primary",           fg = "on_primary",             min = 450, first_pass = true },
-  { bg = "primary_container", fg = "on_primary_container",   min = 450, first_pass = true },
-  { bg = "secondary",         fg = "on_secondary",           min = 450, first_pass = true },
-  { bg = "secondary_container", fg = "on_secondary_container", min = 450, first_pass = true },
-  { bg = "tertiary",          fg = "on_tertiary",            min = 450, first_pass = true },
-  { bg = "tertiary_container", fg = "on_tertiary_container", min = 450, first_pass = true },
-  { bg = "error",             fg = "on_error",               min = 450, first_pass = true },
-  { bg = "success",           fg = "on_success",             min = 450, first_pass = true },
-  { bg = "warning",           fg = "on_warning",             min = 450, first_pass = true },
-  { bg = "info",              fg = "on_info",                min = 450, first_pass = true },
-  { bg = "page",              fg = "primary",                min = 300, first_pass = false },
-  { bg = "page",              fg = "error",                  min = 300, first_pass = false },
-  { bg = "page",              fg = "success",                min = 300, first_pass = false },
-  { bg = "page",              fg = "warning",                min = 300, first_pass = false },
-  { bg = "page",              fg = "info",                   min = 300, first_pass = false },
-]
-
-# While a fill moves from the page to the primary and its text swaps ink where the two cross (ui_motion.c), the text is held to
-# this ratio (times 100) on every frame of the way: the most two tonal inks can give at the crossing is about 3.4:1 against
-# 4.58:1 for pure black and white, so in flight it is the WCAG floor for a user-interface component, 3:1, and at rest it is the
-# pairs' 4.5:1. make_ui_schemes.py checks the path of every scheme.
-[colour.transit]
-floor_x100 = 300
-
 # Colour generation (scripts/make/make_ui_schemes.py), OKLCh. A scheme is a seed hue and a harmony rule: the rule gives the
 # secondary and tertiary hue as offsets in degrees from the seed (Itten's wheel). 4 seeds x 5 rules = 20 schemes, numbered
 # seed-major (1 to 5 the first seed, in the rules' order below).
@@ -187,12 +871,25 @@ seeds = ["blue", "green", "amber", "magenta"]
 rules = ["analogous", "complementary", "split", "triadic", "tetradic"]
 min_scheme_distance_x100 = 4.0   # two schemes differ by at least this in OKLab (times 100) in some brand slot, or the 20 are not twenty
 harmonise_max_deg = 5       # a signal hue turns toward the seed by half the gap, at most this: red has to stay red (Material turns up to 15)
+default_scheme = 1          # vrx's own: its signal (blue) with its analogous neighbours. components/bsp/Kconfig's VRX_UI_SCHEME default
+                            # is this number (Kconfig cannot read the standard; tests/test_ui_class.py holds the two equal)
 
 [generate.seed_hue]
-blue = 255
+blue = 262.5                # vrx's signal, #5B8DEF (brand/IDENTITY.md): OKLCh hue 262.5, chroma 0.156 (the primary's 0.15 is its)
 green = 150
 amber = 65
 magenta = 330
+
+[generate.words]              # what a person reads for a scheme ("Blue, split complementary"): the settings picker, Flutter's too
+blue = "Blue"
+green = "Green"
+amber = "Amber"
+magenta = "Magenta"
+analogous = "analogous"
+complementary = "complementary"
+split = "split complementary"
+triadic = "triadic"
+tetradic = "tetradic"
 
 [generate.rule_offsets]
 analogous = [30, -30]
@@ -303,120 +1000,120 @@ dither = "threshold"
 seed = "blue"
 rule = "analogous"
 light = [
-  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
-  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
-  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
-  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
-  "#5B5A86", "#FFFFFF", "#E0E0FF", "#444365",
-  "#006783", "#FFFFFF", "#B8EAFF", "#004D63",
+  "#F6F9FF", "#ECF1F9", "#DEE3EB", "#191C21",
+  "#404753", "#707784", "#BFC7D5", "#2E5AB4",
+  "#000000", "#FFFFFF", "#2D3137", "#ECF1F9",
+  "#2E5AB4", "#FFFFFF", "#D4E3FF", "#224488",
+  "#615884", "#FFFFFF", "#E4DFFE", "#494264",
+  "#00658B", "#FFFFFF", "#C0E8FF", "#004C69",
   "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
-  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
 ]
 dark = [
-  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
-  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
-  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
-  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
-  "#C2C2F4", "#2F2F3B", "#45445D", "#E0E0FF",
-  "#5FD4FE", "#1A343D", "#1B4C5E", "#B8EAFF",
+  "#121212", "#1B1E23", "#2D3137", "#DEE3EB",
+  "#BFC7D5", "#8A919F", "#404753", "#A9C7FF",
+  "#000000", "#FFFFFF", "#DEE3EB", "#2D3137",
+  "#A9C7FF", "#243047", "#314670", "#D4E3FF",
+  "#C9C0F2", "#312F3B", "#48445D", "#E4DFFF",
+  "#77D1FF", "#1C333F", "#204B61", "#C0E8FF",
   "#FFB3B0", "#462827", "#77DB92", "#1F3524",
-  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
 ]
 
 [schemes.2]
 seed = "blue"
 rule = "complementary"
 light = [
-  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
-  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
-  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
-  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
-  "#436085", "#FFFFFF", "#D0E4FF", "#324864",
-  "#815600", "#FFFFFF", "#FBDEB7", "#624000",
+  "#F6F9FF", "#ECF1F9", "#DEE3EB", "#191C21",
+  "#404753", "#707784", "#BFC7D5", "#2E5AB4",
+  "#000000", "#FFFFFF", "#2D3137", "#ECF1F9",
+  "#2E5AB4", "#FFFFFF", "#D4E3FF", "#224488",
+  "#495E87", "#FFFFFF", "#D4E3FF", "#374765",
+  "#7B5900", "#FFFFFF", "#F7E0B6", "#5D4200",
   "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
-  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
 ]
 dark = [
-  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
-  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
-  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
-  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
-  "#A8C9F4", "#29313B", "#37485D", "#D0E4FF",
-  "#F6BC6A", "#3B2E1C", "#5A4220", "#FFDDB0",
+  "#121212", "#1B1E23", "#2D3137", "#DEE3EB",
+  "#BFC7D5", "#8A919F", "#404753", "#A9C7FF",
+  "#000000", "#FFFFFF", "#DEE3EB", "#2D3137",
+  "#A9C7FF", "#243047", "#314670", "#D4E3FF",
+  "#AFC7F5", "#2B313B", "#3B475E", "#D4E3FF",
+  "#EEC066", "#3A2F1B", "#57441E", "#FFDEA2",
   "#FFB3B0", "#462827", "#77DB92", "#1F3524",
-  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
 ]
 
 [schemes.3]
 seed = "blue"
 rule = "split"
 light = [
-  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
-  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
-  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
-  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
-  "#81533E", "#FFFFFF", "#FDDCCD", "#613E2E",
-  "#676000", "#FFFFFF", "#E7E5B7", "#4D4800",
+  "#F6F9FF", "#ECF1F9", "#DEE3EB", "#191C21",
+  "#404753", "#707784", "#BFC7D5", "#2E5AB4",
+  "#000000", "#FFFFFF", "#2D3137", "#ECF1F9",
+  "#2E5AB4", "#FFFFFF", "#D4E3FF", "#224488",
+  "#7F5439", "#FFFFFF", "#FBDDCA", "#603F2B",
+  "#5F6300", "#FFFFFF", "#E1E6B9", "#474A00",
   "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
-  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
 ]
 dark = [
-  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
-  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
-  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
-  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
-  "#F0BBA3", "#3A2E28", "#5B4135", "#FFDBCB",
-  "#D1CA69", "#33311B", "#4B481F", "#EBE69A",
+  "#121212", "#1B1E23", "#2D3137", "#DEE3EB",
+  "#BFC7D5", "#8A919F", "#404753", "#A9C7FF",
+  "#000000", "#FFFFFF", "#DEE3EB", "#2D3137",
+  "#A9C7FF", "#243047", "#314670", "#D4E3FF",
+  "#EEBC9E", "#3A2E27", "#5A4132", "#FFDCC7",
+  "#C6CD6D", "#30321C", "#464921", "#E1E89D",
   "#FFB3B0", "#462827", "#77DB92", "#1F3524",
-  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
 ]
 
 [schemes.4]
 seed = "blue"
 rule = "triadic"
 light = [
-  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
-  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
-  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
-  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
-  "#845054", "#FFFFFF", "#FFDADB", "#633C3F",
-  "#3C6A1A", "#FFFFFF", "#D0EAC2", "#2C4F14",
+  "#F6F9FF", "#ECF1F9", "#DEE3EB", "#191C21",
+  "#404753", "#707784", "#BFC7D5", "#2E5AB4",
+  "#000000", "#FFFFFF", "#2D3137", "#ECF1F9",
+  "#2E5AB4", "#FFFFFF", "#D4E3FF", "#224488",
+  "#84504E", "#FFFFFF", "#FFDAD7", "#633C3A",
+  "#2C6B28", "#FFFFFF", "#CAEBC7", "#21511E",
   "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
-  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
 ]
 dark = [
-  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
-  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
-  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
-  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
-  "#F3B7BB", "#3B2D2E", "#5D3F41", "#FFDADB",
-  "#A1D585", "#283421", "#374D2B", "#C4EFAE",
+  "#121212", "#1B1E23", "#2D3137", "#DEE3EB",
+  "#BFC7D5", "#8A919F", "#404753", "#A9C7FF",
+  "#000000", "#FFFFFF", "#DEE3EB", "#2D3137",
+  "#A9C7FF", "#243047", "#314670", "#D4E3FF",
+  "#F4B8B4", "#3B2D2C", "#5D3F3E", "#FFDAD7",
+  "#94D78E", "#253423", "#324D2F", "#BBF0B6",
   "#FFB3B0", "#462827", "#77DB92", "#1F3524",
-  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
 ]
 
 [schemes.5]
 seed = "blue"
 rule = "tetradic"
 light = [
-  "#F6FAFF", "#EBF1F9", "#DDE3EB", "#181C21",
-  "#3F4753", "#6E7884", "#BDC7D5", "#105EB1",
-  "#000000", "#FFFFFF", "#2C3136", "#EBF1F9",
-  "#105EB1", "#FFFFFF", "#D0E4FF", "#0D4686",
-  "#70547C", "#FFFFFF", "#EFDCF8", "#543F5D",
-  "#815600", "#FFFFFF", "#FBDEB7", "#624000",
+  "#F6F9FF", "#ECF1F9", "#DEE3EB", "#191C21",
+  "#404753", "#707784", "#BFC7D5", "#2E5AB4",
+  "#000000", "#FFFFFF", "#2D3137", "#ECF1F9",
+  "#2E5AB4", "#FFFFFF", "#D4E3FF", "#224488",
+  "#745378", "#FFFFFF", "#F2DBF5", "#573E5A",
+  "#7B5900", "#FFFFFF", "#F7E0B6", "#5D4200",
   "#A8363B", "#FFFFFF", "#006D33", "#FFFFFF",
-  "#7A5900", "#FFFFFF", "#0E5FAB", "#FFFFFF",
+  "#835500", "#FFFFFF", "#1B5EAC", "#FFFFFF",
 ]
 dark = [
-  "#121212", "#1A1E23", "#2C3136", "#DDE3EB",
-  "#BDC7D5", "#88929E", "#3F4753", "#A0C9FF",
-  "#000000", "#FFFFFF", "#DDE3EB", "#2C3136",
-  "#A0C9FF", "#203147", "#29486E", "#D0E4FF",
-  "#DABCE9", "#352E38", "#514158", "#F3DAFF",
-  "#F6BC6A", "#3B2E1C", "#5A4220", "#FFDDB0",
+  "#121212", "#1B1E23", "#2D3137", "#DEE3EB",
+  "#BFC7D5", "#8A919F", "#404753", "#A9C7FF",
+  "#000000", "#FFFFFF", "#DEE3EB", "#2D3137",
+  "#A9C7FF", "#243047", "#314670", "#D4E3FF",
+  "#DFBAE4", "#362E37", "#534156", "#F7D9FB",
+  "#EEC066", "#3A2F1B", "#57441E", "#FFDEA2",
   "#FFB3B0", "#462827", "#77DB92", "#1F3524",
-  "#EDC066", "#392F1B", "#9DCAFF", "#203245",
+  "#F8BC6B", "#3C2E1C", "#A0C9FF", "#223145",
 ]
 
 [schemes.6]
@@ -929,7 +1626,7 @@ still = "the inversion, as before"
 # --- the tier contract -----------------------------------------------------------------------------------------------
 # What each tier promises, in words a second implementation can meet. The tier is a constant of a build, never decided
 # at run time; there is no frame watchdog and no reduce-motion setting, since either would be the device deciding what
-# its build already knows.
+# its build already knows. What each tier caps a timed animation at is a floor ([floor.motion]).
 
 [tier.still]
 promise = "Nothing moves. Every state change is one paint of the final state, and a pressed control shows its inversion and nothing else. A transform other than the identity is refused, and none of the motion engine is built."
@@ -939,3 +1636,472 @@ promise = "Springs move position, opacity and colour. A rotation or scale of an 
 
 [tier.full]
 promise = "Everything in the micro table: layers are rotated and scaled whole, shadows are drawn, lists enter in turn, a screen change and the keyboard's page change cross-fade through a picture of the old contents."
+
+# --- components (plan 0025 D5) ---------------------------------------------------------------------------------------
+# How each UI element is built: its parts, and for each variant, size and state the tokens each part draws with. Both kits
+# implement the components in their own widget code; what a widget looks like comes from here. A spec is assembled in
+# layers, each later one winning: base, then the variant, then the size, then the state. Every value is a token reference
+# (the file's head lists the kinds), never a number or a colour.
+#
+# parts: the first part is the component's root; it carries the target (hit) and the motion. A state layer (layer_opacity) is
+# drawn in the colour the state names (layer; vrx's is the primary, plan 0062 D14); where the display class gives the layer no opacity (a panel
+# without greys) the state is the inversion: the root takes the layer's colour and every part takes the rest fill as its ink.
+# A layer the colour of the part's own fill would show nothing (primary over a primary fill), so it is drawn in the content's
+# colour instead: a filled control's press is the inversion of its fill.
+# A focus ring is the root's outline: drawn inside the control by its width and an inset, or outside it by an offset, which a
+# control that fills needs (floor.focus_on_fill). interactive: a person acts on
+# it, so it has a focus state that draws its focus_ring part and a disabled state (the resolver refuses a spec without
+# them), and its target is at least the touch floor ([floor.touch_target]). The properties a part can take:
+#   fill (colour or gradient), colour (text or glyph), border_colour, ground (the colour a part's text sits on where that is
+#   not the root's fill), layer_opacity (a state layer in the part's content colour), opacity, border and stroke (border_px),
+#   radius, elevation, type, height, min_width, size, hit, pad_x, pad_y, gap, offset (spacing_mm), motion (micro or duration_ms).
+# Text drawn on a fill is held to a contrast pair of [colour]: a part's text colour on its ground must be a pair there.
+#
+# A tier realisation, [component.<c>.tier.<tier>] <state> = { <part> = { ... } }, is what a render tier (full, light, grey,
+# epaper: the panel's, ui_ds.c) draws for a state instead of, or on top of, the state's own look, because the panel cannot
+# show that look: an opacity on e-paper, a tint that maps to the same grey (D13, floor.state_distinct). It layers after the
+# state; rest has none. Every interactive state must differ from rest in every tier ([floor.state_visible],
+# [floor.state_distinct]), and a brand's design that hides one gets the row's realisation written here for it.
+
+[component.button]
+parts = ["container", "label", "icon", "focus_ring"]
+interactive = true
+[component.button.base]
+container = { radius = "radius_mm.sm", border = "border_px.hairline", pad_x = "spacing_mm.lg", gap = "spacing_mm.sm", hit = "control_mm.sm", elevation = "elevation.0", motion = "micro.press" }
+label = { type = "type.label_lg" }
+icon = { size = "icon_mm.sm" }
+[component.button.variant.filled]
+container = { fill = "colour.primary", border_colour = "colour.primary" }
+label = { colour = "colour.on_primary" }
+icon = { colour = "colour.on_primary" }
+[component.button.variant.tonal]
+container = { fill = "colour.primary_container", border_colour = "colour.primary_container" }
+label = { colour = "colour.on_primary_container" }
+icon = { colour = "colour.on_primary_container" }
+[component.button.variant.outlined]
+container = { border_colour = "colour.outline" }
+label = { colour = "colour.text" }
+icon = { colour = "colour.text" }
+[component.button.variant.text]
+container = { pad_x = "spacing_mm.sm" }
+label = { colour = "colour.primary" }
+icon = { colour = "colour.primary" }
+[component.button.size.sm]
+container = { height = "control_mm.sm", pad_x = "spacing_mm.md" }
+label = { type = "type.label" }
+[component.button.size.md]
+container = { height = "control_mm.md" }
+[component.button.size.lg]
+container = { height = "control_mm.lg", pad_x = "spacing_mm.xl" }
+icon = { size = "icon_mm.md" }
+[component.button.state.rest]
+[component.button.state.hover]
+container = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.button.state.pressed]
+container = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.button.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", offset = "spacing_mm.xs" }
+[component.button.state.disabled]
+container = { fill = "colour.page", border = "border_px.none" }
+label = { colour = "colour.text_secondary" }
+icon = { colour = "colour.text_secondary" }
+
+[component.chip]
+parts = ["container", "label", "icon", "focus_ring"]
+interactive = true
+[component.chip.base]
+container = { fill = "colour.secondary_container", radius = "radius_mm.sm", border = "border_px.regular", border_colour = "colour.outline", pad_x = "spacing_mm.md", pad_y = "spacing_mm.xs", gap = "spacing_mm.xs", hit = "control_mm.sm", motion = "micro.select" }
+label = { type = "type.label", colour = "colour.on_secondary_container" }
+icon = { size = "icon_mm.xs", colour = "colour.on_secondary_container" }
+[component.chip.variant.assist]
+[component.chip.variant.filter]
+[component.chip.size.sm]
+container = { height = "control_mm.sm" }
+[component.chip.size.md]
+container = { height = "control_mm.md" }
+label = { type = "type.label_lg" }
+[component.chip.state.rest]
+[component.chip.state.hover]
+container = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.chip.state.pressed]
+container = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.chip.state.selected]
+container = { fill = "colour.primary", border_colour = "colour.primary" }
+label = { colour = "colour.on_primary" }
+icon = { colour = "colour.on_primary" }
+[component.chip.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", offset = "spacing_mm.xs" }
+[component.chip.state.disabled]
+container = { opacity = "opacity_permille.disabled" }
+[component.chip.tier.grey]
+disabled = { container = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" } }
+[component.chip.tier.epaper]
+disabled = { container = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" } }
+
+[component.badge]
+parts = ["container", "label", "dot"]
+interactive = false
+[component.badge.base]
+container = { radius = "radius_mm.sm", pad_x = "spacing_mm.sm", gap = "spacing_mm.xs" }
+label = { type = "type.label_sm" }
+dot = { size = "spacing_mm.sm", radius = "radius_mm.pill" }
+[component.badge.variant.neutral]
+container = { fill = "colour.surface_high" }
+label = { colour = "colour.text" }
+dot = { fill = "colour.outline" }
+[component.badge.variant.primary]
+container = { fill = "colour.primary" }
+label = { colour = "colour.on_primary" }
+dot = { fill = "colour.on_primary" }
+[component.badge.variant.error]
+container = { fill = "colour.error" }
+label = { colour = "colour.on_error" }
+dot = { fill = "colour.on_error" }
+[component.badge.variant.success]
+container = { fill = "colour.success" }
+label = { colour = "colour.on_success" }
+dot = { fill = "colour.on_success" }
+[component.badge.variant.warning]
+container = { fill = "colour.warning" }
+label = { colour = "colour.on_warning" }
+dot = { fill = "colour.on_warning" }
+[component.badge.variant.info]
+container = { fill = "colour.info" }
+label = { colour = "colour.on_info" }
+dot = { fill = "colour.on_info" }
+[component.badge.size.sm]
+container = { pad_y = "spacing_mm.xs" }
+[component.badge.size.md]
+container = { pad_y = "spacing_mm.xs", pad_x = "spacing_mm.md" }
+label = { type = "type.label" }
+[component.badge.state.rest]
+
+[component.card]
+parts = ["container", "title", "body"]
+interactive = false
+[component.card.base]
+container = { radius = "radius_mm.md", pad_x = "spacing_mm.lg", pad_y = "spacing_mm.lg", gap = "spacing_mm.sm" }
+title = { type = "type.title_sm", colour = "colour.text" }
+body = { type = "type.body", colour = "colour.text" }
+[component.card.variant.elevated]
+container = { fill = "colour.surface", elevation = "elevation.1" }
+[component.card.variant.filled]
+container = { fill = "colour.surface_high", elevation = "elevation.0" }
+[component.card.variant.outlined]
+container = { border = "border_px.hairline", border_colour = "colour.outline_faint", elevation = "elevation.0" }
+[component.card.size.md]
+[component.card.state.rest]
+
+[component.list_tile]
+parts = ["container", "title", "subtitle", "leading", "trailing", "focus_ring"]
+interactive = true
+[component.list_tile.base]
+container = { pad_x = "spacing_mm.edge_inset", pad_y = "spacing_mm.sm", gap = "spacing_mm.md", hit = "control_mm.md", motion = "micro.press_row" }   # pad_x: a row sits on the client area's inset, as the sections and the controls beside it do (the rounded glass takes anything nearer the edge)
+title = { type = "type.body", colour = "colour.text" }
+subtitle = { type = "type.subtext", colour = "colour.text_secondary" }
+leading = { size = "icon_mm.md", colour = "colour.text_secondary" }
+trailing = { size = "icon_mm.sm", colour = "colour.text_secondary" }
+[component.list_tile.variant.plain]
+[component.list_tile.size.one_line]
+container = { height = "control_mm.md" }
+[component.list_tile.size.two_line]
+container = { height = "control_mm.lg" }
+[component.list_tile.state.rest]
+[component.list_tile.state.hover]
+container = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.list_tile.state.pressed]
+container = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.list_tile.state.selected]
+container = { fill = "colour.primary" }
+title = { colour = "colour.on_primary" }
+subtitle = { colour = "colour.on_primary" }
+leading = { colour = "colour.on_primary" }
+trailing = { colour = "colour.on_primary" }
+[component.list_tile.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", offset = "spacing_mm.xs" }
+[component.list_tile.state.disabled]
+container = { opacity = "opacity_permille.disabled" }
+[component.list_tile.tier.grey]
+disabled = { container = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, title = { colour = "colour.text_secondary" }, subtitle = { colour = "colour.text_secondary" } }
+[component.list_tile.tier.epaper]
+disabled = { container = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, title = { colour = "colour.text_secondary" }, subtitle = { colour = "colour.text_secondary" } }
+
+[component.text_field]
+parts = ["container", "input", "label", "helper", "focus_ring"]
+interactive = true
+[component.text_field.base]
+container = { radius = "radius_mm.sm", border = "border_px.hairline", border_colour = "colour.outline", pad_x = "spacing_mm.md", hit = "control_mm.md", height = "control_mm.md", motion = "micro.focus" }
+input = { type = "type.body", colour = "colour.text" }
+label = { type = "type.label", colour = "colour.text_secondary" }
+helper = { type = "type.caption", colour = "colour.text_secondary", ground = "colour.page" }
+[component.text_field.variant.outlined]
+[component.text_field.variant.filled]
+container = { fill = "colour.surface_high", border_colour = "colour.surface_high" }
+label = { colour = "colour.text" }
+[component.text_field.size.md]
+[component.text_field.size.compact]   # a field in a toolbar or a row (Part C's layout finding, 2026-11-15): the touch floor's height, a tight pad
+container = { pad_x = "spacing_mm.xs", height = "control_mm.sm", hit = "control_mm.sm" }
+[component.text_field.state.rest]
+[component.text_field.state.hover]
+container = { border_colour = "colour.text_secondary" }
+[component.text_field.state.focus]
+container = { border = "border_px.regular", border_colour = "colour.focus" }
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", inset = "border_px.hairline" }
+[component.text_field.state.error]
+container = { border = "border_px.regular", border_colour = "colour.error" }
+helper = { colour = "colour.error" }
+[component.text_field.state.disabled]
+container = { opacity = "opacity_permille.disabled" }
+[component.text_field.tier.grey]
+disabled = { container = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" } }
+[component.text_field.tier.epaper]
+disabled = { container = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" } }
+
+[component.checkbox]
+parts = ["box", "check", "label", "focus_ring"]
+interactive = true
+[component.checkbox.base]
+box = { size = "icon_mm.sm", radius = "radius_mm.xs", border = "border_px.regular", border_colour = "colour.outline", hit = "control_mm.sm", motion = "micro.select" }
+check = { stroke = "border_px.regular", colour = "colour.on_primary" }
+label = { type = "type.body", colour = "colour.text", ground = "colour.page" }
+[component.checkbox.variant.plain]
+[component.checkbox.size.md]
+[component.checkbox.state.rest]
+[component.checkbox.state.hover]
+box = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.checkbox.state.pressed]
+box = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.checkbox.state.checked]
+box = { fill = "colour.primary", border_colour = "colour.primary" }
+[component.checkbox.state.error]
+box = { border_colour = "colour.error" }
+[component.checkbox.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", offset = "spacing_mm.xs" }
+[component.checkbox.state.disabled]
+box = { opacity = "opacity_permille.disabled" }
+label = { opacity = "opacity_permille.disabled" }
+[component.checkbox.tier.grey]
+disabled = { box = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { opacity = "opacity_permille.opaque", colour = "colour.text_secondary" } }
+[component.checkbox.tier.epaper]
+disabled = { box = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { opacity = "opacity_permille.opaque", colour = "colour.text_secondary" } }
+
+[component.radio]
+parts = ["ring", "dot", "label", "focus_ring"]
+interactive = true
+[component.radio.base]
+ring = { size = "icon_mm.sm", radius = "radius_mm.pill", border = "border_px.regular", border_colour = "colour.outline", hit = "control_mm.sm", motion = "micro.select" }
+dot = { size = "spacing_mm.sm", radius = "radius_mm.pill" }
+label = { type = "type.body", colour = "colour.text", ground = "colour.page" }
+[component.radio.variant.plain]
+[component.radio.size.md]
+[component.radio.state.rest]
+[component.radio.state.hover]
+ring = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.radio.state.pressed]
+ring = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.radio.state.selected]
+ring = { border_colour = "colour.primary" }
+dot = { fill = "colour.primary" }
+[component.radio.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", inset = "border_px.hairline" }
+[component.radio.state.disabled]
+ring = { opacity = "opacity_permille.disabled" }
+label = { opacity = "opacity_permille.disabled" }
+[component.radio.tier.grey]
+disabled = { ring = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { opacity = "opacity_permille.opaque", colour = "colour.text_secondary" } }
+[component.radio.tier.epaper]
+disabled = { ring = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { opacity = "opacity_permille.opaque", colour = "colour.text_secondary" } }
+
+[component.switch]
+parts = ["track", "knob", "focus_ring"]
+interactive = true
+[component.switch.base]
+track = { height = "icon_mm.md", min_width = "control_mm.md", radius = "radius_mm.pill", border = "border_px.hairline", border_colour = "colour.outline", fill = "colour.surface_high", hit = "control_mm.sm", motion = "micro.select" }
+knob = { size = "icon_mm.xs", radius = "radius_mm.pill", fill = "colour.outline" }
+[component.switch.variant.plain]
+[component.switch.size.md]
+[component.switch.state.rest]
+[component.switch.state.hover]
+track = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.switch.state.pressed]
+track = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.switch.state.checked]
+track = { fill = "colour.primary", border_colour = "colour.primary" }
+knob = { fill = "colour.on_primary" }
+[component.switch.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", offset = "spacing_mm.xs" }
+[component.switch.state.disabled]
+track = { opacity = "opacity_permille.disabled" }
+[component.switch.tier.grey]
+disabled = { track = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" } }
+[component.switch.tier.epaper]
+disabled = { track = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" } }
+
+[component.segmented]
+parts = ["container", "segment", "label", "focus_ring"]
+interactive = true
+[component.segmented.base]
+container = { radius = "radius_mm.sm", border = "border_px.hairline", border_colour = "colour.outline", hit = "control_mm.sm", height = "control_mm.sm", motion = "micro.select" }
+segment = { min_width = "size_mm.touch_along", pad_x = "spacing_mm.md", border = "border_px.hairline", border_colour = "colour.outline" }
+label = { type = "type.label", colour = "colour.text" }
+[component.segmented.variant.plain]
+[component.segmented.size.md]
+[component.segmented.state.rest]
+[component.segmented.state.hover]
+segment = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.segmented.state.pressed]
+segment = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.segmented.state.selected]
+segment = { fill = "colour.primary" }
+label = { colour = "colour.on_primary", ground = "colour.primary" }
+[component.segmented.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", inset = "border_px.hairline" }
+[component.segmented.state.disabled]
+container = { opacity = "opacity_permille.disabled" }
+[component.segmented.tier.grey]
+disabled = { container = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { colour = "colour.text_secondary" } }
+[component.segmented.tier.epaper]
+disabled = { container = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { colour = "colour.text_secondary" } }
+
+[component.banner]
+parts = ["container", "icon", "title", "message"]
+interactive = false
+[component.banner.base]
+container = { fill = "colour.surface_high", radius = "radius_mm.sm", border = "border_px.hairline", pad_x = "spacing_mm.lg", pad_y = "spacing_mm.sm", gap = "spacing_mm.md", elevation = "elevation.0", motion = "micro.banner" }
+icon = { size = "icon_mm.md" }
+title = { type = "type.title_sm", colour = "colour.text" }
+message = { type = "type.subtext", colour = "colour.text" }   # under the title, a step down (Part C: body overflowed a phone's banner, 2026-11-15)
+[component.banner.variant.info]
+container = { border_colour = "colour.info" }
+icon = { colour = "colour.info" }
+[component.banner.variant.success]
+container = { border_colour = "colour.success" }
+icon = { colour = "colour.success" }
+[component.banner.variant.warning]
+container = { border_colour = "colour.warning" }
+icon = { colour = "colour.warning" }
+[component.banner.variant.error]
+container = { border_colour = "colour.error" }
+icon = { colour = "colour.error" }
+[component.banner.size.md]
+[component.banner.state.rest]
+
+[component.toast]
+parts = ["container", "label", "action"]
+interactive = false
+[component.toast.base]
+container = { radius = "radius_mm.sm", pad_x = "spacing_mm.lg", pad_y = "spacing_mm.md", gap = "spacing_mm.md", elevation = "elevation.3", motion = "micro.banner" }
+label = { type = "type.body" }
+action = { type = "type.label_lg" }
+[component.toast.variant.neutral]
+container = { fill = "colour.inverse" }
+label = { colour = "colour.on_inverse" }
+action = { colour = "colour.on_inverse" }
+[component.toast.variant.error]
+container = { fill = "colour.error" }
+label = { colour = "colour.on_error" }
+action = { colour = "colour.on_error" }
+[component.toast.size.md]
+[component.toast.state.rest]
+
+[component.progress]
+parts = ["track", "indicator"]
+interactive = false
+[component.progress.base]
+track = { radius = "radius_mm.xs", motion = "micro.value" }
+indicator = { radius = "radius_mm.xs" }
+[component.progress.variant.linear]
+track = { fill = "colour.outline_faint" }
+indicator = { fill = "gradient.signal" }   # the accent in motion; a tier without gradients draws the gradient's fallback slot
+[component.progress.variant.circular]
+track = { colour = "colour.outline_faint", stroke = "border_px.thick", radius = "radius_mm.pill" }
+indicator = { colour = "colour.primary", stroke = "border_px.thick", radius = "radius_mm.pill" }
+[component.progress.size.sm]
+track = { height = "spacing_mm.xs" }
+[component.progress.size.md]
+track = { height = "spacing_mm.sm" }
+[component.progress.state.rest]
+
+[component.top_bar]
+parts = ["container", "title", "action"]
+interactive = false
+[component.top_bar.base]
+# height: one control, not a chrome band (the Metronome spent 104 px of a 720 px panel on "Tempo", 2026-10-13; a bar with no control is content-high)
+# gap: the bar's controls sit as a pair, a hairline's breath apart; the walks tap the code editor's Save and Run at the kit's
+# measured centres (host_ui, 219 PPI), which a wider gap moved (plan 0025 Part B final pass, 2026-11-15)
+container = { fill = "colour.surface", height = "control_mm.sm", pad_x = "spacing_mm.lg", gap = "spacing_mm.xs", border = "border_px.hairline", border_colour = "colour.outline_faint", elevation = "elevation.0" }
+title = { type = "type.title", colour = "colour.text" }
+action = { size = "icon_mm.md", colour = "colour.text" }
+[component.top_bar.variant.plain]
+[component.top_bar.size.md]
+[component.top_bar.state.rest]
+[component.top_bar.state.scrolled]
+container = { fill = "colour.surface_high", elevation = "elevation.2" }
+
+[component.nav_bar]
+parts = ["container", "item", "indicator", "icon", "label", "focus_ring"]
+interactive = true
+[component.nav_bar.base]
+container = { fill = "colour.page", height = "control_mm.lg", border = "border_px.hairline", border_colour = "colour.outline_faint", hit = "control_mm.lg", motion = "micro.select" }
+item = { min_width = "control_mm.lg", gap = "spacing_mm.xs" }
+indicator = { radius = "radius_mm.sm", pad_x = "spacing_mm.md" }
+icon = { size = "icon_mm.md", colour = "colour.text_secondary" }
+label = { type = "type.label_sm", colour = "colour.text_secondary" }
+[component.nav_bar.variant.plain]
+[component.nav_bar.size.md]
+[component.nav_bar.state.rest]
+[component.nav_bar.state.hover]
+item = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.nav_bar.state.pressed]
+item = { layer = "colour.primary", layer_opacity = "class.pressed_layer_permille" }
+[component.nav_bar.state.selected]
+indicator = { fill = "colour.primary" }
+icon = { colour = "colour.on_primary" }
+label = { colour = "colour.text" }
+[component.nav_bar.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", inset = "border_px.hairline" }
+[component.nav_bar.state.disabled]
+container = { opacity = "opacity_permille.disabled" }   # the bar's state: every item in it fades
+[component.nav_bar.tier.grey]
+disabled = { container = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { colour = "colour.text_secondary" } }
+[component.nav_bar.tier.epaper]
+disabled = { container = { border = "border_px.none", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, label = { colour = "colour.text_secondary" } }
+
+[component.dialog]
+parts = ["container", "scrim", "title", "body", "actions"]
+interactive = false
+[component.dialog.base]
+container = { fill = "colour.surface_high", radius = "radius_mm.md", pad_x = "spacing_mm.xl", pad_y = "spacing_mm.xl", gap = "spacing_mm.lg", elevation = "elevation.4", motion = "micro.modal" }
+scrim = { fill = "colour.shadow", opacity = "opacity_permille.scrim" }
+title = { type = "type.headline_sm", colour = "colour.text" }
+body = { type = "type.body", colour = "colour.text" }
+actions = { gap = "spacing_mm.sm" }
+[component.dialog.variant.basic]
+[component.dialog.size.md]
+[component.dialog.state.rest]
+
+[component.slider]
+parts = ["track", "active_track", "handle", "value_label", "focus_ring"]
+interactive = true
+[component.slider.base]
+track = { height = "spacing_mm.lg", radius = "radius_mm.pill", fill = "colour.outline_faint", hit = "control_mm.sm", motion = "micro.handle" }
+active_track = { height = "spacing_mm.lg", radius = "radius_mm.pill", fill = "colour.primary" }
+handle = { size = "icon_mm.md", radius = "radius_mm.sm", fill = "colour.page", border = "border_px.regular", border_colour = "colour.outline" }
+value_label = { type = "type.label", fill = "colour.inverse", colour = "colour.on_inverse", radius = "radius_mm.sm", pad_x = "spacing_mm.sm" }
+[component.slider.variant.plain]
+[component.slider.size.md]
+[component.slider.state.rest]
+[component.slider.state.hover]
+handle = { layer = "colour.primary", layer_opacity = "opacity_permille.hover" }
+[component.slider.state.pressed]
+handle = { fill = "colour.primary", border_colour = "colour.primary" }
+[component.slider.state.focus]
+focus_ring = { colour = "colour.focus", stroke = "border_px.regular", offset = "spacing_mm.xs" }
+[component.slider.state.disabled]
+track = { opacity = "opacity_permille.disabled" }
+active_track = { opacity = "opacity_permille.disabled" }
+handle = { opacity = "opacity_permille.disabled" }
+[component.slider.tier.grey]
+disabled = { track = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, active_track = { opacity = "opacity_permille.opaque" }, handle = { opacity = "opacity_permille.opaque" } }
+[component.slider.tier.epaper]
+disabled = { track = { border = "border_px.hairline", border_colour = "colour.text_secondary", opacity = "opacity_permille.opaque" }, active_track = { opacity = "opacity_permille.opaque" }, handle = { opacity = "opacity_permille.opaque" } }

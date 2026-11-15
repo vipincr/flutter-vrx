@@ -91,11 +91,11 @@ never two competing blues.
 | Role | Face | Files |
 |---|---|---|
 | UI | Fira Sans | Light, Regular, Medium (the three weights the UI uses) |
-| Console, terminal, logs, code | Fira Code | Regular |
+| Console, terminal, logs, code | Fira Code | Regular, Bold (the editor's keyword emphasis) |
 | Math symbols (fallback) | Noto Sans Math | Regular |
 | Music symbols (fallback) | Noto Music | Regular |
 
-About 2.3 MB in all, in one package (`vrx-fonts`), with fontconfig making them
+About 2.6 MB in all, in one package (`vrx-fonts`), with fontconfig making them
 the defaults: `sans-serif`, `system-ui` and `serif` resolve to Fira Sans,
 `monospace` to Fira Code, and both fall back to the two symbol faces, so a
 math operator or a note value renders inside any text.

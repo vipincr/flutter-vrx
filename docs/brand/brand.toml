@@ -40,29 +40,23 @@ core = "#385794"
 track = "#1C2129"
 mist = "#8B93A1"
 
-[ui]
-# seed = "#RRGGBB"              # the default UI scheme's seed; absent: the UI standard's default scheme
-
 [logo]                          # logo/<shape>-<ground>.svg: paths only, no <text>, no external references
 mark = "mark"
 wordmark = "wordmark"
 
-[fonts]
+[fonts]                         # files by role; each family name is read from its file
 ui = "FiraSans-Regular.ttf"
 ui_light = "FiraSans-Light.ttf"
 ui_medium = "FiraSans-Medium.ttf"
 mono = "FiraCode-Regular.ttf"
+mono_bold = "FiraCode-Bold.ttf"              # the editor's keyword emphasis (code_bold)
 fallback = ["NotoSansMath-Regular.ttf", "NotoMusic-Regular.ttf"]
-
-[fonts.families]                # fontconfig family names, for the system defaults
-ui = "Fira Sans"
-mono = "Fira Code"
-fallback = ["Noto Sans Math", "Noto Music"]
 
 [fonts.licences]                # each face: its licence file and SPDX id
 "FiraSans-Regular.ttf" = ["firasans-OFL.txt", "OFL-1.1"]
 "FiraSans-Light.ttf" = ["firasans-OFL.txt", "OFL-1.1"]
 "FiraSans-Medium.ttf" = ["firasans-OFL.txt", "OFL-1.1"]
 "FiraCode-Regular.ttf" = ["firacode-OFL.txt", "OFL-1.1"]
+"FiraCode-Bold.ttf" = ["firacode-OFL.txt", "OFL-1.1"]
 "NotoSansMath-Regular.ttf" = ["notosansmath-OFL.txt", "OFL-1.1"]
 "NotoMusic-Regular.ttf" = ["notomusic-OFL.txt", "OFL-1.1"]
