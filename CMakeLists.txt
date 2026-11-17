@@ -114,11 +114,32 @@ endif()
 
 message(STATUS "PIE .................... ${CMAKE_POSITION_INDEPENDENT_CODE}")
 
+# libvrx-light (vrx plan 0033 D2): the one perceived-brightness curve, the fade stepper and the
+# backlight class access, shared with vrx-splash and the LVGL runtime. The image provides it
+# (meta-vrx's libvrx-light, found by pkg-config); a host build without it names evrx-rt's
+# components/helpers/vrx_light with -DVRX_LIGHT_SOURCE_DIR=<dir> and gets the same files built in.
+set(VRX_LIGHT_SOURCE_DIR "" CACHE PATH "evrx-rt's components/helpers/vrx_light, built in place of the installed libvrx-light")
+if(VRX_LIGHT_SOURCE_DIR)
+  add_library(vrx_light STATIC
+    ${VRX_LIGHT_SOURCE_DIR}/src/light_curve.c
+    ${VRX_LIGHT_SOURCE_DIR}/src/light_fade.c
+    ${VRX_LIGHT_SOURCE_DIR}/src/light_table.c
+    ${VRX_LIGHT_SOURCE_DIR}/chip/linux/light_sysfs.c
+  )
+  target_include_directories(vrx_light PUBLIC ${VRX_LIGHT_SOURCE_DIR}/include)
+  target_link_libraries(vrx_light PUBLIC m)
+  set(VRX_LIGHT_TARGET vrx_light)
+else()
+  pkg_check_modules(VRX_LIGHT REQUIRED IMPORTED_TARGET vrx-light)
+  set(VRX_LIGHT_TARGET PkgConfig::VRX_LIGHT)
+endif()
+
 # flutter-pi executable
 add_executable(
   flutter-pi
   src/main.c
   src/vrx_compositor.c
+  src/vrx_screen_light.c
   src/vrx_app_client.c
   src/vrx_kms.c
   src/vrx_vt.c
@@ -485,6 +506,7 @@ endif()
 target_link_libraries(
   flutter-pi PUBLIC
   flutterpi_module
+  ${VRX_LIGHT_TARGET}
 )
 # vrx: the runtime's product name (plan 0005). The CMake target keeps
 # upstream's flutter-pi name for merge hygiene; the installed binary is

@@ -2435,7 +2435,7 @@ static void vrx_engine_started(struct flutterpi *fpi) {
     flutterpi_sd_event_add_io(NULL, fd, EPOLLIN, on_vrx_etc_changed, NULL);
 }
 
-// vrx/shell: getInsets and setChrome {hidden} for every app; setRegion
+// vrx/shell: getInsets, setChrome {hidden} and setBrightness {permille} for every app; setRegion
 // {top, full}, back and powerOffAnswer {now} from the shell.
 static int on_vrx_shell_channel(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *handle) {
     (void) channel;
@@ -2461,6 +2461,15 @@ static int on_vrx_shell_channel(char *channel, struct platch_obj *object, Flutte
         struct json_value *now = jsobject_get(&object->json_arg, "now");
         struct vrx_msg_power_off_answer m = { .now = now && JSONVALUE_IS_BOOL(*now) && JSONVALUE_AS_BOOL(*now) };
         vrx_app_client_send(vrx_app.client, VRX_MSG_POWER_OFF_ANSWER, &m, sizeof m, -1);
+        return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
+    }
+    if (strcmp(object->method, "setBrightness") == 0) {
+        // the person's brightness, per mille (vrx plan 0033 D4); the compositor holds the display grant to account
+        struct json_value *permille = jsobject_get(&object->json_arg, "permille");
+        if (!permille || !JSONVALUE_IS_NUM(*permille)) return platch_respond_illegal_arg_json(handle, "setBrightness: permille must be a number");
+        double v = JSONVALUE_AS_NUM(*permille);
+        struct vrx_msg_brightness m = { .permille = v < 0 ? 0 : v > 1000 ? 1000 : (uint32_t) (v + 0.5) };
+        vrx_app_client_send(vrx_app.client, VRX_MSG_BRIGHTNESS, &m, sizeof m, -1);
         return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
     }
     if (strcmp(object->method, "setChrome") == 0) {

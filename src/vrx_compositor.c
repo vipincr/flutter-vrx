@@ -57,8 +57,12 @@
 #include <xf86drmMode.h>
 #include <systemd/sd-bus.h>
 
+#include <vrx_light/vrx_light_sysfs.h>
+
 #include "vrx_ipc.h"
 #include "vrx_kms.h"
+#include "vrx_light_standard.h"
+#include "vrx_screen_light.h"
 #include "vrx_vt.h"
 
 // ─── app client ───────────────────────────────────────────────────────────
@@ -164,11 +168,20 @@ struct vrx_compositor {
 
     // screen power (plan 0010, plan 0023 D1): vrxhost decides when the
     // screen goes dark or lights (MSG_SCREEN) and how far it dims
-    // (MSG_LIGHT_CAP); this executes it and keeps no timer of its own
-    int conf_fd;               // inotify on the screen settings directory
-    int brightness;            // the setting, 0-100, mapped above a floor
+    // (MSG_LIGHT_CAP); this executes it. The light itself (plan 0033) is
+    // `light`: the person's brightness, per mille and perceived, the fade,
+    // and the migration; this file only shows what it says.
     char backlight[96];        // /sys/class/backlight/<name>, "" = none
     int bl_max;                // its max_brightness, 0 = no backlight
+    struct vrx_light bl_map;   // the backlight's levels against perceived brightness
+    struct vrx_screen_light light;
+    int light_fd;              // timerfd: a fade's steps, every LIGHT_STEP_MS while one runs
+    bool fade_ok;              // this screen can fade: a dimmable light, or a dim plane on the full tier
+    bool handoff_wait;         // the first frame waits for the light to be down (plan 0033 D5)
+    bool off_pending;          // the screen goes off when the light is down (screen_off_why)
+    char off_why[24];
+    bool shutdown_dip;         // the system is going down: release our logind delay when the light is down
+    uint32_t resume_deadline_ms;  // after a resume, light at the latest then; 0 = not waiting
     // how brightness is shown: the backlight's levels, or a black plane
     // over everything at partial alpha (DIM_ALPHA), or not at all
     enum { DIM_NONE, DIM_BACKLIGHT, DIM_ALPHA } dim;
@@ -207,8 +220,7 @@ struct vrx_compositor {
     bool light_after_flip;     // waking: light once the newest frame is up
     // the system bus: PrepareForSleep, so apps hear the system sleep
     sd_bus *bus;
-    struct udev_monitor *bl_mon;  // the backlight's change events
-    int bl_level;              // the backlight's level while lit, as set
+    int bl_level;              // the backlight level last written, -1 = none yet
     int sig_fd;                // SIGTERM / SIGINT stop; SIGUSR1 writes the flip ring
     // input facts for the kit (plan 0013 D6, D7): touchscreens and
     // keyboards present, by udev's classification; a device's kinds are
@@ -221,7 +233,6 @@ struct vrx_compositor {
     int sleep_inhibit_fd;      // our logind `sleep` delay inhibitor, -1
     int sleep_ack_fd;          // timerfd: release the delay after 1 s
     bool sleeping;             // between PrepareForSleep(true) and (false)
-    uint32_t light_cap;        // permille above the floor; 1000 = none (D10)
     int touches;               // contacts down now
 
     struct app_client apps[MAX_APPS];
@@ -260,6 +271,9 @@ static uint64_t now_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
 }
+
+// the light's clock (a fade is measured in whole milliseconds; the wrap is the stepper's to handle)
+static uint32_t now_ms(void) { return (uint32_t) (now_ns() / 1000000ull); }
 
 // ─── KMS ──────────────────────────────────────────────────────────────────
 
@@ -610,14 +624,15 @@ static bool frame_import(struct vrx_compositor *c, struct frame *f,
     return true;
 }
 
-static void screen_light(struct vrx_compositor *c);
+static void screen_light(struct vrx_compositor *c, uint32_t ms);
+static void light_timer(struct vrx_compositor *c);
+static uint64_t dim_alpha(uint16_t shown);
 static void screen_report(struct vrx_compositor *c);
 static void screen_facts(const struct vrx_compositor *c);
 static void display_on(struct vrx_compositor *c, const char *why);
 static void display_off(struct vrx_compositor *c, const char *why);
 static void display_tell(struct vrx_compositor *c, int only);
 static bool chrome_shown(const struct vrx_compositor *c);
-static uint64_t dim_alpha(const struct vrx_compositor *c);
 
 // ─── the scene (plan 0017 D9) ─────────────────────────────────────────────
 //
@@ -810,7 +825,7 @@ static bool scene_modeset(struct vrx_compositor *c) {
     c->queued.dmabuf_fd = -1;
     c->queued.app = -1;
     c->scene_dirty = true;
-    if (c->dim == DIM_ALPHA) c->dim_want = dim_alpha(c);
+    if (c->dim == DIM_ALPHA) c->dim_want = dim_alpha(c->light.shown);
     cursor_update(c);
     fprintf(stderr, "[vrx-compositor] modeset: first frame from app %d on screen\n", c->on_screen.app);
     if (c->on_screen.app >= 0) report_app(c, &c->apps[c->on_screen.app], VRX_APP_SHOWN);
@@ -823,6 +838,7 @@ static void scene_commit(struct vrx_compositor *c) {
     if (c->dark) return;  // the newest frames wait for the wake
     bool first = false;
     if (!c->mode_set) {
+        if (c->handoff_wait) return;  // the splash's light is still coming down (plan 0033 D5)
         if (!scene_modeset(c)) return;
         first = true;
     }
@@ -880,7 +896,8 @@ static void scene_commit(struct vrx_compositor *c) {
         c->shell_queued.dmabuf_fd = -1;
         c->shell_queued.app = -1;
     }
-    if (first) screen_light(c);
+    // the first frame is committed: the light comes up on it (a dim plane has no splash to hide)
+    if (first) screen_light(c, c->dim == DIM_BACKLIGHT ? VRX_STD_THROUGH_DARK_IN_MS : 0);
 }
 
 // The scene changed under the commit (the shell came or went, the chrome
@@ -1237,7 +1254,7 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
     if (c->light_after_flip && !c->commit_pending) {
         // waking: the current screen is up, now it can be seen
         c->light_after_flip = false;
-        screen_light(c);
+        screen_light(c, VRX_STD_THROUGH_DARK_IN_MS);
     }
 }
 
@@ -1457,6 +1474,22 @@ static void drop_client(struct vrx_compositor *c, int slot) {
     if (c->pointer_owner == slot) c->pointer_owner = -1;
 }
 
+// Whether the process holds the display grant (group vrx-display): the one
+// thing that lets an applet set the brightness. Read from /proc, where the
+// unit's SupplementaryGroups show; the connection's own credentials do not carry them.
+static bool display_grant(pid_t pid) {
+    struct group *gr = getgrnam("vrx-display");
+    if (!gr) return false;
+    char path[64], text[4096];
+    snprintf(path, sizeof path, "/proc/%d/status", (int) pid);
+    FILE *f = fopen(path, "re");
+    if (!f) return false;
+    size_t n = fread(text, 1, sizeof text - 1, f);
+    fclose(f);
+    text[n] = 0;
+    return vrx_status_has_group(text, gr->gr_gid);
+}
+
 // Handle one message. `fd` is the descriptor that rode it, or -1; this
 // function takes ownership of it.
 static void client_handle(struct vrx_compositor *c, int slot,
@@ -1464,7 +1497,7 @@ static void client_handle(struct vrx_compositor *c, int slot,
     struct app_client *a = &c->apps[slot];
     // a connection is an app (REGISTER) or the controller (CONTROL), once
     bool app_msg = h->type == VRX_MSG_BUFFER || h->type == VRX_MSG_CLOSED || h->type == VRX_MSG_CHROME ||
-                   h->type == VRX_MSG_SEMANTICS_TREE;
+                   h->type == VRX_MSG_SEMANTICS_TREE || h->type == VRX_MSG_BRIGHTNESS;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL || h->type == VRX_MSG_LIGHT_CAP ||
           h->type == VRX_MSG_PROFILING || h->type == VRX_MSG_SEMANTICS || h->type == VRX_MSG_SCREEN ||
@@ -1589,12 +1622,29 @@ static void client_handle(struct vrx_compositor *c, int slot,
             struct vrx_msg_light_cap *m = payload;
             if (h->length < sizeof *m) goto bad;
             uint32_t cap = m->permille > 1000 ? 1000 : m->permille;
-            if (cap != c->light_cap) {
+            if (cap != c->light.cap) {
                 fprintf(stderr, "[vrx-compositor] brightness cap %u/1000 above the floor%s\n", cap,
                         cap == 1000 ? " (none)" : cap == 0 ? " (dimmed)" : " (low power)");
-                c->light_cap = cap;
-                screen_light(c);
+                bool raised = cap > c->light.cap;
+                vrx_screen_light_cap(&c->light, now_ms(), (uint16_t) cap,
+                                     c->fade_ok ? (raised ? VRX_STD_THROUGH_DARK_IN_MS : VRX_STD_THROUGH_DARK_OUT_MS) : 0);
+                light_timer(c);
             }
+            break;
+        }
+        case VRX_MSG_BRIGHTNESS: {
+            // an applet with the display grant (Settings, the shell) sets the person's brightness
+            struct vrx_msg_brightness *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            if (!display_grant(a->pid)) {
+                fprintf(stderr, "[vrx-compositor] app '%s' (pid %d) set the brightness without the display grant: ignored\n",
+                        a->id, (int) a->pid);
+                break;
+            }
+            if (c->dim == DIM_NONE) break;
+            vrx_screen_light_set(&c->light, now_ms(), (uint16_t) (m->permille > 1000 ? 1000 : m->permille));
+            light_timer(c);
+            screen_report(c);
             break;
         }
         case VRX_MSG_SHELL_REGION: {
@@ -1894,26 +1944,31 @@ static int input_target(struct vrx_compositor *c, const struct vrx_msg_input *m)
     }
 }
 
-// ── screen power (plan 0010, plan 0023 D1) ──────────────────────────────
+// ── screen power (plan 0010, plan 0023 D1) and the light (plan 0033) ─────
 // vrxhost decides; the compositor executes. vrxhost's idle chain (dim,
 // screen off, sleep, deep sleep, from the last input it reads on evdev)
 // sends MSG_SCREEN to turn the light to 0 and the connector to DPMS off,
 // or both back on, and MSG_LIGHT_CAP to dim (0: the floor) or to cap the
-// light under low power. No setting means "off": brightness is a position
-// 0-100 that maps into a floor-to-full range, so a stored 0 is still a
-// screen a person can read (the owner, 2026-10-14). Linux first (the
-// owner, same day): a dimmable backlight's level is its own sysfs value
-// (persisted by systemd-backlight, written by applets holding the display
-// grant), and this file holds only what Linux has no home for: the
-// brightness of a screen dimmed by plane alpha, and the output.
-#define SCREEN_DIR "/etc/vrx/display"
-#define SCREEN_FILE SCREEN_DIR "/screen.conf"
+// light under low power. The compositor is the one writer of the light.
+// Brightness is one number, per mille and perceived (libvrx-light's curve),
+// stored once in /data/vrx/display/brightness by vrx_screen_light; a slider
+// asks for it with MSG_BRIGHTNESS. A lit screen never goes under the
+// standard's floor, so a stored 0 is still a screen a person can read (the
+// owner, 2026-10-14).
+//
+// A system moment goes through dark (plan 0033 D1): the light fades down,
+// the screen changes in one paint, the light fades up. The handoff (first
+// frame), screen off and on, sleep, shutdown and resume are those moments;
+// an app's launch or close is not. A screen that cannot dim fades through
+// black in frames only on the full tier (a dim plane over everything); on
+// the others, and where there is no plane, the moment is a cut.
+#define BRIGHTNESS_FILE "/data/vrx/display/brightness"
+#define MOTION_TIER_FILE "/usr/lib/vrx/motion-tier"
 #define SCREEN_FACTS VRX_UI_SOCKET_DIR "/screen"
-// the floors (D8): a tenth of a dimmable backlight; with a dim plane, the
-// screen at 0.4 of its full level (the black plane at alpha 0.6), about
-// 13 % of full luminance, since alpha scales encoded values
-#define BACKLIGHT_FLOOR 0.1
-#define DIM_LEVEL_FLOOR 0.4
+// the rate a fade is stepped at (about a 60 Hz panel's frame)
+#define LIGHT_STEP_MS 16
+// after a resume the light waits for the first frame; at the latest this long
+#define RESUME_WAIT_MS 300
 
 static void screen_facts(const struct vrx_compositor *c);
 
@@ -1928,8 +1983,8 @@ static int sysfs_int(const char *dir, const char *what) {
     return v;
 }
 
-static void backlight_set(const struct vrx_compositor *c, int level) {
-    if (!c->backlight[0]) return;
+static void backlight_set(struct vrx_compositor *c, int level) {
+    if (!c->backlight[0] || level == c->bl_level) return;
     char path[128];
     snprintf(path, sizeof path, "%s/brightness", c->backlight);
     FILE *f = fopen(path, "we");
@@ -1939,32 +1994,14 @@ static void backlight_set(const struct vrx_compositor *c, int level) {
     }
     fprintf(f, "%d\n", level);
     fclose(f);
+    c->bl_level = level;
 }
 
-// The lowest level a dimmable backlight may sit at while lit.
-static int backlight_floor(const struct vrx_compositor *c) {
-    int f = (int) (c->bl_max * BACKLIGHT_FLOOR + 0.5);
-    return f < 1 ? 1 : f;
-}
-
-// The light's level while lit: full on a two-level light; on a dimmable
-// one, its own level as last set, never below the floor.
-static int light_level(const struct vrx_compositor *c) {
-    if (c->dim != DIM_BACKLIGHT) return c->bl_max;
-    int level = c->bl_level < backlight_floor(c) ? backlight_floor(c) : c->bl_level;
-    // the battery's cap (D10): a share of the range above the floor
-    int cap = backlight_floor(c) + (int) ((c->bl_max - backlight_floor(c)) * c->light_cap / 1000.0 + 0.5);
-    return level > cap ? cap : level;
-}
-
-// The dim plane's alpha for the set brightness (and the battery's cap):
-// 0 at full, 1 - DIM_LEVEL_FLOOR at the floor.
-static uint64_t dim_alpha(const struct vrx_compositor *c) {
-    double share = c->brightness / 100.0, cap = c->light_cap / 1000.0;
-    if (share > cap) share = cap;
-    if (share < 0) share = 0;
-    double level = DIM_LEVEL_FLOOR + (1 - DIM_LEVEL_FLOOR) * share;
-    return (uint64_t) (0xffff * (1 - level) + 0.5);
+// The dim plane's alpha for a shown brightness: encoded values scale with
+// alpha, and an encoded share is close to a perceived one, so the plane
+// is black at 1 - shown/1000 (0 at full).
+static uint64_t dim_alpha(uint16_t shown) {
+    return (uint64_t) (0xffff * (1000 - (shown > 1000 ? 1000 : shown)) / 1000);
 }
 
 // Show the dim plane at `alpha` over the whole CRTC, or take it off at 0.
@@ -1977,20 +2014,118 @@ static void dim_show(struct vrx_compositor *c, uint64_t alpha) {
     scene_update(c);
 }
 
-// Light the screen at the set brightness: the backlight, and on a light
-// that cannot dim, the black dim plane over everything.
-static void screen_light(struct vrx_compositor *c) {
-    if (c->dark) return;
-    if (c->dim == DIM_ALPHA) dim_show(c, dim_alpha(c));
-    backlight_set(c, light_level(c));
+// vrx_screen_light's output: what the screen shows now, 0 = dark. A dimmable
+// backlight takes the level of that brightness; a light that cannot dim is
+// on or off, with the dim plane (where there is one) doing the rest.
+static void light_apply(void *ctx, uint16_t shown) {
+    struct vrx_compositor *c = ctx;
+    if (c->dim == DIM_BACKLIGHT) {
+        backlight_set(c, shown ? vrx_light_level(&c->bl_map, shown) : 0);
+        return;
+    }
+    backlight_set(c, shown ? c->bl_max : 0);
+    // dark is the panel going off, not a black plane: the plane keeps its last alpha
+    if (c->dim == DIM_ALPHA && shown) dim_show(c, dim_alpha(shown));
+}
+
+static int light_read_level(void *ctx) {
+    const struct vrx_compositor *c = ctx;
+    return c->dim == DIM_BACKLIGHT ? sysfs_int(c->backlight, "brightness") : c->bl_max;
+}
+
+static int light_read_stored(void *ctx) {
+    (void) ctx;
+    FILE *f = fopen(BRIGHTNESS_FILE, "re");
+    if (!f) return -1;
+    long v = -1;
+    char junk;
+    if (fscanf(f, "%ld%c", &v, &junk) < 1 || v < 0 || v > 1000) v = -1;
+    fclose(f);
+    return (int) v;
+}
+
+// Written to a new file and renamed over, so a power cut leaves the old number or the new one.
+static int light_write_stored(void *ctx, uint16_t permille) {
+    (void) ctx;
+    // /data is mounted before systemd (the pre-init); the directories are ours to make, /data itself is not
+    mkdir("/data/vrx", 0755);
+    mkdir("/data/vrx/display", 0755);
+    char tmp[] = BRIGHTNESS_FILE ".tmp";
+    FILE *f = fopen(tmp, "we");
+    if (!f) {
+        fprintf(stderr, "[vrx-compositor] %s: %s\n", tmp, strerror(errno));
+        return -errno;
+    }
+    fprintf(f, "%u\n", permille);
+    if (fclose(f) != 0 || rename(tmp, BRIGHTNESS_FILE) != 0) {
+        fprintf(stderr, "[vrx-compositor] %s: %s\n", BRIGHTNESS_FILE, strerror(errno));
+        return -errno;
+    }
+    return 0;
+}
+
+static void screen_off_now(struct vrx_compositor *c, const char *why);
+
+// The steps of a fade, while one runs; and what waits for the light to be down.
+static void light_timer(struct vrx_compositor *c) {
+    bool run = c->light.fade.active || c->resume_deadline_ms;
+    struct itimerspec t = {0};
+    if (run) t = (struct itimerspec){ .it_interval = { .tv_nsec = LIGHT_STEP_MS * 1000000L },
+                                      .it_value = { .tv_nsec = LIGHT_STEP_MS * 1000000L } };
+    timerfd_settime(c->light_fd, 0, &t, NULL);
+}
+
+static void sleep_release(struct vrx_compositor *c);
+
+// What was waiting on the light being down, once it is.
+static void light_settled(struct vrx_compositor *c) {
+    if (!vrx_screen_light_is_dark(&c->light)) return;
+    if (c->handoff_wait) {
+        // the splash's light is down: the first frame can go out
+        c->handoff_wait = false;
+        scene_commit(c);
+    }
+    if (c->off_pending) {
+        c->off_pending = false;
+        screen_off_now(c, c->off_why);
+    }
+    if (c->shutdown_dip) {
+        c->shutdown_dip = false;
+        sleep_release(c);
+    }
+}
+
+// Lit or dark over `ms` (0 where this screen cannot fade).
+static void light_go(struct vrx_compositor *c, bool lit, uint32_t ms) {
+    vrx_screen_light_go(&c->light, now_ms(), lit, c->fade_ok ? ms : 0);
+    light_timer(c);
+    if (!c->light.fade.active) light_settled(c);
+}
+
+// Light the screen at the person's brightness (not while it is off or going off).
+static void screen_light(struct vrx_compositor *c, uint32_t ms) {
+    if (c->dark || c->off_pending) return;
+    c->resume_deadline_ms = 0;
+    light_go(c, true, ms);
+}
+
+static void light_tick(struct vrx_compositor *c) {
+    uint64_t expirations;
+    if (read(c->light_fd, &expirations, sizeof expirations) != sizeof expirations) return;
+    uint32_t t = now_ms();
+    vrx_screen_light_tick(&c->light, t);
+    if (c->resume_deadline_ms && (int32_t) (t - c->resume_deadline_ms) >= 0) {
+        // no frame came: the screen is as it was, and lit
+        screen_light(c, VRX_STD_THROUGH_DARK_IN_MS);
+    }
+    light_timer(c);
+    if (!c->light.fade.active) light_settled(c);
 }
 
 // The brightness as a position (0-100) the way the kit's slider reads it,
 // -1 where the screen cannot dim.
 static int screen_position(const struct vrx_compositor *c) {
-    if (c->dim == DIM_BACKLIGHT) return c->bl_max > 0 ? (100 * c->bl_level + c->bl_max / 2) / c->bl_max : -1;
-    if (c->dim == DIM_ALPHA) return c->brightness < 0 ? 100 : c->brightness;
-    return -1;
+    return c->dim == DIM_NONE ? -1 : vrx_screen_light_position(&c->light);
 }
 
 // Tell the controller what the screen is now (vrx plan 0015 D12): its
@@ -2005,6 +2140,7 @@ static void screen_report(struct vrx_compositor *c) {
 }
 
 static int on_prepare_for_sleep(sd_bus_message *m, void *userdata, sd_bus_error *ret_error);
+static int on_prepare_for_shutdown(sd_bus_message *m, void *userdata, sd_bus_error *ret_error);
 static void sleep_delay_take(struct vrx_compositor *c);
 
 static void logind_init(struct vrx_compositor *c) {
@@ -2015,6 +2151,8 @@ static void logind_init(struct vrx_compositor *c) {
     }
     sd_bus_match_signal(c->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
                         "org.freedesktop.login1.Manager", "PrepareForSleep", on_prepare_for_sleep, c);
+    sd_bus_match_signal(c->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                        "org.freedesktop.login1.Manager", "PrepareForShutdown", on_prepare_for_shutdown, c);
     sleep_delay_take(c);
 }
 
@@ -2022,35 +2160,8 @@ static void bus_readable(struct vrx_compositor *c) {
     while (sd_bus_process(c->bus, NULL) > 0) {}
 }
 
-// The backlight changed (an applet with the display grant set a level,
-// through the kit): that is the brightness now. Below the floor it is put
-// back up; while the screen is off it is remembered for the wake.
-static void backlight_changed(struct vrx_compositor *c) {
-    struct udev_device *d;
-    while ((d = udev_monitor_receive_device(c->bl_mon))) udev_device_unref(d);
-    if (c->dim != DIM_BACKLIGHT) return;
-    int level = sysfs_int(c->backlight, "brightness");
-    if (level < 0) return;
-    if (c->dark) {
-        if (level > 0) {
-            c->bl_level = level;
-            backlight_set(c, 0);
-        }
-        return;
-    }
-    if (level == c->bl_level && level >= backlight_floor(c)) return;
-    c->bl_level = level;
-    if (level < backlight_floor(c)) {
-        fprintf(stderr, "[vrx-compositor] backlight %d is below the floor; %d\n", level, backlight_floor(c));
-        backlight_set(c, backlight_floor(c));
-        c->bl_level = backlight_floor(c);
-    }
-    screen_report(c);
-}
-
-// Stopping (shutdown, a restart): the light goes back to its level first,
-// so systemd-backlight saves the person's brightness, not the idle 0.
-// SIGUSR1: write the flip ring (plan 0014 D5) and carry on.
+// SIGUSR1: write the flip ring (plan 0014 D5) and carry on. Anything else stops us;
+// the person's brightness is in its file, so nothing is put back first.
 static void on_stop(struct vrx_compositor *c) {
     struct signalfd_siginfo si;
     if (read(c->sig_fd, &si, sizeof si) != sizeof si) return;
@@ -2058,7 +2169,6 @@ static void on_stop(struct vrx_compositor *c) {
         flip_ring_dump("SIGUSR1");
         return;
     }
-    if (c->dark) backlight_set(c, light_level(c));
     fprintf(stderr, "[vrx-compositor] stopping (signal %u)\n", si.ssi_signo);
     c->running = false;
 }
@@ -2073,11 +2183,21 @@ static void display_tell(struct vrx_compositor *c, int only) {
     }
 }
 
-// Light first, then the panel: the CRTC's ACTIVE property goes to 0 in a
-// commit that waits, so a commit still in flight finishes inside it (its
-// event is read as usual), and nothing is committed until the screen is
-// back (plan 0010 D5, plan 0017 D9).
+// Light first, then the panel (plan 0033 D1): the light fades down, and
+// when it is down the CRTC's ACTIVE property goes to 0 in a commit that
+// waits, so a commit still in flight finishes inside it (its event is read
+// as usual), and nothing is committed until the screen is back (plan 0010
+// D5, plan 0017 D9). A request while the light is coming down changes
+// nothing; display_on cancels it.
 static void display_off(struct vrx_compositor *c, const char *why) {
+    if (c->dark) return;
+    snprintf(c->off_why, sizeof c->off_why, "%s", why);
+    if (c->off_pending) return;
+    c->off_pending = true;
+    light_go(c, false, VRX_STD_THROUGH_DARK_OUT_MS);
+}
+
+static void screen_off_now(struct vrx_compositor *c, const char *why) {
     if (c->dark) return;
     c->dark = true;
     c->light_after_flip = false;
@@ -2085,7 +2205,6 @@ static void display_off(struct vrx_compositor *c, const char *why) {
     // the sequence counter is not meaningful across an off CRTC: the next
     // flip starts the record again instead of counting the dark as drops
     c->last_flip_ns = 0;
-    backlight_set(c, 0);
     if (c->active_prop && c->mode_set) {
         drmModeAtomicReq *req = drmModeAtomicAlloc();
         if (req) {
@@ -2104,6 +2223,12 @@ static void display_off(struct vrx_compositor *c, const char *why) {
 // The panel and the newest scene in one commit, then the light once that
 // commit is up, so the first thing seen is the current screen.
 static void display_on(struct vrx_compositor *c, const char *why) {
+    if (c->off_pending) {
+        // asked on again while the light was coming down: it goes back up, the screen never went off
+        c->off_pending = false;
+        light_go(c, true, VRX_STD_THROUGH_DARK_IN_MS);
+        return;
+    }
     if (!c->dark) return;
     c->dark = false;
     display_tell(c, -1);
@@ -2115,7 +2240,7 @@ static void display_on(struct vrx_compositor *c, const char *why) {
     }
     if (!c->commit_pending) {
         c->light_after_flip = false;
-        screen_light(c);
+        screen_light(c, VRX_STD_THROUGH_DARK_IN_MS);
     }
     fprintf(stderr, "[vrx-compositor] screen on (%s)\n", why);
     screen_report(c);
@@ -2186,34 +2311,6 @@ static bool conf_value(const char *path, const char *key, char *out, size_t cap)
     }
     fclose(f);
     return found;
-}
-
-// A whole number, or `fallback` for anything else (garbage is logged).
-static int conf_int(const char *key, int fallback) {
-    char v[32];
-    if (!conf_value(SCREEN_FILE, key, v, sizeof v)) return fallback;
-    char *end;
-    long n = strtol(v, &end, 10);
-    if (end == v || *end) {
-        fprintf(stderr, "[vrx-compositor] %s: %s=%s is not a number; using %d\n", SCREEN_FILE, key, v, fallback);
-        return fallback;
-    }
-    return n < 0 ? 0 : n > 86400 ? 86400 : (int) n;
-}
-
-static void screen_read_conf(struct vrx_compositor *c) {
-    // a dimmable backlight keeps its own level (sysfs, systemd-backlight);
-    // the file's brightness is only for a screen dimmed by plane alpha
-    int brightness = c->dim == DIM_BACKLIGHT ? 100 : conf_int("brightness", 100);
-    if (brightness > 100) brightness = 100;
-    if (brightness != c->brightness) {
-        if (c->dim != DIM_BACKLIGHT) {
-            fprintf(stderr, "[vrx-compositor] brightness %d%s\n", brightness, c->dim == DIM_NONE ? " (this screen cannot dim)" : "");
-        }
-        c->brightness = brightness;
-        screen_light(c);
-        screen_report(c);
-    }
 }
 
 // What this screen can do, for the kit: whether a brightness slider means
@@ -2317,16 +2414,45 @@ static void dim_init(struct vrx_compositor *c) {
             c->shell_plane);
 }
 
+static void light_open(struct vrx_compositor *c) {
+    // the backlight's levels against perceived brightness: read from the board (libvrx-light)
+    bool mapped = false;
+    if (c->dim == DIM_BACKLIGHT) {
+        mapped = vrx_light_open(&c->bl_map, c->backlight) == 0;
+        if (!mapped) {
+            fprintf(stderr, "[vrx-compositor] %s: levels unreadable, taken as linear\n", c->backlight);
+            mapped = vrx_light_init_scale(&c->bl_map, VRX_LIGHT_SCALE_LINEAR, c->bl_max) == 0;
+        }
+    } else if (c->bl_max > 0) {
+        // a light that is on or off: on is full, which is what a first start stores
+        mapped = vrx_light_init_scale(&c->bl_map, VRX_LIGHT_SCALE_LINEAR, c->bl_max) == 0;
+    }
+    struct vrx_screen_light_ops ops = { .read_level = light_read_level, .read_stored = light_read_stored,
+                                        .write_stored = light_write_stored, .apply = light_apply, .ctx = c };
+    vrx_screen_light_open(&c->light, &ops, mapped ? &c->bl_map : NULL, VRX_STD_LIGHT_FLOOR_PERMILLE);
+    // a screen fades where it can dim: a backlight always; a dim plane in frames, on the full tier only
+    char tier[16] = "";
+    FILE *f = fopen(MOTION_TIER_FILE, "re");
+    if (f) {
+        if (fscanf(f, "%15s", tier) != 1) tier[0] = 0;
+        fclose(f);
+    }
+    c->fade_ok = c->dim == DIM_BACKLIGHT || (c->dim == DIM_ALPHA && strcmp(tier, "full") == 0);
+    fprintf(stderr, "[vrx-compositor] light: %u/1000 stored, shown %u, floor %u, fades %s\n", c->light.stored,
+            c->light.shown, c->light.floor, c->fade_ok ? "yes" : "no (a cut)");
+}
+
 static void screen_init(struct vrx_compositor *c) {
     c->sleep_ack_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    c->light_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     c->sleep_inhibit_fd = -1;
-    c->light_cap = 1000;
+    c->bl_level = -1;
     DIR *d = opendir("/sys/class/backlight");
     if (d) {
         struct dirent *e;
         while ((e = readdir(d))) {
             if (e->d_name[0] == '.') continue;
-            snprintf(c->backlight, sizeof c->backlight, "/sys/class/backlight/%s", e->d_name);
+            snprintf(c->backlight, sizeof c->backlight, "/sys/class/backlight/%.64s", e->d_name);
             break;
         }
         closedir(d);
@@ -2337,44 +2463,32 @@ static void screen_init(struct vrx_compositor *c) {
     // commit, whatever an earlier compositor left in their alpha properties)
     if (c->bl_max <= 1) dim_init(c);
     c->dim = c->bl_max > 1 ? DIM_BACKLIGHT : c->dim_fb ? DIM_ALPHA : DIM_NONE;
-    // the level systemd-backlight restored at boot is the brightness
-    c->bl_level = c->backlight[0] ? sysfs_int(c->backlight, "brightness") : 0;
-    if (c->dim == DIM_BACKLIGHT) {
-        struct udev *udev = udev_new();
-        c->bl_mon = udev ? udev_monitor_new_from_netlink(udev, "udev") : NULL;
-        if (c->bl_mon) {
-            udev_monitor_filter_add_match_subsystem_devtype(c->bl_mon, "backlight", NULL);
-            udev_monitor_enable_receiving(c->bl_mon);
-        }
-    }
     fprintf(stderr, "[vrx-compositor] screen: light %s (max %d), DPMS %s, dims by %s\n",
             c->backlight[0] ? c->backlight : "none", c->bl_max, c->active_prop ? "yes" : "no",
             c->dim == DIM_BACKLIGHT ? "the backlight" : c->dim == DIM_ALPHA ? "a black plane over the screen" : "nothing");
     screen_facts(c);
-    // the directory, not the file: a writer renames a new file over it
-    c->conf_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
-    if (c->conf_fd >= 0 && inotify_add_watch(c->conf_fd, SCREEN_DIR, IN_CLOSE_WRITE | IN_MOVED_TO) < 0) {
-        fprintf(stderr, "[vrx-compositor] watch %s: %s\n", SCREEN_DIR, strerror(errno));
-    }
-    c->brightness = -1;  // logged and applied on the first read
-    screen_read_conf(c);
+    light_open(c);
 }
 
-static void screen_conf_changed(struct vrx_compositor *c) {
-    char buf[4096];
-    while (read(c->conf_fd, buf, sizeof buf) > 0) {}
-    screen_read_conf(c);
+// The handoff (plan 0033 D5): the splash's light comes down before the
+// first frame replaces its picture, and goes up after. A screen with no
+// dimmable light has no splash picture to hide and skips it.
+static void light_handoff_begin(struct vrx_compositor *c) {
+    if (c->dim != DIM_BACKLIGHT) return;
+    c->handoff_wait = true;
+    light_go(c, false, VRX_STD_THROUGH_DARK_OUT_MS);
 }
 
-// Before sleep: a logind delay inhibitor, so applets get PrepareForSleep
-// as lifecycle (paused) and up to a second to save; released then.
+// Before sleep or shutdown: a logind delay inhibitor, so applets get
+// PrepareForSleep as lifecycle (paused) and up to a second to save, and the
+// light is down before the request goes through (plan 0033 D1); released then.
 static void sleep_delay_take(struct vrx_compositor *c) {
     if (!c->bus || c->sleep_inhibit_fd >= 0) return;
     sd_bus_message *reply = NULL;
     sd_bus_error err = SD_BUS_ERROR_NULL;
     int r = sd_bus_call_method(c->bus, "org.freedesktop.login1", "/org/freedesktop/login1",
-                               "org.freedesktop.login1.Manager", "Inhibit", &err, &reply, "ssss", "sleep",
-                               "vrx-compositor", "applets save before the system sleeps", "delay");
+                               "org.freedesktop.login1.Manager", "Inhibit", &err, &reply, "ssss", "sleep:shutdown",
+                               "vrx-compositor", "applets save and the light goes down before the system sleeps or stops", "delay");
     int fd = -1;
     if (r >= 0 && sd_bus_message_read(reply, "h", &fd) >= 0) {
         c->sleep_inhibit_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
@@ -2405,21 +2519,53 @@ static int on_prepare_for_sleep(sd_bus_message *m, void *userdata, sd_bus_error 
         fprintf(stderr, "[vrx-compositor] the system is going to sleep: applets told\n");
         struct itimerspec t = { .it_value = { .tv_sec = 1 } };
         if (c->sleep_ack_fd >= 0) timerfd_settime(c->sleep_ack_fd, 0, &t, NULL);
+        // the light is down well inside that second
+        light_go(c, false, VRX_STD_THROUGH_DARK_OUT_MS);
     } else {
         fprintf(stderr, "[vrx-compositor] the system woke\n");
         sleep_delay_take(c);
+        if (!c->dark && !c->off_pending) {
+            // resume: the light comes up on the first frame after it, or when none comes
+            c->light_after_flip = true;
+            c->resume_deadline_ms = now_ms() + RESUME_WAIT_MS;
+            light_timer(c);
+        }
     }
     return 0;
+}
+
+// The system is going down (start) or the shutdown was called off. The light is down before logind
+// goes on, and our delay is released the moment it is, not a second later.
+static int on_prepare_for_shutdown(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
+    (void) ret_error;
+    struct vrx_compositor *c = userdata;
+    int start = 0;
+    if (sd_bus_message_read(m, "b", &start) < 0) return 0;
+    if (start) {
+        fprintf(stderr, "[vrx-compositor] the system is going down: the light goes first\n");
+        c->shutdown_dip = true;
+        light_go(c, false, VRX_STD_THROUGH_DARK_OUT_MS);
+    } else {
+        fprintf(stderr, "[vrx-compositor] the shutdown was called off\n");
+        c->shutdown_dip = false;
+        sleep_delay_take(c);
+        screen_light(c, VRX_STD_THROUGH_DARK_IN_MS);
+    }
+    return 0;
+}
+
+static void sleep_release(struct vrx_compositor *c) {
+    if (c->sleep_inhibit_fd >= 0) {
+        close(c->sleep_inhibit_fd);
+        c->sleep_inhibit_fd = -1;
+    }
 }
 
 // A second after PrepareForSleep(true): let the sleep go ahead.
 static void sleep_ack_fire(struct vrx_compositor *c) {
     uint64_t expirations;
     if (read(c->sleep_ack_fd, &expirations, sizeof expirations) != sizeof expirations) return;
-    if (c->sleep_inhibit_fd >= 0) {
-        close(c->sleep_inhibit_fd);
-        c->sleep_inhibit_fd = -1;
-    }
+    sleep_release(c);
 }
 
 static void send_input(struct vrx_compositor *c, const struct vrx_msg_input *m) {
@@ -2614,9 +2760,8 @@ static void li_dispatch(struct vrx_compositor *c) {
 #define TAG_LIBINPUT  0xFFFFFFFFFFFFFFFDull
 #define TAG_DRM       0xFFFFFFFFFFFFFFFCull
 #define TAG_REPEAT    0xFFFFFFFFFFFFFFFBull
-#define TAG_CONF      0xFFFFFFFFFFFFFFF9ull
+#define TAG_LIGHT     0xFFFFFFFFFFFFFFF9ull
 #define TAG_BUS       0xFFFFFFFFFFFFFFF8ull
-#define TAG_BACKLIGHT 0xFFFFFFFFFFFFFFF7ull
 #define TAG_SIGNAL    0xFFFFFFFFFFFFFFF6ull
 #define TAG_SLEEPACK  0xFFFFFFFFFFFFFFF4ull
 #define CLIENT_TAG(slot, fd) (((uint64_t) (uint32_t) (fd) << 32) | (uint32_t) (slot))
@@ -2706,9 +2851,9 @@ int vrx_compositor_main(int argc, char **argv) {
     c.active_prop = prop_id(c.drm_fd, c.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
     screen_init(&c);
     scene_init(&c);
-    if (c.conf_fd >= 0) {
-        ev.data.u64 = TAG_CONF;
-        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.conf_fd, &ev);
+    if (c.light_fd >= 0) {
+        ev.data.u64 = TAG_LIGHT;
+        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, c.light_fd, &ev);
     }
     if (c.sleep_ack_fd >= 0) {
         ev.data.u64 = TAG_SLEEPACK;
@@ -2723,10 +2868,6 @@ int vrx_compositor_main(int argc, char **argv) {
     // fd readable: read them now, or nothing counts as a wake device until
     // the first input arrives
     if (c.li) li_dispatch(&c);
-    if (c.bl_mon) {
-        ev.data.u64 = TAG_BACKLIGHT;
-        epoll_ctl(c.epoll_fd, EPOLL_CTL_ADD, udev_monitor_get_fd(c.bl_mon), &ev);
-    }
     sigset_t stop;
     sigemptyset(&stop);
     sigaddset(&stop, SIGTERM);
@@ -2743,6 +2884,7 @@ int vrx_compositor_main(int argc, char **argv) {
     cursor_init(&c);
 
     c.running = true;
+    light_handoff_begin(&c);
 
     fprintf(stderr, "[vrx-compositor] running (socket %s)\n", VRX_UI_SOCKET);
     while (c.running) {
@@ -2765,12 +2907,10 @@ int vrx_compositor_main(int argc, char **argv) {
                 drm_readable(&c);
             } else if (tag == TAG_REPEAT) {
                 repeat_fire(&c);
-            } else if (tag == TAG_CONF) {
-                screen_conf_changed(&c);
+            } else if (tag == TAG_LIGHT) {
+                light_tick(&c);
             } else if (tag == TAG_BUS) {
                 bus_readable(&c);
-            } else if (tag == TAG_BACKLIGHT) {
-                backlight_changed(&c);
             } else if (tag == TAG_SIGNAL) {
                 on_stop(&c);
             } else if (tag == TAG_SLEEPACK) {

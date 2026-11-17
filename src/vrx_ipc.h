@@ -124,7 +124,8 @@ enum vrx_msg_type {
     // through Matter (vrx plans 0015 D12, 0023 D1). The compositor keeps
     // no idle timer of its own; it executes.
     // comp -> vrxhost: the screen went on or off, or its brightness moved
-    // (position 0-100, -1 where it cannot dim); sent on CONTROL too.
+    // (position 0-100 over [the standard's lit floor, full], -1 where it
+    // cannot dim); sent on CONTROL too.
     VRX_MSG_SCREEN = 24,
     // vrxhost -> comp -> the shell: the power-off countdown (vrx-linux's
     // poweroff.rs). A person's power off (the power key held, the drawer's
@@ -137,6 +138,12 @@ enum vrx_msg_type {
     // shell -> comp -> vrxhost: the dialog's answer, 0 Cancel (the board
     // stays on), 1 Power off now.
     VRX_MSG_POWER_OFF_ANSWER = 26,
+    // app -> comp: set the person's brightness (vrx plan 0033 D4), per mille,
+    // perceived, 0-1000. Only an app with the display grant (group
+    // vrx-display: Settings, the shell) is heard; the compositor is the one
+    // writer of the light and of the stored number. Held to the standard's
+    // floor when lit. Ignored where the screen cannot dim.
+    VRX_MSG_BRIGHTNESS = 27,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -218,6 +225,10 @@ struct vrx_msg_display {
 
 struct vrx_msg_light_cap {
     uint32_t permille;  // 0-1000 of the range above the floor; 1000 = none
+};
+
+struct vrx_msg_brightness {
+    uint32_t permille;  // 0-1000, perceived (CIE 1931 lightness x 10)
 };
 
 struct vrx_msg_sleep {

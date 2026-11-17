@@ -64,3 +64,19 @@ target_link_libraries(
 )
 
 add_test(vrx_ipc_power_off_wire_test vrx_ipc_power_off_wire_test)
+
+# the light's sequence (plan 0033): the stored brightness, the migration, the fade, retargeting; a fake device and clock
+add_executable(vrx_screen_light_test
+    vrx_screen_light_test.c
+    ../src/vrx_screen_light.c
+)
+
+target_include_directories(vrx_screen_light_test PRIVATE ../src)
+
+target_link_libraries(
+    vrx_screen_light_test
+    Unity
+    ${VRX_LIGHT_TARGET}
+)
+
+add_test(vrx_screen_light_test vrx_screen_light_test)
