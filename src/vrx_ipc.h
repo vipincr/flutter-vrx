@@ -126,6 +126,17 @@ enum vrx_msg_type {
     // comp -> vrxhost: the screen went on or off, or its brightness moved
     // (position 0-100, -1 where it cannot dim); sent on CONTROL too.
     VRX_MSG_SCREEN = 24,
+    // vrxhost -> comp -> the shell: the power-off countdown (vrx-linux's
+    // poweroff.rs). A person's power off (the power key held, the drawer's
+    // button) counts down before it happens; the shell shows the design
+    // system's dialog "Shutting down in N" with Cancel and Power off now.
+    // secs_left >= 0 opens it or updates the number, -1 closes it. The
+    // compositor keeps the last one and sends it again when the shell
+    // (re)appears.
+    VRX_MSG_POWER_OFF = 25,
+    // shell -> comp -> vrxhost: the dialog's answer, 0 Cancel (the board
+    // stays on), 1 Power off now.
+    VRX_MSG_POWER_OFF_ANSWER = 26,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -224,6 +235,14 @@ struct vrx_msg_semantics {
 struct vrx_msg_screen {
     uint32_t on;       // 0/1
     int32_t position;  // comp -> vrxhost only: 0-100, -1 = cannot dim
+};
+
+struct vrx_msg_power_off {
+    int32_t secs_left;  // >= 0 the countdown's whole seconds left, -1 over
+};
+
+struct vrx_msg_power_off_answer {
+    uint32_t now;  // 0 Cancel, 1 Power off now
 };
 
 struct vrx_msg_semantics_tree {

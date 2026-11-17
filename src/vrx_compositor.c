@@ -203,6 +203,7 @@ struct vrx_compositor {
     bool dark;                 // the screen is off
     struct vrx_msg_screen reported_screen;  // the last VRX_MSG_SCREEN sent
     bool reported_screen_valid;
+    int32_t power_off_left;    // vrxhost's last power-off countdown word, -1 = none
     bool light_after_flip;     // waking: light once the newest frame is up
     // the system bus: PrepareForSleep, so apps hear the system sleep
     sd_bus *bus;
@@ -1366,6 +1367,10 @@ static void apply_want_shell(struct vrx_compositor *c) {
                 (int) c->apps[slot].pid, c->shell_plane);
     }
     send_insets(c, -1);
+    if (slot >= 0 && c->power_off_left >= 0) {
+        struct vrx_msg_power_off m = { .secs_left = c->power_off_left };
+        client_send(c, c->apps[slot].fd, VRX_MSG_POWER_OFF, &m, sizeof m, -1);
+    }
 }
 
 static void focus_slot(struct vrx_compositor *c, int slot) {
@@ -1462,8 +1467,10 @@ static void client_handle(struct vrx_compositor *c, int slot,
                    h->type == VRX_MSG_SEMANTICS_TREE;
     if ((app_msg && !a->registered) ||
         ((h->type == VRX_MSG_SET_FOCUS || h->type == VRX_MSG_SET_SHELL || h->type == VRX_MSG_LIGHT_CAP ||
-          h->type == VRX_MSG_PROFILING || h->type == VRX_MSG_SEMANTICS || h->type == VRX_MSG_SCREEN) &&
+          h->type == VRX_MSG_PROFILING || h->type == VRX_MSG_SEMANTICS || h->type == VRX_MSG_SCREEN ||
+          h->type == VRX_MSG_POWER_OFF) &&
          !a->controller) ||
+        (h->type == VRX_MSG_POWER_OFF_ANSWER && slot != c->shell) ||
         (h->type == VRX_MSG_SHELL_REGION && !a->registered) ||
         (h->type == VRX_MSG_BACK && slot != c->shell) ||
         ((h->type == VRX_MSG_REGISTER || h->type == VRX_MSG_CONTROL) &&
@@ -1524,6 +1531,26 @@ static void client_handle(struct vrx_compositor *c, int slot,
             }
             // the answer either way: what the screen is now
             screen_report(c);
+            break;
+        }
+        case VRX_MSG_POWER_OFF: {
+            struct vrx_msg_power_off *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            // vrxhost's countdown: the shell shows it (the dialog is the
+            // design system's, drawn by the shell's UI), and a shell that
+            // comes later is told what is still running
+            c->power_off_left = m->secs_left < 0 ? -1 : m->secs_left;
+            if (c->shell >= 0) {
+                client_send(c, c->apps[c->shell].fd, VRX_MSG_POWER_OFF, m, sizeof *m, -1);
+            }
+            break;
+        }
+        case VRX_MSG_POWER_OFF_ANSWER: {
+            struct vrx_msg_power_off_answer *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            if (c->controller >= 0) {
+                client_send(c, c->apps[c->controller].fd, VRX_MSG_POWER_OFF_ANSWER, m, sizeof *m, -1);
+            }
             break;
         }
         case VRX_MSG_SET_FOCUS: {
@@ -2634,6 +2661,7 @@ int vrx_compositor_main(int argc, char **argv) {
     c.marker_fd = -1;
     c.focused = -1;
     c.controller = -1;
+    c.power_off_left = -1;
     c.shell = -1;
     c.pointer_owner = -1;
     for (int i = 0; i < 16; i++) c.touch_owner[i] = -1;

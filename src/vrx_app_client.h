@@ -27,6 +27,8 @@ struct vrx_app_client_callbacks {
     void (*on_vblank)(uint64_t flip_ns, uint64_t period_ns, void *userdata);
     // build the semantics tree or stop (plan 0014 D8)
     void (*on_semantics)(uint32_t on, void *userdata);
+    // the power-off countdown (shell only): seconds left, -1 over
+    void (*on_power_off)(int32_t secs_left, void *userdata);
     void *userdata;
 };
 

@@ -2077,6 +2077,15 @@ static void vrx_on_back(void *userdata) {
     platch_call_json("vrx/chrome", "back", &(struct json_value){ .type = kJsonNull }, NULL, NULL);
 }
 
+// vrxhost's power-off countdown, for the shell (vrx_ipc.h VRX_MSG_POWER_OFF):
+// the shell's Dart draws the dialog. Before the engine runs there is no one
+// to tell; the compositor sends the countdown again if it is still running.
+static void vrx_on_power_off(int32_t secs_left, void *userdata) {
+    (void) userdata;
+    if (flutterpi == NULL || flutterpi->flutter.engine == NULL) return;
+    platch_call_json("vrx/chrome", "powerOff", &JSONOBJECT1("secsLeft", JSONNUM(secs_left)), NULL, NULL);
+}
+
 // The screen went off or came back (plan 0010 D4).
 static void vrx_on_display(uint32_t on, void *userdata) {
     (void) userdata;
@@ -2427,7 +2436,7 @@ static void vrx_engine_started(struct flutterpi *fpi) {
 }
 
 // vrx/shell: getInsets and setChrome {hidden} for every app; setRegion
-// {top, full} and back from the shell.
+// {top, full}, back and powerOffAnswer {now} from the shell.
 static int on_vrx_shell_channel(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *handle) {
     (void) channel;
     if (strcmp(object->method, "getInsets") == 0) {
@@ -2446,6 +2455,12 @@ static int on_vrx_shell_channel(char *channel, struct platch_obj *object, Flutte
     }
     if (strcmp(object->method, "back") == 0) {
         vrx_app_client_send(vrx_app.client, VRX_MSG_BACK, NULL, 0, -1);
+        return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
+    }
+    if (strcmp(object->method, "powerOffAnswer") == 0) {
+        struct json_value *now = jsobject_get(&object->json_arg, "now");
+        struct vrx_msg_power_off_answer m = { .now = now && JSONVALUE_IS_BOOL(*now) && JSONVALUE_AS_BOOL(*now) };
+        vrx_app_client_send(vrx_app.client, VRX_MSG_POWER_OFF_ANSWER, &m, sizeof m, -1);
         return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
     }
     if (strcmp(object->method, "setChrome") == 0) {
@@ -2471,6 +2486,7 @@ static int on_vrx_ipc_ready(sd_event_source *s, int fd, uint32_t revents, void *
         .on_sleep = vrx_on_sleep,
         .on_vblank = vrx_on_vblank,
         .on_semantics = vrx_on_semantics,
+        .on_power_off = vrx_on_power_off,
     };
     if ((revents & (EPOLLHUP | EPOLLERR)) || !vrx_app_client_dispatch(vrx_app.client, &cbs)) {
         // the compositor went away or told us to stop: an app has nothing to

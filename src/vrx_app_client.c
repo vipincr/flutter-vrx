@@ -262,6 +262,11 @@ bool vrx_app_client_dispatch(struct vrx_app_client *c,
                 cb->on_semantics(((struct vrx_msg_semantics *) p)->on, cb->userdata);
             }
             break;
+        case VRX_MSG_POWER_OFF:
+            if (h.length >= sizeof(struct vrx_msg_power_off) && cb && cb->on_power_off) {
+                cb->on_power_off(((struct vrx_msg_power_off *) p)->secs_left, cb->userdata);
+            }
+            break;
         case VRX_MSG_SHUTDOWN:
             alive = false;
             break;

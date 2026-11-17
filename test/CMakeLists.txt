@@ -50,3 +50,17 @@ target_link_libraries(
 )
 
 add_test(vrx_vt_test vrx_vt_test)
+
+# the power-off countdown's wire: numbers and sizes vrxhost encodes
+add_executable(vrx_ipc_power_off_wire_test
+    vrx_ipc_power_off_wire_test.c
+)
+
+target_include_directories(vrx_ipc_power_off_wire_test PRIVATE ../src)
+
+target_link_libraries(
+    vrx_ipc_power_off_wire_test
+    Unity
+)
+
+add_test(vrx_ipc_power_off_wire_test vrx_ipc_power_off_wire_test)
