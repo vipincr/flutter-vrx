@@ -59,6 +59,7 @@
 
 #include "vrx_ipc.h"
 #include "vrx_kms.h"
+#include "vrx_vt.h"
 
 // ─── app client ───────────────────────────────────────────────────────────
 
@@ -2623,9 +2624,11 @@ static void accept_client(struct vrx_compositor *c) {
 
 int vrx_compositor_main(int argc, char **argv) {
     const char *device = NULL;
+    const char *vt_path = VRX_VT_DEFAULT;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--compositor")) continue;
         if (i + 1 < argc && !strcmp(argv[i], "--device")) device = argv[++i];
+        if (i + 1 < argc && !strcmp(argv[i], "--vt")) vt_path = argv[++i];
     }
     struct vrx_compositor c = {0};
     c.marker_fd = -1;
@@ -2643,8 +2646,17 @@ int vrx_compositor_main(int argc, char **argv) {
     }
     for (int i = 0; i < MAX_APPS; i++) c.apps[i].fd = -1;
     if (kms_init(&c, device) != 0) return 1;
+    // GUI first (plan 0028 D2): the panel's VT draws no console and reads no
+    // key while the compositor runs; a board with no VT has none to hold
+    struct vrx_vt vt = { .fd = -1 };
+    if (vrx_vt_hold(&vt, vt_path) != 0) {
+        fprintf(stderr, "[vrx-compositor] no VT held (%s): %s\n", vt_path, strerror(errno));
+    }
     c.shell_plane = plane_probe(&c, false);
-    if (sock_init(&c) != 0) return 1;
+    if (sock_init(&c) != 0) {
+        vrx_vt_release(&vt);
+        return 1;
+    }
     if (li_init(&c) != 0) {
         fprintf(stderr, "[vrx-compositor] libinput init failed; continuing without input\n");
     }
@@ -2745,5 +2757,6 @@ int vrx_compositor_main(int argc, char **argv) {
             }
         }
     }
+    vrx_vt_release(&vt);
     return 0;
 }

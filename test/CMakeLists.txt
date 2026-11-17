@@ -35,3 +35,18 @@ target_link_libraries(
 )
 
 add_test(vrx_camera_wire_test vrx_camera_wire_test)
+
+# the compositor's VT hold (plan 0028 D2): a fake ioctl, no VT needed
+add_executable(vrx_vt_test
+    vrx_vt_test.c
+    ../src/vrx_vt.c
+)
+
+target_include_directories(vrx_vt_test PRIVATE ../src)
+
+target_link_libraries(
+    vrx_vt_test
+    Unity
+)
+
+add_test(vrx_vt_test vrx_vt_test)
