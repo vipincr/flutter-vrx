@@ -80,3 +80,26 @@ target_link_libraries(
 )
 
 add_test(vrx_screen_light_test vrx_screen_light_test)
+
+# vrx-linux, which owns the screen's words (vectors/screen-wire.json) and the UI standard the light's header is generated from
+set(VRX_LINUX_DIR "${CMAKE_SOURCE_DIR}/../vrx/yocto/layers/vrx/vrx-linux" CACHE PATH "vrx-linux, the owner of the vectors and of the vendored UI standard")
+
+add_executable(vrx_ipc_screen_wire_test
+    vrx_ipc_screen_wire_test.c
+)
+
+target_include_directories(vrx_ipc_screen_wire_test PRIVATE ../src)
+
+target_link_libraries(
+    vrx_ipc_screen_wire_test
+    Unity
+)
+
+add_test(NAME vrx_ipc_screen_wire_test COMMAND vrx_ipc_screen_wire_test "${VRX_LINUX_DIR}/vectors/screen-wire.json")
+
+# src/vrx_light_standard.h is generated from vrx-linux's vendored standard: a re-vendor that leaves it stale fails here
+# (and in the pre-push hook). A missing standard fails too.
+find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+add_test(NAME vrx_light_standard_header
+    COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/ui-standard-light.py"
+            "${VRX_LINUX_DIR}/flutter/vrx_kit/standard/vrx-ui-standard.toml" --check)

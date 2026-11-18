@@ -246,19 +246,6 @@ void test_a_cap_over_a_fade_in_is_the_same_fade(void) {
     TEST_ASSERT_EQUAL(FLOOR, last_shown());
 }
 
-void test_position_covers_the_floor_to_full_range(void) {
-    vrx_screen_light_open(&sl, &ops, NULL, FLOOR);
-    TEST_ASSERT_EQUAL(FLOOR, vrx_screen_light_from_position(&sl, 0));
-    TEST_ASSERT_EQUAL(1000, vrx_screen_light_from_position(&sl, 100));
-    TEST_ASSERT_EQUAL(1000, vrx_screen_light_from_position(&sl, 400));
-    for (int p = 0; p <= 100; p++) {
-        sl.stored = vrx_screen_light_from_position(&sl, p);
-        TEST_ASSERT_EQUAL(p, vrx_screen_light_position(&sl));
-    }
-    sl.stored = 0;
-    TEST_ASSERT_EQUAL(0, vrx_screen_light_position(&sl));
-}
-
 // --- the display grant ----------------------------------------------------------------------------------------
 
 void test_the_grant_is_read_from_the_groups_line(void) {
@@ -291,7 +278,6 @@ int main(void) {
     RUN_TEST(test_a_lit_screen_never_goes_under_the_floor);
     RUN_TEST(test_the_cap_is_a_share_of_the_range_above_the_floor);
     RUN_TEST(test_a_cap_over_a_fade_in_is_the_same_fade);
-    RUN_TEST(test_position_covers_the_floor_to_full_range);
     RUN_TEST(test_the_grant_is_read_from_the_groups_line);
     return UNITY_END();
 }

@@ -3,4 +3,8 @@
 # `Design-system:` trailer. The check is evrx-rt's; a missing evrx-rt fails the push. `git push --no-verify` skips it.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/design-trailer-locate"
-exec "$EVRX_RT/scripts/githooks/design-trailer" push
+# src/vrx_light_standard.h is generated from vrx-linux's vendored UI standard: a push with a stale one fails (VRX_LINUX_DIR
+# in the environment names another checkout of vrx-linux; a missing standard fails, it never passes)
+VRX_LINUX_DIR="${VRX_LINUX_DIR:-$REPO_ROOT/../vrx/yocto/layers/vrx/vrx-linux}"
+python3 "$REPO_ROOT/scripts/ui-standard-light.py" "$VRX_LINUX_DIR/flutter/vrx_kit/standard/vrx-ui-standard.toml" --check
+"$EVRX_RT/scripts/githooks/design-trailer" push

@@ -217,6 +217,7 @@ struct vrx_compositor {
     struct vrx_msg_screen reported_screen;  // the last VRX_MSG_SCREEN sent
     bool reported_screen_valid;
     int32_t power_off_left;    // vrxhost's last power-off countdown word, -1 = none
+    int power_off_dark;        // 0, or the countdown ran out: 1 = answer vrxhost when the light is down, 2 = answered (the light returns if vrxhost says the count is over)
     bool light_after_flip;     // waking: light once the newest frame is up
     // the system bus: PrepareForSleep, so apps hear the system sleep
     sd_bus *bus;
@@ -625,6 +626,7 @@ static bool frame_import(struct vrx_compositor *c, struct frame *f,
 }
 
 static void screen_light(struct vrx_compositor *c, uint32_t ms);
+static void light_go(struct vrx_compositor *c, bool lit, uint32_t ms);
 static void light_timer(struct vrx_compositor *c);
 static uint64_t dim_alpha(uint16_t shown);
 static void screen_report(struct vrx_compositor *c);
@@ -946,7 +948,8 @@ static void semantics_set(struct vrx_compositor *c, bool on) {
             struct dirent *e;
             while ((e = readdir(d))) {
                 if (e->d_name[0] == '.') continue;
-                char path[256];
+                // the directory, a slash and the longest d_name (255) and its NUL: no name is ever cut into another's path
+                char path[sizeof SEMANTICS_DIR + 1 + 256];
                 snprintf(path, sizeof path, SEMANTICS_DIR "/%s", e->d_name);
                 unlink(path);
             }
@@ -1572,7 +1575,18 @@ static void client_handle(struct vrx_compositor *c, int slot,
             // vrxhost's countdown: the shell shows it (the dialog is the
             // design system's, drawn by the shell's UI), and a shell that
             // comes later is told what is still running
-            c->power_off_left = m->secs_left < 0 ? -1 : m->secs_left;
+            if (m->secs_left == VRX_POWER_OFF_DARKEN) {
+                // through dark (plan 0033 D1): the light comes down, and vrxhost is told when it is
+                c->power_off_dark = 1;
+                light_go(c, false, VRX_STD_THROUGH_DARK_OUT_MS);
+                break;
+            }
+            if (c->power_off_dark) {
+                // vrxhost did not power off (logind refused): the light comes back
+                c->power_off_dark = 0;
+                screen_light(c, VRX_STD_THROUGH_DARK_IN_MS);
+            }
+            c->power_off_left = m->secs_left < 0 ? VRX_POWER_OFF_CLOSED : m->secs_left;
             if (c->shell >= 0) {
                 client_send(c, c->apps[c->shell].fd, VRX_MSG_POWER_OFF, m, sizeof *m, -1);
             }
@@ -2085,6 +2099,12 @@ static void light_settled(struct vrx_compositor *c) {
         c->handoff_wait = false;
         scene_commit(c);
     }
+    if (c->power_off_dark == 1 && c->controller >= 0) {
+        c->power_off_dark = 2;
+        // the light is down for vrxhost's power off: the answer it waits for (the one Power off now gives)
+        struct vrx_msg_power_off_answer m = { .now = 1 };
+        client_send(c, c->apps[c->controller].fd, VRX_MSG_POWER_OFF_ANSWER, &m, sizeof m, -1);
+    }
     if (c->off_pending) {
         c->off_pending = false;
         screen_off_now(c, c->off_why);
@@ -2122,18 +2142,18 @@ static void light_tick(struct vrx_compositor *c) {
     if (!c->light.fade.active) light_settled(c);
 }
 
-// The brightness as a position (0-100) the way the kit's slider reads it,
-// -1 where the screen cannot dim.
-static int screen_position(const struct vrx_compositor *c) {
-    return c->dim == DIM_NONE ? -1 : vrx_screen_light_position(&c->light);
+// The person's brightness, per mille and perceived (the wire's unit; each UI maps it to its own slider),
+// VRX_BRIGHTNESS_CANNOT_DIM where the screen cannot dim.
+static int screen_brightness(const struct vrx_compositor *c) {
+    return c->dim == DIM_NONE ? VRX_BRIGHTNESS_CANNOT_DIM : c->light.stored;
 }
 
 // Tell the controller what the screen is now (vrx plan 0015 D12): its
 // facts carry it to Matter. Sent only on a change.
 static void screen_report(struct vrx_compositor *c) {
     if (c->controller < 0) return;
-    struct vrx_msg_screen m = { .on = !c->dark, .position = screen_position(c) };
-    if (c->reported_screen_valid && m.on == c->reported_screen.on && m.position == c->reported_screen.position) return;
+    struct vrx_msg_screen m = { .on = !c->dark, .brightness = screen_brightness(c) };
+    if (c->reported_screen_valid && m.on == c->reported_screen.on && m.brightness == c->reported_screen.brightness) return;
     c->reported_screen = m;
     c->reported_screen_valid = true;
     client_send(c, c->apps[c->controller].fd, VRX_MSG_SCREEN, &m, sizeof m, -1);

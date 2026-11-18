@@ -61,10 +61,6 @@ bool vrx_screen_light_tick(struct vrx_screen_light *sl, uint32_t now_ms);
 // No fade runs and nothing is shown.
 bool vrx_screen_light_is_dark(const struct vrx_screen_light *sl);
 
-// The slider's position, 0..100, over [floor, 1000]; and back.
-int vrx_screen_light_position(const struct vrx_screen_light *sl);
-uint16_t vrx_screen_light_from_position(const struct vrx_screen_light *sl, int position);
-
 // Whether `status` (the text of /proc/<pid>/status) lists `gid` among the process's groups: the display
 // grant is the group vrx-display, and the connection's own credentials do not carry supplementary groups.
 bool vrx_status_has_group(const char *status, unsigned gid);

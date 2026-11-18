@@ -124,8 +124,11 @@ enum vrx_msg_type {
     // through Matter (vrx plans 0015 D12, 0023 D1). The compositor keeps
     // no idle timer of its own; it executes.
     // comp -> vrxhost: the screen went on or off, or its brightness moved
-    // (position 0-100 over [the standard's lit floor, full], -1 where it
-    // cannot dim); sent on CONTROL too.
+    // (the person's brightness, per mille and perceived, 0-1000, the unit of
+    // the light everywhere; VRX_BRIGHTNESS_CANNOT_DIM where it cannot dim);
+    // sent on CONTROL too. vrx-linux's vectors/screen-wire.json is the one
+    // definition of the word, and test/vrx_ipc_screen_wire_test.c holds
+    // these numbers to it.
     VRX_MSG_SCREEN = 24,
     // vrxhost -> comp -> the shell: the power-off countdown (vrx-linux's
     // poweroff.rs). A person's power off (the power key held, the drawer's
@@ -133,7 +136,8 @@ enum vrx_msg_type {
     // system's dialog "Shutting down in N" with Cancel and Power off now.
     // secs_left >= 0 opens it or updates the number, -1 closes it. The
     // compositor keeps the last one and sends it again when the shell
-    // (re)appears.
+    // (re)appears. -2 (VRX_POWER_OFF_DARKEN) is the countdown out with no
+    // tap: see below.
     VRX_MSG_POWER_OFF = 25,
     // shell -> comp -> vrxhost: the dialog's answer, 0 Cancel (the board
     // stays on), 1 Power off now.
@@ -243,13 +247,23 @@ struct vrx_msg_semantics {
     uint32_t on;  // 0/1
 };
 
+// struct vrx_msg_screen's brightness where the screen cannot dim
+#define VRX_BRIGHTNESS_CANNOT_DIM (-1)
+
 struct vrx_msg_screen {
-    uint32_t on;       // 0/1
-    int32_t position;  // comp -> vrxhost only: 0-100, -1 = cannot dim
+    uint32_t on;          // 0/1
+    int32_t brightness;   // comp -> vrxhost only: 0-1000 per mille, perceived; VRX_BRIGHTNESS_CANNOT_DIM
 };
 
+// struct vrx_msg_power_off's secs_left words below zero
+#define VRX_POWER_OFF_CLOSED (-1)  // the countdown is over: close the dialog
+// The countdown ran out with no tap: the compositor takes the light down (the through-dark dip) and answers
+// VRX_MSG_POWER_OFF_ANSWER now = 1 once it is dark; vrxhost powers off on that or after its own bound. Not
+// forwarded to the shell, and not remembered: it is an order, not a count.
+#define VRX_POWER_OFF_DARKEN (-2)
+
 struct vrx_msg_power_off {
-    int32_t secs_left;  // >= 0 the countdown's whole seconds left, -1 over
+    int32_t secs_left;  // >= 0 the countdown's whole seconds left, VRX_POWER_OFF_CLOSED, VRX_POWER_OFF_DARKEN
 };
 
 struct vrx_msg_power_off_answer {

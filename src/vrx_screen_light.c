@@ -64,17 +64,6 @@ bool vrx_screen_light_is_dark(const struct vrx_screen_light *sl) {
     return !sl->fade.active && sl->shown == 0;
 }
 
-int vrx_screen_light_position(const struct vrx_screen_light *sl) {
-    int v = sl->stored < sl->floor ? sl->floor : sl->stored;
-    return (int) (((uint32_t) (v - sl->floor) * 100 + (VRX_LIGHT_FULL - sl->floor) / 2) / (VRX_LIGHT_FULL - sl->floor));
-}
-
-uint16_t vrx_screen_light_from_position(const struct vrx_screen_light *sl, int position) {
-    if (position < 0) position = 0;
-    if (position > 100) position = 100;
-    return (uint16_t) (sl->floor + ((uint32_t) (VRX_LIGHT_FULL - sl->floor) * (uint32_t) position + 50) / 100);
-}
-
 // The Groups: line of /proc/<pid>/status lists the gids of the process, supplementary ones included.
 bool vrx_status_has_group(const char *status, unsigned gid) {
     const char *line = status;
