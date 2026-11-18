@@ -140,8 +140,6 @@ add_executable(
   src/main.c
   src/vrx_compositor.c
   src/vrx_screen_light.c
-  src/vrx_app_client.c
-  src/vrx_kms.c
   src/vrx_vt.c
 )
 
@@ -151,6 +149,11 @@ add_executable(
 add_library(
   flutterpi_module OBJECT
   src/flutter-pi.c
+  # flutter-pi.c and window.c call the app client and the KMS node opener, so they
+  # live in the module those are in; in the executable alone, the tests that link
+  # the module failed to link
+  src/vrx_app_client.c
+  src/vrx_kms.c
   src/platformchannel.c
   src/pluginregistry.c
   src/texture_registry.c
