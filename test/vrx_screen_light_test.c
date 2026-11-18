@@ -201,6 +201,22 @@ void test_set_while_lit_is_shown_at_once_and_stored(void) {
     TEST_ASSERT_EQUAL(1, g.writes);  // an unchanged number is not rewritten
 }
 
+void test_the_resume_limit_holds_the_light_under_the_person_and_over_the_floor(void) {
+    g.stored = 900;
+    g.level = 0;
+    vrx_screen_light_open(&sl, &ops, &map, FLOOR);
+    vrx_screen_light_limit(&sl, 0, VRX_STD_RESUME_SPLASH_LEVEL_PERMILLE, 0);
+    vrx_screen_light_go(&sl, 0, true, 0);
+    TEST_ASSERT_EQUAL_MESSAGE(VRX_STD_RESUME_SPLASH_LEVEL_PERMILLE, last_shown(), "lit to the splash's level, under the person's 900");
+    vrx_screen_light_limit(&sl, 10, 0, 0);
+    TEST_ASSERT_EQUAL_MESSAGE(900, last_shown(), "lifted: the person's own");
+    vrx_screen_light_set(&sl, 20, 300);
+    vrx_screen_light_limit(&sl, 30, VRX_STD_RESUME_SPLASH_LEVEL_PERMILLE, 0);
+    TEST_ASSERT_EQUAL_MESSAGE(300, last_shown(), "a limit above the person's brightness changes nothing");
+    vrx_screen_light_limit(&sl, 40, 10, 0);
+    TEST_ASSERT_EQUAL_MESSAGE(FLOOR, last_shown(), "and never under the lit floor");
+}
+
 void test_set_while_dark_is_stored_and_shows_nothing(void) {
     g.stored = 500;
     vrx_screen_light_open(&sl, &ops, NULL, FLOOR);
@@ -274,6 +290,7 @@ int main(void) {
     RUN_TEST(test_a_screen_that_cannot_fade_cuts);
     RUN_TEST(test_the_clock_may_wrap);
     RUN_TEST(test_set_while_lit_is_shown_at_once_and_stored);
+    RUN_TEST(test_the_resume_limit_holds_the_light_under_the_person_and_over_the_floor);
     RUN_TEST(test_set_while_dark_is_stored_and_shows_nothing);
     RUN_TEST(test_a_lit_screen_never_goes_under_the_floor);
     RUN_TEST(test_the_cap_is_a_share_of_the_range_above_the_floor);

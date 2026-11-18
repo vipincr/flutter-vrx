@@ -28,7 +28,10 @@ void vrx_screen_light_open(struct vrx_screen_light *sl, const struct vrx_screen_
 uint16_t vrx_screen_light_target(const struct vrx_screen_light *sl) {
     uint16_t v = sl->stored < sl->floor ? sl->floor : sl->stored;
     uint16_t ceiling = (uint16_t) (sl->floor + ((uint32_t) (VRX_LIGHT_FULL - sl->floor) * sl->cap + 500) / 1000);
-    return v > ceiling ? ceiling : v;
+    v = v > ceiling ? ceiling : v;
+    // the splash's ceiling, never under the floor and never above what the person has
+    if (sl->limit && v > sl->limit) v = sl->limit < sl->floor ? sl->floor : sl->limit;
+    return v;
 }
 
 static void retarget(struct vrx_screen_light *sl, uint32_t now_ms, uint32_t ms) {
@@ -48,6 +51,11 @@ void vrx_screen_light_set(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t
         sl->ops.write_stored(sl->ops.ctx, permille);
     }
     if (sl->lit) retarget(sl, now_ms, 0);
+}
+
+void vrx_screen_light_limit(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t limit, uint32_t ms) {
+    sl->limit = limit > VRX_LIGHT_FULL ? VRX_LIGHT_FULL : limit;
+    if (sl->lit) retarget(sl, now_ms, ms);
 }
 
 void vrx_screen_light_cap(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t cap, uint32_t ms) {

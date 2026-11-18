@@ -28,6 +28,7 @@ struct vrx_screen_light {
     uint16_t floor;           // the dimmest a lit screen goes, per mille (the standard's [light])
     uint16_t stored;          // the person's brightness, per mille
     uint16_t cap;             // vrxhost's cap: per mille of the range above the floor, 1000 = none
+    uint16_t limit;           // a ceiling on what is lit, per mille (the resume's splash level); 0 = none
     uint16_t shown;           // what apply() last showed
     bool lit;                 // wanted lit (at the person's level, under the cap), else dark
     struct vrx_light_fade fade;
@@ -51,6 +52,9 @@ void vrx_screen_light_go(struct vrx_screen_light *sl, uint32_t now_ms, bool lit,
 
 // The person set a brightness: stored, and shown at once when lit (a slider's samples are its own ramp).
 void vrx_screen_light_set(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t permille);
+
+// A ceiling on the lit brightness (the resume's splash is lit to its own level, under the person's), 0 to lift it: over `ms` when lit.
+void vrx_screen_light_limit(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t limit, uint32_t ms);
 
 // vrxhost's cap changed: over `ms` when lit.
 void vrx_screen_light_cap(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t cap, uint32_t ms);

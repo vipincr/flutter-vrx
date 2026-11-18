@@ -81,6 +81,22 @@ target_link_libraries(
 
 add_test(vrx_screen_light_test vrx_screen_light_test)
 
+# the resume's presentation (plan 0034): the splash in the dark, the wake's wait for the essentials, the dip, the splash file
+add_executable(vrx_resume_test
+    vrx_resume_test.c
+    ../src/vrx_resume.c
+)
+
+target_include_directories(vrx_resume_test PRIVATE ../src)
+
+target_link_libraries(
+    vrx_resume_test
+    Unity
+    ${VRX_LIGHT_TARGET}
+)
+
+add_test(vrx_resume_test vrx_resume_test)
+
 # vrx-linux, which owns the screen's words (vectors/screen-wire.json) and the UI standard the light's header is generated from
 set(VRX_LINUX_DIR "${CMAKE_SOURCE_DIR}/../vrx/yocto/layers/vrx/vrx-linux" CACHE PATH "vrx-linux, the owner of the vectors and of the vendored UI standard")
 

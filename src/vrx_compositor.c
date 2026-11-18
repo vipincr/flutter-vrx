@@ -62,6 +62,7 @@
 #include "vrx_ipc.h"
 #include "vrx_kms.h"
 #include "vrx_light_standard.h"
+#include "vrx_resume.h"
 #include "vrx_screen_light.h"
 #include "vrx_vt.h"
 
@@ -182,6 +183,12 @@ struct vrx_compositor {
     char off_why[24];
     bool shutdown_dip;         // the system is going down: release our logind delay when the light is down
     uint32_t resume_deadline_ms;  // after a resume, light at the latest then; 0 = not waiting
+    // the resume's presentation (vrx plan 0034): the splash drawn in the dark before the system sleeps, lit on the wake
+    struct vrx_resume resume;
+    uint32_t splash_fb;        // the splash's framebuffer (XRGB8888, the CRTC's size), 0 = none made
+    bool splash_on;            // the primary plane shows the splash, and app frames wait
+    bool splash_sent;          // a commit carrying the splash is in flight
+    bool splash_release;       // the sleep delay is released when that commit's flip lands
     // how brightness is shown: the backlight's levels, or a black plane
     // over everything at partial alpha (DIM_ALPHA), or not at all
     enum { DIM_NONE, DIM_BACKLIGHT, DIM_ALPHA } dim;
@@ -730,9 +737,17 @@ static int scene_send(struct vrx_compositor *c, bool with_dim, bool with_shell, 
         kadd(req, c->crtc_id, c->active_prop, 1);
         *planes |= SCENE_WAKE;
     }
+    // the resume's splash (plan 0034): it takes the primary plane, turned as the app's frames are, the shell's plane is off, and the
+    // app's newest frame waits in `queued` for the splash to go
+    const bool splash = c->splash_on && c->splash_fb;
+    if (splash) with_shell = false;
     // primary: the app's newest frame, else what is on it now
     const struct frame *p = c->queued.valid ? &c->queued : &c->on_screen;
-    if (p->valid) {
+    if (splash) {
+        kplane_place(req, &c->kp_primary, c->crtc_id, c->splash_fb, c->width, c->height, c->width, c->height);
+        kadd(req, c->kp_primary.id, c->kp_primary.alpha, 0xffff);
+        kadd(req, c->kp_primary.id, c->kp_primary.rotation, c->kp_primary.rotate_180);   // upright, as the app's frames are
+    } else if (p->valid) {
         kplane_place(req, &c->kp_primary, c->crtc_id, p->fb_id, c->width, c->height, c->width, c->height);
         kadd(req, c->kp_primary.id, c->kp_primary.alpha, 0xffff);
         kadd(req, c->kp_primary.id, c->kp_primary.rotation, c->kp_primary.rotate_180);
@@ -886,6 +901,7 @@ static void scene_commit(struct vrx_compositor *c) {
     c->commit_pending = true;
     c->commit_planes = planes;
     c->dim_sent = c->kp_dim.id ? c->dim_want : 0;
+    if (c->splash_on && c->splash_fb) c->splash_sent = true;
     if (planes & SCENE_PRIMARY) {
         c->pending = c->queued;
         memset(&c->queued, 0, sizeof c->queued);
@@ -1199,6 +1215,9 @@ static void flip_record(struct vrx_compositor *c, const struct frame *f, uint32_
 // the vblank phase; the record keeps one entry per commit that did, headed
 // by the frame that arrived last, so a late shell frame and a late app
 // frame are each seen as what they are.
+static void sleep_release(struct vrx_compositor *c);
+static void resume_essentials(struct vrx_compositor *c, bool facts, bool clock);
+
 static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
                          unsigned int usec, void *data) {
     (void) fd;
@@ -1251,6 +1270,12 @@ static void on_page_flip(int fd, unsigned int seq, unsigned int sec,
         report_app(c, &c->apps[c->shell], VRX_APP_SHOWN);
     }
     c->commit_planes = 0;
+    if (c->splash_sent && c->splash_release) {
+        // the splash is on the glass: the request may go (plan 0034 D5)
+        c->splash_release = false;
+        sleep_release(c);
+    }
+    c->splash_sent = false;
     send_vblank(c, c->on_screen.app, false);
     send_vblank(c, c->shell, false);
     scene_commit(c);
@@ -1644,6 +1669,13 @@ static void client_handle(struct vrx_compositor *c, int slot,
                                      c->fade_ok ? (raised ? VRX_STD_THROUGH_DARK_IN_MS : VRX_STD_THROUGH_DARK_OUT_MS) : 0);
                 light_timer(c);
             }
+            break;
+        }
+        case VRX_MSG_RESUME_ESSENTIALS: {
+            // the kit's word on the resume's essentials (plan 0034 D3): a Facts reading after the wake, a known clock source
+            struct vrx_msg_resume_essentials *m = payload;
+            if (h->length < sizeof *m) goto bad;
+            resume_essentials(c, m->facts != 0, m->clock != 0);
             break;
         }
         case VRX_MSG_BRIGHTNESS: {
@@ -2084,12 +2116,94 @@ static void screen_off_now(struct vrx_compositor *c, const char *why);
 static void light_timer(struct vrx_compositor *c) {
     bool run = c->light.fade.active || c->resume_deadline_ms;
     struct itimerspec t = {0};
-    if (run) t = (struct itimerspec){ .it_interval = { .tv_nsec = LIGHT_STEP_MS * 1000000L },
-                                      .it_value = { .tv_nsec = LIGHT_STEP_MS * 1000000L } };
+    if (run) {
+        t = (struct itimerspec){ .it_interval = { .tv_nsec = LIGHT_STEP_MS * 1000000L },
+                                 .it_value = { .tv_nsec = LIGHT_STEP_MS * 1000000L } };
+    } else if (c->resume.stage == VRX_RESUME_WAITING) {
+        // the splash is held for the essentials: one shot at the bound, and an event ends it sooner
+        uint32_t left = vrx_resume_left(&c->resume, now_ms());
+        t.it_value = (struct timespec){ .tv_sec = left / 1000, .tv_nsec = (long) (left % 1000) * 1000000L };
+    }
     timerfd_settime(c->light_fd, 0, &t, NULL);
 }
 
 static void sleep_release(struct vrx_compositor *c);
+static void light_go(struct vrx_compositor *c, bool lit, uint32_t ms);
+static void screen_light(struct vrx_compositor *c, uint32_t ms);
+
+// ─── the resume's presentation (vrx plan 0034 D1, D3, D5) ───────────────
+// Before the system sleeps and the light is down, the splash goes on the glass and only then is the
+// request let go; on the wake the light rises to the standard's splash level and the splash holds
+// until the kit says a Facts reading and a clock source are back and the input devices are,
+// or until the standard's bound; then through dark into the UI. The sequence is vrx_resume.c's.
+#define SPLASH_DIR "/usr/share/vrx/splash"
+
+static void splash_say(const char *what, void *ctx) {
+    (void) ctx;
+    fprintf(stderr, "[vrx-compositor] splash: %s\n", what);
+}
+
+// The splash's framebuffer, made once: the file (or the page colour) in a dumb XRGB8888 buffer of the CRTC's size.
+static bool splash_make(struct vrx_compositor *c) {
+    if (c->splash_fb) return true;
+    if (!c->mode_set) return false;
+    struct drm_mode_create_dumb cd = { .width = c->width, .height = c->height, .bpp = 32 };
+    if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) != 0) return false;
+    struct drm_mode_map_dumb md = { .handle = cd.handle };
+    if (drmIoctl(c->drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &md) != 0) return false;
+    uint32_t *px = mmap(NULL, cd.size, PROT_READ | PROT_WRITE, MAP_SHARED, c->drm_fd, md.offset);
+    if (px == MAP_FAILED) return false;
+    // the page colour of a splash with no file: black, the colour the panel is dark in (the compositor knows no scheme)
+    vrx_resume_splash_fill(px, cd.pitch / 4, c->width, c->height, SPLASH_DIR, 0x000000, splash_say, NULL);
+    munmap(px, cd.size);
+    uint32_t handles[4] = { cd.handle }, pitches[4] = { cd.pitch }, offsets[4] = { 0 }, fb = 0;
+    if (drmModeAddFB2(c->drm_fd, c->width, c->height, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &fb, 0) != 0) {
+        fprintf(stderr, "[vrx-compositor] splash: AddFB2 %s\n", strerror(errno));
+        return false;
+    }
+    c->splash_fb = fb;
+    return true;
+}
+
+static unsigned inputs_now(const struct vrx_compositor *c) { return (unsigned) (c->touchscreens + c->keyboards); }
+
+// The light is down while parking: the splash goes on the glass and the sleep may go once it is there.
+static void resume_dark(struct vrx_compositor *c) {
+    if (vrx_resume_dark(&c->resume) != VRX_RESUME_DRAW_SPLASH) return;
+    if (!splash_make(c)) {
+        fprintf(stderr, "[vrx-compositor] splash: none could be made; the wake shows the last frame\n");
+        vrx_resume_abort(&c->resume);
+        sleep_release(c);
+        return;
+    }
+    c->splash_on = true;
+    c->splash_release = true;
+    scene_update(c);                  // the flip that lands it releases the sleep delay (on_page_flip)
+}
+
+// The light is down after the essentials: the UI's frame goes back on the glass and the light rises to the person's.
+static void resume_dipped(struct vrx_compositor *c) {
+    if (vrx_resume_dipped(&c->resume) != VRX_RESUME_SHOW_UI) return;
+    c->splash_on = false;
+    vrx_screen_light_limit(&c->light, now_ms(), 0, 0);
+    c->light_after_flip = true;
+    c->resume_deadline_ms = now_ms() + RESUME_WAIT_MS;
+    scene_update(c);
+    light_timer(c);
+}
+
+// The wait's verdict, at an event or the bound.
+static void resume_check(struct vrx_compositor *c) {
+    if (vrx_resume_check(&c->resume, now_ms()) != VRX_RESUME_DIP) return;
+    fprintf(stderr, "[vrx-compositor] resume: the splash held %u ms, the clock %s\n",
+            (unsigned) (now_ms() - c->resume.t0), c->resume.clock_unknown ? "unknown" : "known or the wait complete");
+    light_go(c, false, VRX_STD_THROUGH_DARK_OUT_MS);
+}
+
+static void resume_essentials(struct vrx_compositor *c, bool facts, bool clock) {
+    vrx_resume_report(&c->resume, facts, clock);
+    resume_check(c);
+}
 
 // What was waiting on the light being down, once it is.
 static void light_settled(struct vrx_compositor *c) {
@@ -2113,6 +2227,8 @@ static void light_settled(struct vrx_compositor *c) {
         c->shutdown_dip = false;
         sleep_release(c);
     }
+    if (c->resume.stage == VRX_RESUME_PARKING) resume_dark(c);
+    else if (c->resume.stage == VRX_RESUME_DIPPING) resume_dipped(c);
 }
 
 // Lit or dark over `ms` (0 where this screen cannot fade).
@@ -2134,6 +2250,7 @@ static void light_tick(struct vrx_compositor *c) {
     if (read(c->light_fd, &expirations, sizeof expirations) != sizeof expirations) return;
     uint32_t t = now_ms();
     vrx_screen_light_tick(&c->light, t);
+    if (c->resume.stage == VRX_RESUME_WAITING && vrx_resume_left(&c->resume, t) <= 1) resume_check(c);
     if (c->resume_deadline_ms && (int32_t) (t - c->resume_deadline_ms) >= 0) {
         // no frame came: the screen is as it was, and lit
         screen_light(c, VRX_STD_THROUGH_DARK_IN_MS);
@@ -2307,6 +2424,8 @@ static void input_facts_changed(struct vrx_compositor *c, struct libinput_device
     fprintf(stderr, "[vrx-compositor] input: %d touchscreen%s, %d keyboard%s\n", c->touchscreens,
             c->touchscreens == 1 ? "" : "s", c->keyboards, c->keyboards == 1 ? "" : "s");
     screen_facts(c);
+    vrx_resume_inputs(&c->resume, inputs_now(c));   // the resume's input essential (plan 0034 D3)
+    resume_check(c);
 }
 
 // The value of `key` in a key=value file; false when absent.
@@ -2466,6 +2585,7 @@ static void screen_init(struct vrx_compositor *c) {
     c->sleep_ack_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     c->light_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     c->sleep_inhibit_fd = -1;
+    vrx_resume_init(&c->resume, VRX_STD_RESUME_ESSENTIALS_MAX_MS);
     c->bl_level = -1;
     DIR *d = opendir("/sys/class/backlight");
     if (d) {
@@ -2539,12 +2659,19 @@ static int on_prepare_for_sleep(sd_bus_message *m, void *userdata, sd_bus_error 
         fprintf(stderr, "[vrx-compositor] the system is going to sleep: applets told\n");
         struct itimerspec t = { .it_value = { .tv_sec = 1 } };
         if (c->sleep_ack_fd >= 0) timerfd_settime(c->sleep_ack_fd, 0, &t, NULL);
-        // the light is down well inside that second
+        // the light is down well inside that second, and then the splash goes on the glass (plan 0034 D5)
+        if (!c->dark && !c->off_pending && c->mode_set && c->fade_ok) vrx_resume_sleep(&c->resume, inputs_now(c));
         light_go(c, false, VRX_STD_THROUGH_DARK_OUT_MS);
     } else {
         fprintf(stderr, "[vrx-compositor] the system woke\n");
         sleep_delay_take(c);
-        if (!c->dark && !c->off_pending) {
+        if (vrx_resume_wake(&c->resume, now_ms(), inputs_now(c)) == VRX_RESUME_LIGHT_SPLASH) {
+            // the splash is up: lit to its own level, held until the essentials are back (resume_check), then through dark
+            c->splash_release = false;
+            vrx_screen_light_limit(&c->light, now_ms(), VRX_STD_RESUME_SPLASH_LEVEL_PERMILLE, 0);
+            screen_light(c, VRX_STD_THROUGH_DARK_IN_MS);
+            resume_check(c);
+        } else if (!c->dark && !c->off_pending) {
             // resume: the light comes up on the first frame after it, or when none comes
             c->light_after_flip = true;
             c->resume_deadline_ms = now_ms() + RESUME_WAIT_MS;

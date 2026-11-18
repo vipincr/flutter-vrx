@@ -148,6 +148,13 @@ enum vrx_msg_type {
     // writer of the light and of the stored number. Held to the standard's
     // floor when lit. Ignored where the screen cannot dim.
     VRX_MSG_BRIGHTNESS = 27,
+    // app -> comp: what the kit knows of the resume's essentials (vrx plan 0034 D3), told whenever either changes while the splash
+    // is held after a wake. facts = 1: a Facts reading after the wake (the kit's SystemFacts.isAfterWake(held), `held` being the
+    // wakes it counted when it heard VRX_MSG_SLEEP with sleeping = 1); clock = 1: the clock's source after that wake is a known one
+    // (clockSourceAfter(held) is not null and not vectors/clock-source.json's "unknown"). The compositor reads no Facts and names
+    // no source of its own: the values are the kit's, from vrx-linux's vectors. Any registered app is heard (it can only end a
+    // wait the bound ends anyway).
+    VRX_MSG_RESUME_ESSENTIALS = 28,
 };
 
 // Every message on the wire: fixed header, then a type-specific payload.
@@ -233,6 +240,11 @@ struct vrx_msg_light_cap {
 
 struct vrx_msg_brightness {
     uint32_t permille;  // 0-1000, perceived (CIE 1931 lightness x 10)
+};
+
+struct vrx_msg_resume_essentials {
+    uint32_t facts;  // 0/1
+    uint32_t clock;  // 0/1
 };
 
 struct vrx_msg_sleep {

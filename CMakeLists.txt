@@ -124,6 +124,7 @@ if(VRX_LIGHT_SOURCE_DIR)
     ${VRX_LIGHT_SOURCE_DIR}/src/light_curve.c
     ${VRX_LIGHT_SOURCE_DIR}/src/light_fade.c
     ${VRX_LIGHT_SOURCE_DIR}/src/light_table.c
+    ${VRX_LIGHT_SOURCE_DIR}/src/light_resume.c
     ${VRX_LIGHT_SOURCE_DIR}/chip/linux/light_sysfs.c
   )
   target_include_directories(vrx_light PUBLIC ${VRX_LIGHT_SOURCE_DIR}/include)
@@ -140,6 +141,7 @@ add_executable(
   src/main.c
   src/vrx_compositor.c
   src/vrx_screen_light.c
+  src/vrx_resume.c
   src/vrx_vt.c
 )
 

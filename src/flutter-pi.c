@@ -2435,7 +2435,7 @@ static void vrx_engine_started(struct flutterpi *fpi) {
     flutterpi_sd_event_add_io(NULL, fd, EPOLLIN, on_vrx_etc_changed, NULL);
 }
 
-// vrx/shell: getInsets, setChrome {hidden} and setBrightness {permille} for every app; setRegion
+// vrx/shell: getInsets, setChrome {hidden}, setBrightness {permille} and resumeEssentials {facts, clock} for every app; setRegion
 // {top, full}, back and powerOffAnswer {now} from the shell.
 static int on_vrx_shell_channel(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *handle) {
     (void) channel;
@@ -2470,6 +2470,17 @@ static int on_vrx_shell_channel(char *channel, struct platch_obj *object, Flutte
         double v = JSONVALUE_AS_NUM(*permille);
         struct vrx_msg_brightness m = { .permille = v < 0 ? 0 : v > 1000 ? 1000 : (uint32_t) (v + 0.5) };
         vrx_app_client_send(vrx_app.client, VRX_MSG_BRIGHTNESS, &m, sizeof m, -1);
+        return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
+    }
+    if (strcmp(object->method, "resumeEssentials") == 0) {
+        // what the kit knows after a wake (vrx plan 0034 D3): a Facts reading after it, a known clock source
+        struct json_value *facts = jsobject_get(&object->json_arg, "facts");
+        struct json_value *clock = jsobject_get(&object->json_arg, "clock");
+        struct vrx_msg_resume_essentials m = {
+            .facts = facts && JSONVALUE_IS_BOOL(*facts) && JSONVALUE_AS_BOOL(*facts),
+            .clock = clock && JSONVALUE_IS_BOOL(*clock) && JSONVALUE_AS_BOOL(*clock),
+        };
+        vrx_app_client_send(vrx_app.client, VRX_MSG_RESUME_ESSENTIALS, &m, sizeof m, -1);
         return platch_respond_success_json(handle, &(struct json_value){ .type = kJsonNull });
     }
     if (strcmp(object->method, "setChrome") == 0) {
