@@ -31,6 +31,8 @@ def render(path: pathlib.Path) -> str:
         "\n"
         "// [light] lit_floor_permille: the dimmest a lit screen goes\n"
         f"#define VRX_STD_LIGHT_FLOOR_PERMILLE {int(light['lit_floor_permille'])}u\n"
+        "// [light] change_ms: a change of the person's brightness glides from where the light is over this long\n"
+        f"#define VRX_STD_LIGHT_CHANGE_MS {int(light['change_ms'])}u\n"
         "// [transition.through_dark]\n"
         f"#define VRX_STD_THROUGH_DARK_OUT_MS {int(through['out_ms'])}u\n"
         f"#define VRX_STD_THROUGH_DARK_IN_MS {int(through['in_ms'])}u\n"

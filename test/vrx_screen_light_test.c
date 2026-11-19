@@ -189,16 +189,47 @@ void test_the_clock_may_wrap(void) {
 
 // --- the person's brightness -------------------------------------------------------------------------------------
 
-void test_set_while_lit_is_shown_at_once_and_stored(void) {
+#define CHANGE VRX_STD_LIGHT_CHANGE_MS
+
+void test_a_jump_passes_through_intermediate_levels_over_change_ms_and_lands(void) {
     g.stored = 500;
     g.level = 500;
     vrx_screen_light_open(&sl, &ops, &map, FLOOR);
     vrx_screen_light_go(&sl, 0, true, 0);
-    vrx_screen_light_set(&sl, 10, 300);
-    TEST_ASSERT_EQUAL(300, last_shown());
-    TEST_ASSERT_EQUAL(300, g.stored);
-    vrx_screen_light_set(&sl, 20, 300);
-    TEST_ASSERT_EQUAL(1, g.writes);  // an unchanged number is not rewritten
+    vrx_screen_light_set(&sl, 1000, 900);
+    TEST_ASSERT_TRUE_MESSAGE(sl.fade.active, "a lit change is a fade, not a jump");
+    int from = g.applies;
+    uint32_t t = 1000;
+    while (vrx_screen_light_tick(&sl, t += 16)) {}
+    TEST_ASSERT_EQUAL(900, last_shown());
+    TEST_ASSERT_TRUE_MESSAGE(g.applies - from >= 8, "through intermediate levels");
+    assert_monotone(from - 1, g.applies, false);
+    TEST_ASSERT_TRUE(t - 1000 >= CHANGE && t - 1000 < CHANGE + 16);
+}
+
+void test_a_drag_retargets_from_where_the_light_is_and_is_stored_once(void) {
+    g.stored = 200;
+    g.level = 200;
+    vrx_screen_light_open(&sl, &ops, &map, FLOOR);
+    vrx_screen_light_go(&sl, 0, true, 0);
+    uint32_t t = 1000;
+    uint16_t ends[] = { 300, 400, 500, 600, 700, 800, 700 };
+    for (unsigned i = 0; i < sizeof ends / sizeof ends[0]; i++, t += 16) {
+        vrx_screen_light_set(&sl, t, ends[i]);
+        vrx_screen_light_tick(&sl, t);
+        TEST_ASSERT_EQUAL_MESSAGE(0, g.writes, "no sample stores the number");
+    }
+    // never restarted from the old start: nothing shown fell back toward 200 while the finger went up
+    for (int i = 1; i < g.applies; i++) TEST_ASSERT_TRUE(g.shown[i] >= g.shown[i - 1] || g.shown[i] >= 600);
+    for (int i = 0; i < g.applies; i++) TEST_ASSERT_TRUE(g.shown[i] >= 200);
+    uint32_t lastsample = t - 16;
+    while (vrx_screen_light_tick(&sl, t += 16)) {}
+    TEST_ASSERT_EQUAL(700, last_shown());
+    TEST_ASSERT_TRUE_MESSAGE(t - lastsample < CHANGE + 32, "it settles one change_ms after the last sample, not after a queue of them");
+    TEST_ASSERT_EQUAL_MESSAGE(1, g.writes, "the gesture is stored once, at its end");
+    TEST_ASSERT_EQUAL(700, g.stored);
+    vrx_screen_light_set(&sl, t + 16, 700);
+    TEST_ASSERT_EQUAL_MESSAGE(1, g.writes, "an unchanged number is not rewritten");
 }
 
 void test_the_resume_limit_holds_the_light_under_the_person_and_over_the_floor(void) {
@@ -211,9 +242,10 @@ void test_the_resume_limit_holds_the_light_under_the_person_and_over_the_floor(v
     vrx_screen_light_limit(&sl, 10, 0, 0);
     TEST_ASSERT_EQUAL_MESSAGE(900, last_shown(), "lifted: the person's own");
     vrx_screen_light_set(&sl, 20, 300);
-    vrx_screen_light_limit(&sl, 30, VRX_STD_RESUME_SPLASH_LEVEL_PERMILLE, 0);
+    run(20, 20 + CHANGE);
+    vrx_screen_light_limit(&sl, 230, VRX_STD_RESUME_SPLASH_LEVEL_PERMILLE, 0);
     TEST_ASSERT_EQUAL_MESSAGE(300, last_shown(), "a limit above the person's brightness changes nothing");
-    vrx_screen_light_limit(&sl, 40, 10, 0);
+    vrx_screen_light_limit(&sl, 240, 10, 0);
     TEST_ASSERT_EQUAL_MESSAGE(FLOOR, last_shown(), "and never under the lit floor");
 }
 
@@ -249,7 +281,8 @@ void test_the_cap_is_a_share_of_the_range_above_the_floor(void) {
     TEST_ASSERT_EQUAL(1000, last_shown());
     // a person below the cap is not raised to it
     vrx_screen_light_set(&sl, 0, 200);
-    vrx_screen_light_cap(&sl, 0, 500, 0);
+    run(0, CHANGE);
+    vrx_screen_light_cap(&sl, CHANGE, 500, 0);
     TEST_ASSERT_EQUAL(200, last_shown());
 }
 
@@ -289,7 +322,8 @@ int main(void) {
     RUN_TEST(test_the_later_request_wins);
     RUN_TEST(test_a_screen_that_cannot_fade_cuts);
     RUN_TEST(test_the_clock_may_wrap);
-    RUN_TEST(test_set_while_lit_is_shown_at_once_and_stored);
+    RUN_TEST(test_a_jump_passes_through_intermediate_levels_over_change_ms_and_lands);
+    RUN_TEST(test_a_drag_retargets_from_where_the_light_is_and_is_stored_once);
     RUN_TEST(test_the_resume_limit_holds_the_light_under_the_person_and_over_the_floor);
     RUN_TEST(test_set_while_dark_is_stored_and_shows_nothing);
     RUN_TEST(test_a_lit_screen_never_goes_under_the_floor);

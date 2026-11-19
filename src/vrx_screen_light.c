@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "vrx_light_standard.h"
+
 static void show(struct vrx_screen_light *sl, uint16_t v) {
     if (v == sl->shown) return;
     sl->shown = v;
@@ -44,13 +46,21 @@ void vrx_screen_light_go(struct vrx_screen_light *sl, uint32_t now_ms, bool lit,
     retarget(sl, now_ms, ms);
 }
 
+// The stored number is written when no fade of the person's own is running, so a drag's samples cost one write, at its end.
+static void keep(struct vrx_screen_light *sl) {
+    if (!sl->store_due || sl->fade.active) return;
+    sl->store_due = false;
+    sl->ops.write_stored(sl->ops.ctx, sl->stored);
+}
+
 void vrx_screen_light_set(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t permille) {
     if (permille > VRX_LIGHT_FULL) permille = VRX_LIGHT_FULL;
     if (permille != sl->stored) {
         sl->stored = permille;
-        sl->ops.write_stored(sl->ops.ctx, permille);
+        sl->store_due = true;
     }
-    if (sl->lit) retarget(sl, now_ms, 0);
+    if (sl->lit) retarget(sl, now_ms, VRX_STD_LIGHT_CHANGE_MS);
+    keep(sl);
 }
 
 void vrx_screen_light_limit(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t limit, uint32_t ms) {
@@ -65,6 +75,7 @@ void vrx_screen_light_cap(struct vrx_screen_light *sl, uint32_t now_ms, uint16_t
 
 bool vrx_screen_light_tick(struct vrx_screen_light *sl, uint32_t now_ms) {
     show(sl, vrx_light_fade_step(&sl->fade, now_ms));
+    keep(sl);
     return sl->fade.active;
 }
 
