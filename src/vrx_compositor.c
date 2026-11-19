@@ -2029,17 +2029,16 @@ static int sysfs_int(const char *dir, const char *what) {
     return v;
 }
 
+// The light's one Linux writer is libvrx-light's (it also unblanks a backlight that came up powered down, which a
+// bare `brightness` write leaves dark: bench 2026-11-19, the PW-SH7).
 static void backlight_set(struct vrx_compositor *c, int level) {
     if (!c->backlight[0] || level == c->bl_level) return;
-    char path[128];
-    snprintf(path, sizeof path, "%s/brightness", c->backlight);
-    FILE *f = fopen(path, "we");
-    if (!f) {
-        fprintf(stderr, "[vrx-compositor] %s: %s\n", path, strerror(errno));
+    if (!c->bl_map.dir[0]) snprintf(c->bl_map.dir, sizeof c->bl_map.dir, "%s", c->backlight);
+    const int rc = vrx_light_write_level(&c->bl_map, level);
+    if (rc < 0) {
+        fprintf(stderr, "[vrx-compositor] %s: %s\n", c->backlight, strerror(-rc));
         return;
     }
-    fprintf(f, "%d\n", level);
-    fclose(f);
     c->bl_level = level;
 }
 
